@@ -5,7 +5,7 @@
 services:
   cli-proxy-api:
     # CLI_PROXY_IMAGE still selects the image to run. Builds are explicit; see docs.
-    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
+    image: ${CLI_PROXY_IMAGE:-ghcr.io/nukwaw/cpa:latest}
     pull_policy: always
     build:
       context: .

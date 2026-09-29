@@ -11,9 +11,24 @@ This fork adds `/stats.html` and a persistence adapter for the **existing built-
 | Explicit [bundled PostgreSQL Compose](../docker-compose.postgres.yml) | Shares the bundled PostgreSQL auth/config store | Bundled database, selected only with `-f docker-compose.postgres.yml` |
 | CLIProxyAPIHome | This standalone add-on is not attached | No database added by this feature |
 
-The base deployment is unchanged: `CLI_PROXY_IMAGE` still selects the proxy image, the default remains `eceasy/cli-proxy-api:latest`, and the normal pull behavior remains intact. It has no required database/password, no new PostgreSQL environment mapping, and no database startup dependency. Native local usage also needs no environment variable. External-database deployments should keep their existing wiring; they must not select the bundled file just to get statistics.
+The base, bundled PostgreSQL, and Home/cluster Compose files now default to `ghcr.io/nukwaw/cpa:latest`. `CLI_PROXY_IMAGE` still overrides that choice and `pull_policy: always` remains intact. The base deployment has no required database/password, no new PostgreSQL environment mapping, and no database startup dependency. Native local usage also needs no environment variable. External-database deployments should keep their existing wiring; they must not select the bundled file just to get statistics.
 
-The fork must actually be present in the image/binary you run. An upstream or custom image is not silently replaced or retagged by this feature. The bundled example below explicitly selects a local build tag and builds this checkout.
+## Published fork images
+
+The [GHCR workflow](../.github/workflows/ghcr-image.yml) publishes native `linux/amd64` and `linux/arm64` builds after a push to `main`, or a manual workflow run on `main`. It checks out the exact triggering commit, with full history/tags for metadata, and never checks out the selected version tag. The version is the highest version-sorted `v*` tag reachable from that commit; a release sorts ahead of its prereleases. For example, a commit after `v8.0.4` builds the new commit with `VERSION=v8.0.4`, not the old tagged tree. No matching tag is an explicit build error: push the relevant version tags to this fork first. At setup, the fork's remote had no tags even though the local checkout had `v8.0.4`; pushing the branch alone does not publish that tag. For the current local release tag, publish it explicitly with `git push origin v8.0.4` before the main build. This does not move the tag to the new commit.
+
+A successful multi-platform build publishes `sha-<full-commit-sha>`, then checks the remote main tip before promoting `latest` and the selected version (for example `v8.0.4`). An old rerun does not cancel a newer commit's run and does not deliberately roll those moving aliases back. SHA tags select source commits, not immutable image bytes: rebuilds can change build time or base images. Use `ghcr.io/nukwaw/cpa@sha256:<manifest-digest>` for immutable image pinning. The existing Dockerfile receives `VERSION`, the full `COMMIT`, and UTC `BUILD_DATE`, and the image has matching OCI labels. Per-run architecture tags prevent the final manifest from mixing two pushes; those `build-*` staging tags remain available for registry cleanup/retention. The workflow builds committed files without refreshing generated catalogs from the network.
+
+Publication uses `GITHUB_TOKEN` with `packages: write`. No Docker Hub secrets or personal publishing token are required. After the first successful run, set the GHCR package visibility to public for anonymous pulls, or authenticate Docker with suitable package-read permission. If an existing package is not linked to this repository, grant the repository Actions access before publishing. Enable Actions for the fork if they are disabled. The inherited Docker Hub workflow runs only in the upstream repository.
+
+For the base deployment, after publication and normal configuration setup:
+
+```sh
+docker compose pull cli-proxy-api
+docker compose up -d --no-build
+```
+
+For bundled PostgreSQL, complete the bootstrap/migration and password prerequisites below, then use `docker compose -p cpa-postgres -f docker-compose.postgres.yml pull` followed by `docker compose -p cpa-postgres -f docker-compose.postgres.yml up -d --no-build`. Keep the same project name to retain volumes. Local builds remain supported; the following examples explicitly select a local image tag rather than retagging a published image.
 
 ## Existing collection switch
 
@@ -94,7 +109,7 @@ PostgreSQL has no published host port, has a named `postgres-data` volume, and i
 
 ## Native and existing external deployments
 
-To run this fork with the unchanged base deployment and local storage, deliberately choose a local image tag and build it; do not enable PGSTORE or select the bundled file:
+To build locally instead of pulling the default GHCR image, deliberately choose a local image tag; do not enable PGSTORE or select the bundled file merely to get statistics:
 
 ```sh
 export CLI_PROXY_IMAGE=cli-proxy-api:usage-local

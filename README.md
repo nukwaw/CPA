@@ -134,6 +134,19 @@ PackyCode provides special discounts for our software users: register using <a h
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+## Fork container image
+
+Pushes to `main` publish `ghcr.io/nukwaw/cpa` for `linux/amd64` and `linux/arm64` through the [GHCR workflow](.github/workflows/ghcr-image.yml). The build checks out the pushed commit; the highest version-sorted reachable `v*` tag supplies its version label, even when that tag points to an older commit. Git tags must exist in the fork. Images are tagged `latest`, the selected version, and `sha-<full-commit-sha>`. The SHA tag selects a source commit; use `@sha256:<manifest-digest>` for immutable image pinning because a rerun can rebuild that commit. Only a build whose commit is still the current main tip promotes the moving version/`latest` aliases.
+
+All three Compose files now default to `ghcr.io/nukwaw/cpa:latest`, retaining the `CLI_PROXY_IMAGE` override. After the first successful publication, make the GHCR package public for anonymous pulls or authenticate Docker for a private package. Start the base deployment with:
+
+```sh
+docker compose pull cli-proxy-api
+docker compose up -d --no-build
+```
+
+Publishing uses the repository's `GITHUB_TOKEN` with package-write permission, not Docker Hub credentials. The inherited Docker Hub workflow is restricted to the upstream repository. See the [deployment guide](docs/usage-persistence.md#published-fork-images) for version semantics and the separate PostgreSQL deployment.
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
@@ -142,7 +155,7 @@ see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
 This fork adds `/stats.html` and bounded, asynchronous persistence of the built-in usage output for standalone CLI runs. Enable the existing `observability.usage.usage-statistics-enabled` option (v0: `usage-statistics-enabled`; default: `false`) to collect new usage; there is no additional enable switch. Saved history, pricing, and management quota remain available when collection is off and persistence is healthy. Storage initialization and observation writes do not block inference startup or the original management handlers. The original management quota page remains available.
 
-An already active PostgreSQL auth/config store supplies its existing SQL pool and schema; otherwise an instance-specific local journal uses `WRITABLE_PATH` or the resolved auth directory. The [base Compose deployment](docker-compose.yml) keeps its original image/pull behavior and does not require PostgreSQL. The explicitly selected [bundled PostgreSQL deployment](docker-compose.postgres.yml) is a separate auth/config-storage choice, **not** an automatic usage-only upgrade. Read the [usage persistence guide](docs/usage-persistence.md) for safe config seeding/auth migration, explicit fork-build commands, storage/worker limits, and validation instructions. Persistence is best-effort operational history, not a billing ledger.
+An already active PostgreSQL auth/config store supplies its existing SQL pool and schema; otherwise an instance-specific local journal uses `WRITABLE_PATH` or the resolved auth directory. The [base Compose deployment](docker-compose.yml) defaults to the fork's GHCR image, keeps its pull policy and image override, and does not require PostgreSQL. The explicitly selected [bundled PostgreSQL deployment](docker-compose.postgres.yml) is a separate auth/config-storage choice, **not** an automatic usage-only upgrade. Read the [usage persistence guide](docs/usage-persistence.md) for safe config seeding/auth migration, explicit fork-build commands, storage/worker limits, and validation instructions. Persistence is best-effort operational history, not a billing ledger.
 
 Upstream CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) removed built-in usage statistics in v6.10.0. Alternative external statistics projects include:
 

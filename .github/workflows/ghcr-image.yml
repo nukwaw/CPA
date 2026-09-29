@@ -1,0 +1,158 @@
+name: Publish fork image to GHCR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Retrying an old commit must not cancel a newer commit's build.
+  group: ghcr-${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    # A manual run on another branch/tag must not replace the main image.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+      build_ref: ${{ steps.meta.outputs.build_ref }}
+    steps:
+      - name: Check out the pushed commit, including version tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select version without checking out the tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          commit="$(git rev-parse HEAD)"
+          test "$commit" = "$GITHUB_SHA"
+          # Highest version tag in this commit's history; a release outranks its
+          # prereleases. The source tree remains the pushed SHA, not the tag SHA.
+          version="$(git -c versionsort.suffix=- tag --merged HEAD --list 'v[0-9]*' --sort=-version:refname | sed -n '1p')"
+          if [[ ! "$version" =~ ^v[0-9][A-Za-z0-9_.-]*$ ]] || (( ${#version} > 128 )); then
+            echo '::error::No usable version tag found. Push the relevant v* Git tags to this fork before publishing.'
+            exit 1
+          fi
+          {
+            printf 'image=%s\n' "$image"
+            printf 'version=%s\n' "$version"
+            printf 'commit=%s\n' "$commit"
+            printf 'build_date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'build_ref=%s:build-%s-%s\n' "$image" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: metadata
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the native architecture
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          # Run-specific references prevent mixing architectures from two pushes.
+          tags: ${{ needs.metadata.outputs.build_ref }}-${{ matrix.arch }}
+          build-args: |
+            VERSION=${{ needs.metadata.outputs.version }}
+            COMMIT=${{ needs.metadata.outputs.commit }}
+            BUILD_DATE=${{ needs.metadata.outputs.build_date }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.metadata.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.metadata.outputs.version }}
+            org.opencontainers.image.created=${{ needs.metadata.outputs.build_date }}
+          cache-from: type=gha,scope=ghcr-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ghcr-${{ matrix.arch }}
+
+  publish:
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the multi-platform image
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          COMMIT: ${{ needs.metadata.outputs.commit }}
+          BUILD_REF: ${{ needs.metadata.outputs.build_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "$IMAGE:sha-$COMMIT" \
+            "$BUILD_REF-amd64" "$BUILD_REF-arm64"
+          docker buildx imagetools inspect "$IMAGE:sha-$COMMIT"
+          # Reruns still build their triggering SHA, but may not roll back moving
+          # aliases after main has advanced. Fail closed if the ref check fails.
+          main_commit="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["object"]["sha"])')"
+          if [[ "$main_commit" == "$COMMIT" ]]; then
+            docker buildx imagetools create \
+              --tag "$IMAGE:latest" \
+              --tag "$IMAGE:$VERSION" \
+              "$IMAGE:sha-$COMMIT"
+            promotion='Updated latest and version aliases.'
+          else
+            promotion='Main has advanced; published the commit image without moving latest/version aliases.'
+          fi
+          {
+            printf '### Published container\n\n'
+            printf -- '- Version: `%s` (tag metadata only)\n' "$VERSION"
+            printf -- '- Built commit: `%s`\n' "$COMMIT"
+            printf -- '- Commit image: `%s:sha-%s`\n' "$IMAGE" "$COMMIT"
+            printf -- '- Platforms: `linux/amd64`, `linux/arm64`\n'
+            printf -- '- %s\n' "$promotion"
+          } >> "$GITHUB_STEP_SUMMARY"
