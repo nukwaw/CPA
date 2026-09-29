@@ -50,7 +50,7 @@ func TestUsagePersistenceStalledDDLDoesNotBlockBuildRun(t *testing.T) {
 			db := sql.OpenDB(usageDDLConnector{gate: gate})
 			t.Cleanup(func() { _ = db.Close() })
 			t.Cleanup(gate.release)
-			selectUsageTestCore(t, &usageTestCore{FileTokenStore: sdkAuth.NewFileTokenStore(), db: db})
+			selectUsageTestCore(t, sdkAuth.NewFileTokenStore())
 			cfg := &config.Config{Host: "127.0.0.1", Port: 0, CommercialMode: true, AuthDir: t.TempDir(), UsageStatisticsEnabled: false}
 			cfg.RemoteManagement.SecretKey = "configured-secret"
 			cfg.RemoteManagement.DisableAutoUpdatePanel = true
@@ -71,10 +71,13 @@ func TestUsagePersistenceStalledDDLDoesNotBlockBuildRun(t *testing.T) {
 				WithLocalManagementPassword("init-test-key").
 				WithServerOptions(api.WithServerConfigurator(func(s *api.Server) { server = s })).
 				WithHooks(cliproxy.Hooks{OnAfterStart: func(*cliproxy.Service) { close(started) }})
-			initializer, err := attachUsagePersistence(ctx, builder, cfg, path)
-			if err != nil {
-				t.Fatal(err)
-			}
+			storageCtx, cancelStorage := context.WithCancel(ctx)
+			initializer := &usagePersistenceInitializer{ctx: storageCtx, cancel: cancelStorage, initialized: make(chan struct{})}
+			builder.WithServerOptions(api.WithUsagePersistenceProvider(initializer.current))
+			context.AfterFunc(storageCtx, initializer.stop)
+			go initializer.initialize(func(ctx context.Context) (*usagepersist.Store, error) {
+				return usagepersist.Open(ctx, usagepersist.Options{Database: db, Schema: "selected"})
+			})
 			defer initializer.stop()
 			var initContext context.Context
 			select {
@@ -237,7 +240,11 @@ type usageDDLConnector struct{ gate *usageDDLGate }
 func (c usageDDLConnector) Connect(context.Context) (driver.Conn, error) {
 	return &usageDDLConn{gate: c.gate}, nil
 }
-func (c usageDDLConnector) Driver() driver.Driver { return usageTestDriver{} }
+func (c usageDDLConnector) Driver() driver.Driver { return usageDDLDriver{} }
+
+type usageDDLDriver struct{}
+
+func (usageDDLDriver) Open(string) (driver.Conn, error) { return nil, errors.New("not supported") }
 
 type usageDDLConn struct{ gate *usageDDLGate }
 

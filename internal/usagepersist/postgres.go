@@ -9,15 +9,33 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
-// postgresStore borrows the already initialized core PGSTORE connection. All
-// identifiers are qualified once, independently of a pooled connection's search_path.
+// All identifiers are qualified independently of a connection's search_path.
 type postgresStore struct {
+	ownsDB   bool
 	db       *sql.DB
 	schema   string
 	events   string
 	metadata string
+}
+
+func openUsagePostgres(ctx context.Context, dsn, schema string) (*postgresStore, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("invalid usage PostgreSQL connection configuration")
+	}
+	db := stdlib.OpenDB(*cfg)
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	s, err := openPostgresStore(ctx, db, schema)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	s.ownsDB = true
+	return s, nil
 }
 
 func openPostgresStore(ctx context.Context, db *sql.DB, schema string) (*postgresStore, error) {
@@ -254,5 +272,9 @@ func (s *postgresStore) MutateCache(ctx context.Context, namespace, key string, 
 	return tx.Commit()
 }
 
-// Close never closes the borrowed core connection pool.
-func (s *postgresStore) Close() error { return nil }
+func (s *postgresStore) Close() error {
+	if s.ownsDB {
+		return s.db.Close()
+	}
+	return nil
+}

@@ -50,7 +50,9 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 	}
 	var storage store
 	var err error
-	if options.Database != nil {
+	if options.PostgresDSN != "" {
+		storage, err = openUsagePostgres(ctx, options.PostgresDSN, options.Schema)
+	} else if options.Database != nil {
 		storage, err = openPostgresStore(ctx, options.Database, options.Schema)
 	} else {
 		if strings.TrimSpace(options.DataDir) == "" {

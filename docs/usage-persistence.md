@@ -7,8 +7,8 @@ This fork adds `/stats.html` and a persistence adapter for the **existing built-
 | Deployment | Usage storage | Database requirement |
 | --- | --- | --- |
 | Existing file-based/native or [base Compose](../docker-compose.yml) | Instance-specific local journal | None |
-| An already active PostgreSQL auth/config store | Borrows that store's actual SQL pool and schema | Its existing database only |
-| Explicit [bundled PostgreSQL Compose](../docker-compose.postgres.yml) | Shares the bundled PostgreSQL auth/config store | Bundled database, selected only with `-f docker-compose.postgres.yml` |
+| Native/external database with `USAGE_PG_DSN` | Dedicated usage-only PostgreSQL pool | Explicitly selected usage database |
+| Explicit [bundled PostgreSQL Compose](../docker-compose.postgres.yml) | PostgreSQL for usage only; CPA config/auth stay in files | Bundled database, selected only with `-f docker-compose.postgres.yml` |
 | CLIProxyAPIHome | This standalone add-on is not attached | No database added by this feature |
 
 The base, bundled PostgreSQL, and Home/cluster Compose files now default to `ghcr.io/nukwaw/cpa:latest`. `CLI_PROXY_IMAGE` still overrides that choice and `pull_policy: always` remains intact. The base deployment has no required database/password, no new PostgreSQL environment mapping, and no database startup dependency. Native local usage also needs no environment variable. External-database deployments should keep their existing wiring; they must not select the bundled file just to get statistics.
@@ -52,19 +52,13 @@ The original provider checks this gate when it handles a usage record. Turning c
 
 ## Opt-in bundled PostgreSQL deployment
 
-**This is an auth/config-storage choice, not a usage-only switch.** The [separate Compose file](../docker-compose.postgres.yml) is standalone, not an overlay. Do not combine it with the base file. It starts a private PostgreSQL service and uses the existing `PGSTORE_DSN`, `PGSTORE_SCHEMA`, and `PGSTORE_LOCAL_PATH` interfaces. Usage borrows the active `PostgresStore` connection pool and schema; it opens no second pool and has no separate database settings.
+**PostgreSQL stores fork usage data only. CPA configuration and authentication stay in files.** The [separate Compose file](../docker-compose.postgres.yml) sets `USAGE_PG_DSN` and optional `USAGE_PG_SCHEMA`, not `PGSTORE_DSN`. The fork owns its usage connection pool and creates only `usage_events` and `usage_metadata`. The latter holds fork pricing/quota metadata. The file is standalone, not an overlay.
 
-### Bootstrap and migration prerequisites
+### Configuration and existing installations
 
-Understand the existing PGSTORE bootstrap before starting or migrating:
+The host configuration is mounted **writable at `/CLIProxyAPI/config.yaml`**, and `CLI_PROXY_AUTH_PATH` (default `./auths`) is mounted at `/root/.cli-proxy-api`. There is no seed-file indirection or config/auth spool. Keep the configured auth directory aligned with that mount.
 
-1. The CLI appends `pgstore/` below `PGSTORE_LOCAL_PATH`. The managed configuration is in `pgstore/config/config.yaml`; managed auth files are in `pgstore/auths/`.
-2. An existing database config is authoritative and is written into the spool at startup. If the database has no config row, an existing spool config is used. Only when both are absent does bootstrap copy the working directory's [config template](../config.example.yaml). A normal config-path argument or mount alone is **not** the PGSTORE seed.
-3. The bundled deployment therefore mounts `CLI_PROXY_CONFIG_PATH` (default `./config.yaml`) **read-only at `/CLIProxyAPI/config.example.yaml`**, the actual bootstrap seed path. The host file must already exist; `create_host_path: false` prevents silently creating a directory for a missing file. This does not overwrite the host configuration. Subsequent seed edits do not replace database configuration; use the existing management configuration workflow against the active store.
-4. Existing PGSTORE bootstrap **removes and rebuilds its spool auth directory from database records**. The bundled deployment uses a dedicated `postgres-spool` volume and intentionally does not bind the old local auth directory there. Copying auth files into the spool before startup is not a migration and can lose those copies.
-5. For an existing installation, back up its configuration, auth files, and relevant databases first. Plan and verify credential import through the existing authenticated management upload/login flows, or a separately reviewed PGSTORE migration, **before production cutover**. Verify credentials and configuration after a restart. Old host auth/config files remain untouched by this deployment; retain them and a rollback plan. It performs no automatic local-auth or usage-history migration.
-
-The bootstrap behavior is implemented in the existing [server entrypoint](../cmd/server/main.go) and [PostgresStore](../internal/store/postgresstore.go); this deployment does not alter it. Do not delete database config or spool files merely to force reseeding.
+If you previously used the old PGSTORE-based deployment, back up/export its **active** configuration and auth files before switching. Its host seed may be outdated; the old default active directory was `/var/lib/cliproxy/pgstore/`. Place the exported configuration/auths in the host mounts and change an old spool auth-dir to `/root/.cli-proxy-api`. Remove `PGSTORE_DSN` from any custom container environment. This change does not export credentials, delete old database rows/volumes, or migrate data automatically. Keep the same database/schema/project name to retain existing usage history.
 
 ### New-installation commands
 
@@ -80,9 +74,9 @@ openssl rand -hex 32
 Before starting:
 
 - Set `POSTGRES_PASSWORD` in the environment file to the generated value. The optional `POSTGRES_USER` and `POSTGRES_DB` default to `cliproxy`. Use URL-safe username/database values and a hexadecimal password because the bundled DSN is constructed from them. These variables are not required by base Compose, native local mode, Home, or an external database.
-- Configure real client API keys, desired providers, the existing usage switch, and a strong management secret in the selected seed configuration. A nonempty `MANAGEMENT_PASSWORD` is an alternative, but also enables remote management; review the security section.
-- Keep `PGSTORE_LOCAL_PATH` as an absolute container path (default `/var/lib/cliproxy`); the named spool volume is mounted at that path. Do not set it to an existing auth directory or a location that masks application files. `PGSTORE_SCHEMA` defaults to `public` in this example.
-- The file deliberately constructs `PGSTORE_DSN` for its bundled `postgres` service. An external shell value does not redirect it. For an external database, use your existing deployment instead, with the bootstrap prerequisites above.
+- Configure real client API keys, providers, the existing usage switch, and a management secret in the normal writable configuration. A nonempty `MANAGEMENT_PASSWORD` also enables remote management; review the security section.
+- `USAGE_PG_SCHEMA` defaults to `public`. If keeping historical usage from a custom schema, select that same schema.
+- Compose constructs `USAGE_PG_DSN` for the bundled `postgres` service. Native/external deployments can set `USAGE_PG_DSN` directly. No `PGSTORE_*` setting is needed for usage.
 - Resolve host-port conflicts with an existing installation as part of the planned cutover. The example retains the usual proxy/OAuth callback port mappings.
 
 See [the environment example](../.env.example) for the exact settings. Build and start this fork explicitly:
@@ -105,7 +99,7 @@ Alternatively, when deliberately using a prebuilt image of this fork, set `CLI_P
 
 Open `/stats.html` on the proxy (default port `8317`) and authenticate using the **management key**, not a proxy client API key. Configure model prices and generate normal traffic.
 
-PostgreSQL has no published host port, has a named `postgres-data` volume, and is the only service this deployment health-waits for. The spool has its own named `postgres-spool` volume. The chosen project name prefixes both volume names: keep it stable across restarts/upgrades. The store needs permission to create/use its tables and indexes in the selected schema. Failure of the configured PostgreSQL auth/config backend is not a request to switch silently to local history.
+PostgreSQL has no published host port and retains usage in the named `postgres-data` volume. Keep the Compose project name stable across upgrades. The usage database user needs permission to create/use usage tables and indexes in the selected schema. Usage initialization failures leave CPA file-backed operation unchanged; they do not silently switch usage storage.
 
 ## Native and existing external deployments
 
@@ -122,7 +116,7 @@ Existing external deployments can instead retain their selected prebuilt image a
 
 ### Local journal
 
-With no active `PostgresStore`, the adapter writes `<root>/usage/<instance-id>/usage.jsonl`. The root is the absolute existing `WRITABLE_PATH`, or the resolved `AuthDir` if that variable is absent. The instance ID is the full hexadecimal SHA-256 of the absolute configuration path, not of its contents. Moving that path selects a different instance directory; it does not delete or migrate the previous history. The config path identifies the instance but does **not** choose a writable location beside the configuration. `WRITABLE_PATH` is an existing shared writable-root setting, not a usage-only setting. The original lowercase `writable_path` convention remains supported.
+With `USAGE_PG_DSN` unset, the adapter writes `<root>/usage/<instance-id>/usage.jsonl`. The root is the absolute existing `WRITABLE_PATH`, or the resolved `AuthDir` if that variable is absent. The instance ID is the full hexadecimal SHA-256 of the absolute configuration path, not of its contents. Moving that path selects a different instance directory; it does not delete or migrate the previous history. The config path identifies the instance but does **not** choose a writable location beside the configuration. `WRITABLE_PATH` is an existing shared writable-root setting, not a usage-only setting. The original lowercase `writable_path` convention remains supported.
 
 For example, after building a binary of this fork:
 

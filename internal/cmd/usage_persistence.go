@@ -3,10 +3,11 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
@@ -14,21 +15,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy"
 	log "github.com/sirupsen/logrus"
 )
 
-// usagePersistenceOptions follows the already selected core storage resource.
-// main registers that resource after resolving PGSTORE and the auth directory;
-// this add-on must not reparse credentials or initialize a second database pool.
+// Usage storage is independent of CPA's configuration and authentication store.
 func usagePersistenceOptions(cfg *config.Config, configPath string) (usagepersist.Options, error) {
-	if core, ok := sdkAuth.GetTokenStore().(interface{ UsageDatabase() (*sql.DB, string) }); ok {
-		db, schema := core.UsageDatabase()
-		if db == nil {
-			return usagepersist.Options{}, errors.New("selected PostgreSQL store is unavailable")
-		}
-		return usagepersist.Options{Database: db, Schema: schema}, nil
+	if dsn := strings.TrimSpace(os.Getenv("USAGE_PG_DSN")); dsn != "" {
+		return usagepersist.Options{PostgresDSN: dsn, Schema: strings.TrimSpace(os.Getenv("USAGE_PG_SCHEMA"))}, nil
 	}
 	root := util.WritablePath()
 	if root == "" {
