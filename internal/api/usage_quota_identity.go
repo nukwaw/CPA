@@ -58,9 +58,12 @@ func newUsageQuotaIdentitySource(current func() *coreauth.Manager, currentConfig
 		if !strings.EqualFold(strings.TrimSpace(provider), auth.Provider) {
 			return false
 		}
-		disk := &coreauth.Auth{ID: auth.ID, Index: auth.Index, Provider: auth.Provider, FileName: auth.FileName, Metadata: metadata}
+		// The file must still describe the same credential the runtime observes.
+		// Runtime selector attributes are inherited by the projection, because the
+		// synthesizer derives some of them (the Kimi domain/base_url pair, for
+		// example) and a file cannot restate them.
 		runtimeBinding, okRuntime := usagepersist.ProjectQuotaBinding(auth)
-		diskBinding, okDisk := usagepersist.ProjectQuotaBinding(disk)
+		diskBinding, okDisk := usagepersist.ProjectDiskQuotaBinding(auth, metadata)
 		return okRuntime && okDisk && runtimeBinding.CredentialGeneration == diskBinding.CredentialGeneration
 	})
 }

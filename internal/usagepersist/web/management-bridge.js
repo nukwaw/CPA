@@ -1,4 +1,5 @@
-/* Explicit adapter for the verified upstream quota/auth stores. No UI/DOM replacement. */
+/* Explicit adapter for the verified upstream quota/auth stores. No UI/DOM replacement: the
+   separate management-nav.js asset adds the statistics link. */
 (function (root) {
   'use strict';
   const mapNames = {antigravity: 'antigravityQuota', claude: 'claudeQuota', codex: 'codexQuota', devin: 'devinQuota', kimi: 'kimiQuota', meta: 'metaQuota', xai: 'xaiQuota'};
@@ -179,6 +180,12 @@
     attached = true;
     const clearQuotaCache = quotaStore.getState().clearQuotaCache;
     let session = 0, authenticated = false, key = '', base = '', applying = false, identityClearing = false;
+    // Hand the current same-origin management key to the embedded statistics
+    // dashboard in this tab only, exactly as the upstream "remember for this tab"
+    // option does. The value is never returned or placed in navigation markup.
+    api.armStatistics = () => {
+      try {if (authenticated && key) window.sessionStorage.setItem('cpa-stats-management-key', key);} catch {}
+    };
     let bindings = new Map(), poll = 0, debounce = 0, flushing = null, refreshTicket = 0, globalInvalidated = 0;
     const pending = new Map(), observation = new Map(), invalidated = new Map(), windowTimes = new Map(), denied = new Set(), unknownNames = new Set();
     let unknownBatch = false;

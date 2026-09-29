@@ -111,6 +111,50 @@ func TestUsageQuotaIdentityDiskReplacementAndRestart(t *testing.T) {
 	}
 }
 
+// A Kimi file credential always receives derived `domain` and `base_url` attributes
+// from the file synthesizer, and both participate in credential identity. The disk
+// reconciliation must not treat those runtime-only values as missing file evidence,
+// or every Kimi credential would silently lose its persisted quota state.
+func TestUsageQuotaIdentityKeepsDerivedSelectorAttributes(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	path := filepath.Join(directory, "kimi.json")
+	metadata := map[string]any{"type": "kimi", "access_token": "kimi-token", "refresh_token": "rt-kimi", "email": "kimi@example.invalid"}
+	writeFile := func(value map[string]any) {
+		t.Helper()
+		data, _ := json.Marshal(value)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(metadata)
+	auth := &coreauth.Auth{ID: "kimi.json", FileName: "kimi.json", Provider: "kimi", Attributes: map[string]string{
+		coreauth.AttributePath:          path,
+		coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
+		"auth_kind":                     "oauth",
+		"base_url":                      "https://api.kimi.com/coding",
+		"domain":                        "kimi.com",
+	}, Metadata: map[string]any{"type": "kimi", "access_token": "kimi-token", "refresh_token": "rt-kimi", "email": "kimi@example.invalid"}}
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{AuthDir: directory}
+	source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager }, func() *config.Config { return cfg })
+	bindings := source.QuotaBindings(true)
+	if len(bindings) != 1 {
+		t.Fatal("derived selector attributes made a file credential unverifiable")
+	}
+	if _, ok := bindings[0].SelectorHashes["base_url"]; !ok {
+		t.Fatal("derived base_url selector is not part of identity")
+	}
+	// A genuinely different on-disk credential must still be refused.
+	writeFile(map[string]any{"type": "kimi", "access_token": "other-token", "refresh_token": "rt-kimi", "email": "kimi@example.invalid"})
+	if len(source.QuotaBindings(true)) != 0 {
+		t.Fatal("changed file credential still verified")
+	}
+}
+
 func TestUsageQuotaIdentitiesAuthenticatedDynamicAndStalePUT(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	cfg := &config.Config{CommercialMode: true, AuthDir: t.TempDir()}

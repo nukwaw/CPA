@@ -12,7 +12,7 @@ import (
 // AssetsPrefix is the canonical URL prefix for the embedded statistics assets.
 const AssetsPrefix = "/stats-assets"
 
-//go:embed stats.html stats.css stats-core.js stats.js management-bridge.js
+//go:embed stats.html stats.css stats-core.js stats.js management-bridge.js management-nav.js
 var assets embed.FS
 
 // Asset returns a known embedded asset, its MIME type and whether it exists.
@@ -24,6 +24,7 @@ func Asset(name string) ([]byte, string, bool) {
 		"stats-core.js":        "text/javascript; charset=utf-8",
 		"stats.js":             "text/javascript; charset=utf-8",
 		"management-bridge.js": "text/javascript; charset=utf-8",
+		"management-nav.js":    "text/javascript; charset=utf-8",
 	}
 	contentType, ok := contentTypes[name]
 	if !ok {
@@ -45,6 +46,10 @@ var (
 
 const bridgeMarker = "data-cpa-quota-persistence"
 
+// navMarker marks the separate navigation asset that links the management
+// sidebar to the embedded statistics dashboard.
+const navMarker = "data-cpa-stats-nav"
+
 // InjectManagementHTML adds a separate bridge asset and an explicit same-module
 // store adapter to a recognized upstream management bundle. The source file on
 // disk is never changed. On unknown versions, callers should log a compatibility
@@ -52,7 +57,7 @@ const bridgeMarker = "data-cpa-quota-persistence"
 //
 // Verified against upstream source commit 4530da271ba2e89810d4dccebc57f3091afa590a.
 func InjectManagementHTML(data []byte) ([]byte, bool) {
-	if bytes.Contains(data, []byte(bridgeMarker)) {
+	if bytes.Contains(data, []byte(bridgeMarker)) && bytes.Contains(data, []byte(navMarker)) {
 		return data, true
 	}
 	matches := scriptElement.FindAllSubmatchIndex(data, -1)
@@ -98,10 +103,11 @@ func InjectManagementHTML(data []byte) ([]byte, bool) {
 		return data, false
 	}
 	item := found[0]
-	asset := `<script ` + bridgeMarker + ` src=".` + AssetsPrefix + `/management-bridge.js"></script>`
+	asset := `<script ` + bridgeMarker + ` src=".` + AssetsPrefix + `/management-bridge.js"></script>` +
+		`<script ` + navMarker + ` src=".` + AssetsPrefix + `/management-nav.js"></script>`
 	adapter := fmt.Sprintf("\n;try{window.CPAQuotaPersistence&&window.CPAQuotaPersistence.attach({quotaStore:%s,authStore:%s});}catch{console.warn('CPA quota persistence could not attach; original quota UI remains available.');}\n", item.quota, item.auth)
 	var result bytes.Buffer
-	result.Grow(len(data) + len(asset) + len(adapter))
+	result.Grow(len(data) + len(asset) + len(adapter) + 64)
 	result.Write(data[:item.start])
 	result.WriteString(asset)
 	result.Write(data[item.start:item.bodyStart])

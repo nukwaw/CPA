@@ -281,6 +281,80 @@ func TestQuotaIdentityRolloverStalePUTAndRestart(t *testing.T) {
 	}
 }
 
+// TestQuotaIdentityDurableCacheSurvivesRuntimeRevisionDrift reproduces the reported
+// regression: a manual quota refresh captures request-start identity, an unrelated
+// auth-file write advances the runtime revision while the credential stays the same,
+// and the captured observation arrives afterwards. The durable display cache is
+// bound to the credential, not to the runtime operation fence, so it must persist.
+func TestQuotaIdentityDurableCacheSurvivesRuntimeRevisionDrift(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	auth := quotaFixtureAuth("claude", "account-1", "auth.json", "source-token")
+	manager := bindQuotaFixtures(t, s, auth)
+	captured := fixtureBinding(s, "claude", "account-1")
+	entry := bindCacheFixture(s, QuotaCacheEntry{Provider: "claude", AuthIndex: "account-1", ObservedAt: time.Now().Add(-time.Minute), State: json.RawMessage(`{"status":"success","windows":[]}`)})
+	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{entry}); err != nil {
+		t.Fatalf("fresh observation rejected: %v", err)
+	}
+	// Any auth-file write advances Generation, and with it the runtime revision.
+	if _, err := manager.Update(ctx, auth.Clone()); err != nil {
+		t.Fatal(err)
+	}
+	current := fixtureBinding(s, "claude", "account-1")
+	if current.CredentialGeneration != captured.CredentialGeneration {
+		t.Fatal("benign credential activity changed durable identity")
+	}
+	if current.Revision == captured.Revision {
+		t.Fatal("benign credential activity did not advance the runtime revision")
+	}
+	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{entry}); err != nil {
+		t.Fatalf("drifted request-start revision rejected: %v", err)
+	}
+	if cached, err := s.QuotaCache(ctx); err != nil || len(cached) != 1 {
+		t.Fatalf("displayed state lost after revision drift: %#v %v", cached, err)
+	}
+	// Real replacement must still be refused and remain invisible.
+	auth.Metadata["access_token"] = "replacement-token"
+	if _, err := manager.Update(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{entry}); !errors.Is(err, ErrQuotaIdentity) {
+		t.Fatalf("replaced credential accepted stale observation: %v", err)
+	}
+	if cached, _ := s.QuotaCache(ctx); len(cached) != 0 {
+		t.Fatal("replaced credential still displays old state")
+	}
+}
+
+// Disk reconciliation restates a credential's metadata from its backing file while
+// keeping attributes, which core derives for some providers and a file cannot
+// restate. Kimi always receives a derived domain/base_url pair that is part of its
+// identity; without those attributes every Kimi comparison would fail and the
+// credential would silently lose its persisted quota display.
+func TestQuotaIdentityDiskProjectionKeepsRuntimeSelectorAttributes(t *testing.T) {
+	metadata := map[string]any{"type": "kimi", "access_token": "kimi-token", "refresh_token": "rt-kimi"}
+	auth := &coreauth.Auth{ID: "kimi.json", FileName: "kimi.json", Provider: "kimi", Metadata: metadata,
+		Attributes: map[string]string{"base_url": "https://api.kimi.com/coding", "domain": "kimi.com"}}
+	runtimeBinding, ok := ProjectQuotaBinding(auth)
+	if !ok {
+		t.Fatal("kimi runtime projection refused")
+	}
+	if len(runtimeBinding.SelectorHashes) != 2 {
+		t.Fatalf("derived selectors missing from identity: %#v", runtimeBinding.SelectorHashes)
+	}
+	diskBinding, ok := ProjectDiskQuotaBinding(auth, map[string]any{"type": "kimi", "access_token": "kimi-token", "refresh_token": "rt-kimi"})
+	if !ok || diskBinding.CredentialGeneration != runtimeBinding.CredentialGeneration {
+		t.Fatal("unchanged kimi file did not reconcile")
+	}
+	replaced, ok := ProjectDiskQuotaBinding(auth, map[string]any{"type": "kimi", "access_token": "other-token", "refresh_token": "rt-kimi"})
+	if !ok || replaced.CredentialGeneration == runtimeBinding.CredentialGeneration {
+		t.Fatal("changed kimi file reconciled as the old credential")
+	}
+	if _, ok := ProjectDiskQuotaBinding(nil, metadata); ok {
+		t.Fatal("absent runtime credential projected")
+	}
+}
+
 func TestQuotaIdentityNoSourceAndLegacyRowsHidden(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

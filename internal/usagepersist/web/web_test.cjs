@@ -215,8 +215,9 @@ function harness({cached = [], snapshots = [], origin = 'http://localhost:18317'
   const calls = [], events = [], timers = new Map(), listeners = new Map(), holds = []; let nextTimer = 0;
   const maps = {cacheGeneration: 0, fileGenerations: {}, ...Object.fromEntries(providers.map(provider => [`${provider}Quota`, {}]))};
   const quota = store(maps), auth = store({isAuthenticated: true, connectionStatus: 'connected', apiBase: origin, managementKey: 'secret-key'});
-  const window = {dispatchEvent(event) {events.push(event);}, addEventListener(type, fn) {listeners.set(type, fn);}};
-  const h = {window, quota, auth, calls, events, timers, bindings, cached, snapshots, quotaStatus, now, putStatus: 200, clearCalls: [], hold(path, method = 'GET') {holds.push({path, method});}, refresh() {listeners.get('online')();}, async timersAt(ms) {for (const [id, timer] of [...timers]) if (timer.ms === ms) {timers.delete(id); timer.fn();} await settle();}, puts() {return calls.filter(call => call.options.method === 'PUT');}, resolveFiles() {calls.find(call => call.url.endsWith('/identities') && call.release)?.release();}};
+  const session = new Map();
+  const window = {dispatchEvent(event) {events.push(event);}, addEventListener(type, fn) {listeners.set(type, fn);}, sessionStorage: {getItem: key => session.has(key) ? session.get(key) : null, setItem: (key, value) => session.set(key, value), removeItem: key => session.delete(key)}};
+  const h = {window, quota, auth, calls, events, timers, bindings, cached, snapshots, quotaStatus, now, putStatus: 200, clearCalls: [], session, hold(path, method = 'GET') {holds.push({path, method});}, refresh() {listeners.get('online')();}, async timersAt(ms) {for (const [id, timer] of [...timers]) if (timer.ms === ms) {timers.delete(id); timer.fn();} await settle();}, puts() {return calls.filter(call => call.options.method === 'PUT');}, resolveFiles() {calls.find(call => call.url.endsWith('/identities') && call.release)?.release();}};
   if (delayFiles) h.hold('/identities');
   class Clock extends Date {constructor(...args) {super(...(args.length ? args : [h.now]));} static now() {return h.now;}}
   const context = vm.createContext({window, location: {origin: 'http://localhost:18317', href: 'http://localhost:18317/management.html'}, document: {hidden: false}, navigator: {onLine: true}, URL, Date: Clock, Map, Set, Object, Number, String, Array, JSON, Promise, TextEncoder, AbortController, DOMException, CustomEvent: class {constructor(type, options) {this.type = type; this.detail = options.detail;}}, console: {warn() {}}, setTimeout(fn, ms) {const id = ++nextTimer; timers.set(id, {fn, ms}); return id;}, clearTimeout(id) {timers.delete(id);}, fetch: async (url, options) => {
@@ -537,4 +538,91 @@ test('logout aborts synchronization and late callbacks cannot enter a new auth s
   h.auth.setState({isAuthenticated: false, connectionStatus: 'disconnected', managementKey: ''}); assert.equal(delayed.options.signal.aborted, true);
   delayed.release(); await settle(); assert.equal(h.window.CPAQuotaPersistence.status.state, 'waiting-for-login'); assert.equal(h.succeed(old), false);
   h.auth.setState({isAuthenticated: true, connectionStatus: 'connected', managementKey: 'new-key'}); await settle(); assert.equal(h.succeed(old), false); await h.timersAt(500); assert.equal(h.puts().length, 0);
+});
+
+// Minimal DOM used by the navigation asset: enough structure to prove it finds the
+// verified sidebar classes, appends one idempotent entry and leaves unknown markup alone.
+function fakeDocument({section = true} = {}) {
+  const created = [];
+  const node = tag => {
+    const element = {tag, attributes: {}, children: [], listeners: [], className: '', textContent: ''};
+    element.setAttribute = (name, value) => {element.attributes[name] = value;};
+    element.appendChild = child => {element.children.push(child); return child;};
+    element.addEventListener = (type, fn) => element.listeners.push({type, fn});
+    element.dispatch = event => {for (const listener of element.listeners) listener.fn(event);};
+    element.closest = () => (section ? {classList: {}} : null);
+    return element;
+  };
+  const sidebar = {className: 'sidebar'};
+  const navSection = {...node('div'), className: 'nav-section', sidebar};
+  navSection.closest = () => sidebar;
+  const document = {
+    created, navSection,
+    createElement: tag => {const element = node(tag); created.push(element); return element;},
+    createElementNS: (_namespace, tag) => {const element = node(tag); created.push(element); return element;},
+    querySelector: selector => {
+      if (selector.startsWith('[')) return created.some(element => Object.hasOwn(element.attributes, nav.entryAttribute)) ? {} : null;
+      if (selector === '.sidebar .nav-section') return section ? navSection : null;
+      return null;
+    },
+  };
+  return document;
+}
+
+const nav = require('./management-nav.js');
+test('navigation asset adds one statistics link to the verified sidebar markup', () => {
+  const document = fakeDocument();
+  assert.equal(nav.mount(document, null), true);
+  assert.equal(document.navSection.children.length, 1);
+  const group = document.navSection.children[0];
+  assert.equal(group.className, 'nav-group');
+  assert.ok(Object.hasOwn(group.attributes, nav.entryAttribute));
+  const link = group.children[0];
+  assert.equal(link.className, 'nav-item');
+  assert.equal(link.attributes.href, nav.href);
+  assert.equal(link.children[0].className, 'nav-icon');
+  assert.equal(link.children[1].children[0].textContent, nav.label);
+  assert.equal(nav.mount(document, null), true);
+  assert.equal(document.navSection.children.length, 1);
+});
+test('navigation asset leaves unavailable or unknown sidebar markup unchanged', () => {
+  const absent = fakeDocument({section: false});
+  assert.equal(nav.mount(absent, null), false);
+  assert.equal(absent.created.length, 0);
+  assert.equal(nav.mount({querySelector: () => {throw new Error('unexpected');}}, null), false);
+});
+test('plain left clicks hand over the tab key and navigate; modified clicks are never rewritten', () => {
+  const document = fakeDocument();
+  const aims = [], opened = [], prevented = [];
+  const bridge = {armStatistics: () => aims.push('armed')};
+  assert.equal(nav.mount(document, bridge, target => opened.push(target)), true);
+  const link = document.navSection.children[0].children[0];
+  link.dispatch({defaultPrevented: false, button: 0, preventDefault: () => prevented.push('prevented')});
+  assert.deepEqual(aims, ['armed']);
+  assert.deepEqual(opened, [nav.href]);
+  assert.deepEqual(prevented, ['prevented']);
+  for (const event of [{defaultPrevented: false, button: 1}, {defaultPrevented: false, button: 0, ctrlKey: true}, {defaultPrevented: false, button: 0, metaKey: true}, {defaultPrevented: true, button: 0}, {defaultPrevented: false, button: 0, shiftKey: true}]) {
+    event.preventDefault = () => prevented.push('modified');
+    for (const listener of link.listeners) listener.fn(event);
+  }
+  assert.deepEqual(aims, ['armed']);
+  assert.deepEqual(opened, [nav.href]);
+  assert.deepEqual(prevented, ['prevented']);
+  assert.equal(nav.plainLeftClick(null), false);
+  assert.equal(link.attributes.href, nav.href);
+});
+test('navigation asset never exposes or reads the management key itself', () => {
+  const source = fs.readFileSync(require.resolve('./management-nav.js'), 'utf8');
+  for (const secret of ['localStorage', 'managementKey', 'cpa-stats-management-key', 'Authorization']) {
+    assert.equal(source.includes(secret), false, secret);
+  }
+});
+test('statistics handoff exposes only the tab-scoped key the dashboard already reads', async () => {
+  const h = harness(); await settle();
+  h.window.CPAQuotaPersistence.armStatistics();
+  assert.equal(h.session.get('cpa-stats-management-key'), 'secret-key');
+  h.auth.setState({isAuthenticated: false, connectionStatus: 'disconnected', managementKey: ''});
+  h.session.clear();
+  h.window.CPAQuotaPersistence.armStatistics();
+  assert.equal(h.session.has('cpa-stats-management-key'), false);
 });

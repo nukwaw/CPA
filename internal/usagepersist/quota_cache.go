@@ -16,6 +16,8 @@ import (
 
 // QuotaCacheEntry is the existing management UI's display-only quota state.
 // Its strict recursive schema excludes arbitrary response/request objects and errors.
+// Revision is the client's request-start fence. It is accepted for diagnostics but
+// never persisted and never required to match durable credential identity.
 type QuotaCacheEntry struct {
 	Provider             string          `json:"provider"`
 	Key                  string          `json:"key"`
@@ -240,8 +242,15 @@ func (s *Store) SaveQuotaCache(ctx context.Context, entries []QuotaCacheEntry) e
 	}
 	return nil
 }
+
+// quotaCacheBindingMatches accepts displayed state for the durable credential it
+// was observed with. A request-start revision must still be present, proving the
+// client captured identity evidence before observing, but it is never required to
+// match: it advances on ordinary credential activity such as an auth-file write or
+// a token refresh, while the credential generation it fences stays identical. A
+// real replacement is still refused by its different credential generation and key.
 func quotaCacheBindingMatches(entry QuotaCacheEntry, binding QuotaBinding) bool {
-	return entry.CredentialGeneration != "" && entry.Revision != "" && binding.Key == entry.Key && binding.CredentialGeneration == entry.CredentialGeneration && binding.Revision == entry.Revision
+	return entry.CredentialGeneration != "" && entry.Revision != "" && binding.Key == entry.Key && binding.CredentialGeneration == entry.CredentialGeneration
 }
 
 func (s *Store) validQuotaCacheBinding(entry QuotaCacheEntry) bool {

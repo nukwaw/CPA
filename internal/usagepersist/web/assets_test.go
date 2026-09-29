@@ -17,7 +17,7 @@ var ym="\0";function Sm(e){let t=e.indexOf(ym);return t===-1?e:e.slice(0,t)}var 
 </script></head><body><div id="root"></div></body></html>`
 
 func TestAssetAllowlist(t *testing.T) {
-	for _, name := range []string{"stats.html", "stats.css", "stats-core.js", "stats.js", "management-bridge.js"} {
+	for _, name := range []string{"stats.html", "stats.css", "stats-core.js", "stats.js", "management-bridge.js", "management-nav.js"} {
 		data, contentType, ok := Asset(name)
 		if !ok || len(data) == 0 || !strings.Contains(contentType, "charset=utf-8") {
 			t.Fatalf("missing asset %s", name)
@@ -51,8 +51,14 @@ func TestInjectRecognizedManagementModule(t *testing.T) {
 		if !bytes.Contains(result, []byte(`<script data-cpa-quota-persistence src=".`+AssetsPrefix+`/management-bridge.js"></script>`)) {
 			t.Fatal("bridge does not use the canonical asset path and marker")
 		}
+		if !bytes.Contains(result, []byte(`<script data-cpa-stats-nav src=".`+AssetsPrefix+`/management-nav.js"></script>`)) {
+			t.Fatal("navigation asset does not use the canonical asset path and marker")
+		}
 		if bytes.Index(result, []byte("management-bridge.js")) > bytes.Index(result, []byte(`type="module"`)) {
 			t.Fatal("bridge must load before the inline module")
+		}
+		if bytes.Index(result, []byte("management-nav.js")) > bytes.Index(result, []byte(`type="module"`)) {
+			t.Fatal("navigation asset must load before the inline module")
 		}
 		adapter := bytes.Index(result, []byte("CPAQuotaPersistence.attach"))
 		lastScriptEnd := bytes.LastIndex(result, []byte("</script>"))
@@ -104,7 +110,7 @@ func TestInjectFailsClosedForUnknownOrAmbiguousBundle(t *testing.T) {
 }
 
 func TestJavaScriptDoesNotUseHTMLSinks(t *testing.T) {
-	for _, name := range []string{"stats.js", "stats-core.js", "management-bridge.js"} {
+	for _, name := range []string{"stats.js", "stats-core.js", "management-bridge.js", "management-nav.js"} {
 		data, _, _ := Asset(name)
 		for _, unsafe := range []string{".innerHTML", ".outerHTML", "insertAdjacentHTML", "document.write(", "eval("} {
 			if bytes.Contains(data, []byte(unsafe)) {
@@ -129,7 +135,7 @@ func TestActualManagementBuild(t *testing.T) {
 	if !ok || !bytes.Contains(result, []byte("CPAQuotaPersistence.attach")) {
 		t.Fatal("the actual upstream bundle was not recognized")
 	}
-	if len(result) <= len(data) || bytes.Count(result, []byte(bridgeMarker)) != 1 {
+	if len(result) <= len(data) || bytes.Count(result, []byte(bridgeMarker)) != 1 || bytes.Count(result, []byte(navMarker)) != 1 {
 		t.Fatal("invalid compiled-asset injection")
 	}
 	verifyCompiledHelpers(t, data, result)

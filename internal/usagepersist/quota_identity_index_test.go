@@ -179,6 +179,9 @@ func TestQuotaIdentityIndexAmbiguityIsNotResolvedByInvalidCompetitor(t *testing.
 }
 
 func TestQuotaIdentityIndexLockedMutationRechecksCurrent(t *testing.T) {
+	// Display-cache writes are bound to durable credential identity. A credential
+	// that returns to the same token, or is removed and re-created from it, keeps its
+	// generation, so only a different credential must refuse the locked mutation.
 	for _, change := range []string{"replacement", "A-B-A", "delete-recreate", "deletion", "duplicate-index", "duplicate-key", "disk-replacement", "manager-replacement"} {
 		t.Run(change, func(t *testing.T) {
 			ctx := context.Background()
@@ -212,17 +215,20 @@ func TestQuotaIdentityIndexLockedMutationRechecksCurrent(t *testing.T) {
 					t.Error(err)
 				}
 			}
+			sameCredential := false
 			switch change {
 			case "replacement":
 				update("B")
 			case "A-B-A":
 				update("B")
 				update("A")
+				sameCredential = true
 			case "delete-recreate":
 				manager.Remove(ctx, auth.ID)
 				if _, err := manager.Register(ctx, quotaFixtureAuth("codex", "index", "same.json", "A")); err != nil {
 					t.Error(err)
 				}
+				sameCredential = true
 			case "deletion":
 				manager.Remove(ctx, auth.ID)
 			case "duplicate-index", "duplicate-key":
@@ -241,7 +247,17 @@ func TestQuotaIdentityIndexLockedMutationRechecksCurrent(t *testing.T) {
 				active.Store(coreauth.NewManager(nil, nil, nil))
 			}
 			close(release)
-			if err := <-done; !errors.Is(err, ErrQuotaIdentity) {
+			err := <-done
+			if sameCredential {
+				if err != nil {
+					t.Fatalf("same-credential locked mutation refused: %v", err)
+				}
+				if len(backend.rows) != 1 {
+					t.Fatal("same-credential locked mutation persisted no row")
+				}
+				return
+			}
+			if !errors.Is(err, ErrQuotaIdentity) {
 				t.Fatalf("stale locked mutation returned %v", err)
 			}
 			if len(backend.rows) != 0 {

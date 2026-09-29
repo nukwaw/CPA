@@ -525,6 +525,29 @@ func (source *managerQuotaIdentitySource) QuotaBinding(provider, index string, v
 var quotaInformationalFields = strings.Fields("type auth_kind email label note disabled priority weight prefix proxy_url excluded_models oauth_model_aliases model_aliases models request_retry request_scoped_errors disable_cooling websockets tool_prefix_disabled last_refresh last_refreshed_at expired expires_at expiry expires_in expire expires token_type scope scopes plan_type plan tier subscription created_at updated_at timestamp dca_expired dca_expires_at subs_tier_name subs_tier_id is_subs_active has_payment_method organization_name org_name user_name username name picture avatar claude_device_ids fingerprint_profile device_id device_seed refresh_token refreshToken id_token idToken token_endpoint redirect_uri")
 var quotaSelectorFields = strings.Fields("account_id account_uuid organization_uuid organization_id org_id project_id team_id user_id sub domain base_url")
 
+// ProjectDiskQuotaBinding projects the credential a backing file currently
+// describes, for comparison with the live runtime projection.
+//
+// Only metadata is replaced with the file's: metadata is what a file credential
+// restates, while the runtime attributes are shared read-only because a file cannot
+// restate them. Core derives attributes for file credentials that do take part in
+// identity, such as the Kimi domain/base_url pair that every Kimi file credential
+// receives, so dropping them would make every comparison fail rather than detect a
+// real change to the file.
+func ProjectDiskQuotaBinding(runtime *coreauth.Auth, metadata map[string]any) (QuotaBinding, bool) {
+	if runtime == nil || len(metadata) > 128 {
+		return QuotaBinding{}, false
+	}
+	return ProjectQuotaBinding(&coreauth.Auth{
+		ID:         runtime.ID,
+		Index:      runtime.Index,
+		Provider:   runtime.Provider,
+		FileName:   runtime.FileName,
+		Attributes: runtime.Attributes,
+		Metadata:   metadata,
+	})
+}
+
 // ProjectQuotaBinding is a bounded, restart-stable projection of effective
 // credentials and quota-affecting selectors. It does not use email, mtime or ID
 // as account evidence. It returns no raw token or selector value.

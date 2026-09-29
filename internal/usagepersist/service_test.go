@@ -336,7 +336,6 @@ func TestQuotaCacheRejectsMissingOrMismatchedBindingBeforeBatchWrite(t *testing.
 		{"missing-generation", func(e *QuotaCacheEntry) { e.CredentialGeneration = "" }},
 		{"missing-revision", func(e *QuotaCacheEntry) { e.Revision = "" }},
 		{"wrong-generation", func(e *QuotaCacheEntry) { e.CredentialGeneration += "-stale" }},
-		{"wrong-revision", func(e *QuotaCacheEntry) { e.Revision += "-stale" }},
 		{"wrong-provider", func(e *QuotaCacheEntry) { e.Provider = "codex" }},
 		{"wrong-index", func(e *QuotaCacheEntry) { e.AuthIndex = "other-index" }},
 		{"wrong-key", func(e *QuotaCacheEntry) { e.Key = "other.json" }},
@@ -355,6 +354,15 @@ func TestQuotaCacheRejectsMissingOrMismatchedBindingBeforeBatchWrite(t *testing.
 			}
 			if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{valid}); err != nil {
 				t.Fatalf("valid source binding rejected: %v", err)
+			}
+			// A request-start revision that drifted while the credential stayed the
+			// same must still be accepted, otherwise a browser refresh that raced an
+			// ordinary auth-file write would silently lose its displayed state.
+			drifted := valid
+			drifted.Revision = "drifted-revision"
+			drifted.ObservedAt = time.Now()
+			if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{drifted}); err != nil {
+				t.Fatalf("same-credential revision drift rejected: %v", err)
 			}
 			withoutSource := openTestStore(t)
 			if err := withoutSource.SaveQuotaCache(ctx, []QuotaCacheEntry{valid}); !errors.Is(err, ErrQuotaIdentity) {
