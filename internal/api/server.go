@@ -230,6 +230,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	engine.Use(s.homeHeartbeatMiddleware())
 	engine.Use(s.exampleAPIKeySafeModeMiddleware())
 
+	if optionState.serverConfigurator != nil {
+		optionState.serverConfigurator(s)
+	}
+
 	// Setup routes
 	s.setupRoutes()
 

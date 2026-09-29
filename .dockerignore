@@ -4,6 +4,7 @@
 
 # Docker and CI/CD related files
 docker-compose.yml
+docker-compose.postgres.yml
 .dockerignore
 .gitignore
 .goreleaser.yml
@@ -19,7 +20,13 @@ LICENSE
 auths
 logs
 conv
+# Repository-root runtime state only; internal/usagepersist must be built.
+/usage/
+/pgstore/
+/gitstore/
+/objectstore/
 config.yaml
+.env
 
 # Development/editor
 bin

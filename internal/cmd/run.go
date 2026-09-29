@@ -55,12 +55,27 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 		}))
 	}
 
+	persistence, errPersistence := attachUsagePersistence(runCtx, builder, cfg, configPath)
+	if errPersistence != nil {
+		if !errors.Is(errPersistence, context.Canceled) && !errors.Is(errPersistence, context.DeadlineExceeded) {
+			log.Error(errPersistence)
+		}
+		return
+	}
+	defer persistence.stop()
+	if runCtx.Err() != nil {
+		return
+	}
+
 	service, err := builder.Build()
 	if err != nil {
 		log.Errorf("failed to build proxy service: %v", err)
 		return
 	}
 
+	if runCtx.Err() != nil {
+		return
+	}
 	err = service.Run(runCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Errorf("proxy service exited with error: %v", err)
@@ -88,18 +103,32 @@ func StartServiceBackgroundWithPluginHost(cfg *config.Config, configPath string,
 
 	ctx, cancelFn := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
-
-	service, err := builder.Build()
-	if err != nil {
-		log.Errorf("failed to build proxy service: %v", err)
-		close(doneCh)
-		return cancelFn, doneCh
-	}
-
 	go func() {
 		defer close(doneCh)
-		if err := service.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Errorf("proxy service exited with error: %v", err)
+		defer cancelFn()
+		// Optional storage initialization runs independently of Build/Run, under
+		// the returned cancellation handle even while database DDL is stalled.
+		persistence, errPersistence := attachUsagePersistence(ctx, builder, cfg, configPath)
+		if errPersistence != nil {
+			if !errors.Is(errPersistence, context.Canceled) && !errors.Is(errPersistence, context.DeadlineExceeded) {
+				log.Error(errPersistence)
+			}
+			return
+		}
+		defer persistence.stop()
+		if ctx.Err() != nil {
+			return
+		}
+		service, err := builder.Build()
+		if err != nil {
+			log.Errorf("failed to build proxy service: %v", err)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if errRun := service.Run(ctx); errRun != nil && !errors.Is(errRun, context.Canceled) {
+			log.Errorf("proxy service exited with error: %v", errRun)
 		}
 	}()
 

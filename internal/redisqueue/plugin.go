@@ -160,6 +160,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		return
 	}
 	Enqueue(payload)
+	observeUsage(ctx, payload)
 }
 
 type queuedUsageDetail struct {

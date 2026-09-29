@@ -16,6 +16,7 @@ import (
 type serverOptionConfig struct {
 	extraMiddleware       []gin.HandlerFunc
 	engineConfigurator    func(*gin.Engine)
+	serverConfigurator    func(*Server)
 	routerConfigurator    func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)
 	requestLoggerFactory  func(*config.Config, string) logging.RequestLogger
 	localPassword         string

@@ -19,6 +19,8 @@ examples/plugin/bin/*
 pgstore/*
 gitstore/*
 objectstore/*
+# Repository-root runtime state only; never hide internal/usagepersist source.
+/usage/
 
 # Static assets
 static/*
@@ -31,6 +33,7 @@ auths/*
 # Documentation
 docs/*
 !docs/management-api-v8.md
+!docs/usage-persistence.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md

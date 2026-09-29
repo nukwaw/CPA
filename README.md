@@ -140,7 +140,11 @@ see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
 ## Usage Statistics
 
-Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) no longer ship built-in usage statistics. If you need usage statistics, use:
+This fork adds `/stats.html` and bounded, asynchronous persistence of the built-in usage output for standalone CLI runs. Enable the existing `observability.usage.usage-statistics-enabled` option (v0: `usage-statistics-enabled`; default: `false`) to collect new usage; there is no additional enable switch. Saved history, pricing, and management quota remain available when collection is off and persistence is healthy. Storage initialization and observation writes do not block inference startup or the original management handlers. The original management quota page remains available.
+
+An already active PostgreSQL auth/config store supplies its existing SQL pool and schema; otherwise an instance-specific local journal uses `WRITABLE_PATH` or the resolved auth directory. The [base Compose deployment](docker-compose.yml) keeps its original image/pull behavior and does not require PostgreSQL. The explicitly selected [bundled PostgreSQL deployment](docker-compose.postgres.yml) is a separate auth/config-storage choice, **not** an automatic usage-only upgrade. Read the [usage persistence guide](docs/usage-persistence.md) for safe config seeding/auth migration, explicit fork-build commands, storage/worker limits, and validation instructions. Persistence is best-effort operational history, not a billing ledger.
+
+Upstream CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) removed built-in usage statistics in v6.10.0. Alternative external statistics projects include:
 
 ### [CPA Usage Keeper](https://github.com/Willxup/cpa-usage-keeper)
 
