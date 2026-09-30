@@ -30,21 +30,49 @@
     const parsed = new Date(value);
     return value && Number.isFinite(parsed.getTime()) ? parsed.toLocaleString() : '—';
   };
-  function query(filters, now = Date.now()) {
-    const params = new URLSearchParams();
-    const ranges = {'1h': 3600000, '24h': 86400000, '7d': 604800000, '30d': 2592000000};
-    if (filters.range === 'custom') {
+  // One preset list drives every range control the dashboard owns, so the page
+  // filters and the credential side window cannot drift apart, and a range is
+  // always resolved in one place. `today` is the default: a reader opening the
+  // page wants the current day, not a rolling window that reaches into yesterday.
+  const RANGE_PRESETS = [
+    ['today', 'Today'],
+    ['yesterday', 'Yesterday'],
+    ['24h', 'Last 24 hours'],
+    ['7d', 'Last week'],
+    ['30d', 'Last month'],
+    ['custom', 'Custom range'],
+    ['all', 'All retained history'],
+  ];
+  const RANGE_DEFAULT = 'today';
+  const rolling = {'24h': 86400000, '7d': 604800000, '30d': 2592000000};
+  const startOfDay = at => new Date(at.getFullYear(), at.getMonth(), at.getDate());
+  // Resolve a preset to an explicit instant pair. The calendar presets use the
+  // reader's local day boundaries, which is the frame the page already labels its
+  // buckets in; a day boundary is therefore built from calendar parts rather than
+  // by subtracting a fixed 24 hours, which a DST shift would move.
+  function rangeBounds(range, filters = {}, now = Date.now()) {
+    const at = new Date(now);
+    if (range === 'custom') {
       const from = new Date(filters.from), to = new Date(filters.to);
       if (!filters.from || !filters.to || !Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from >= to) throw new Error('Choose a valid custom range with the end after the start.');
-      params.set('from', from.toISOString()); params.set('to', to.toISOString());
-      params.set('bucket', to - from > 3 * 86400000 ? 'day' : 'hour');
-    } else if (ranges[filters.range]) {
-      params.set('from', new Date(now - ranges[filters.range]).toISOString()); params.set('to', new Date(now).toISOString());
-      params.set('bucket', ranges[filters.range] > 3 * 86400000 ? 'day' : 'hour');
-    } else {
-      params.set('from', '1970-01-01T00:00:00.000Z'); params.set('to', new Date(now).toISOString());
-      params.set('bucket', 'day');
+      return {from, to};
     }
+    if (range === 'today') return {from: startOfDay(at), to: at};
+    if (range === 'yesterday') {const to = startOfDay(at); return {from: new Date(to.getFullYear(), to.getMonth(), to.getDate() - 1), to};}
+    if (rolling[range]) return {from: new Date(now - rolling[range]), to: at};
+    // Anything else, including an unknown value, reads all retained history.
+    return {from: new Date(0), to: at};
+  }
+  function rangeQuery(range, filters = {}, now = Date.now()) {
+    const {from, to} = rangeBounds(range, filters, now);
+    return {from: from.toISOString(), to: to.toISOString(), bucket: to - from > 3 * 86400000 ? 'day' : 'hour'};
+  }
+  function query(filters, now = Date.now()) {
+    const params = new URLSearchParams();
+    const {from, to, bucket} = rangeQuery(filters.range || RANGE_DEFAULT, filters, now);
+    params.set('from', from);
+    params.set('to', to);
+    params.set('bucket', bucket);
     for (const key of ['provider', 'model', 'account', 'key_id', 'status']) if (filters[key]) params.set(key, filters[key]);
     return params;
   }
@@ -267,13 +295,7 @@
     // its own quota cards.
     return [...credentials.values()].sort((a, b) => String(a.provider + '\u0000' + a.key).localeCompare(String(b.provider + '\u0000' + b.key)));
   }
-  // Explicit range presets for the credential side window.
-  function rangeWindow(value, now = Date.now()) {
-    const span = {'7d': 604800000, '14d': 1209600000, '30d': 2592000000}[value] || 604800000;
-    return {from: new Date(now - span).toISOString(), to: new Date(now).toISOString()};
-  }
-
-  const api = {number, integer, compact, money, duration, percent, date, query, seriesPoints, csvCell, price, arrays, speed, speedText, cacheRate, cacheRateText, responseModelMismatch, percentOf, quotaLabel, credentialName, credentialFiles, accountText, credentialKey, describeCredential, quotaLines, summarizeCredentials, rangeWindow};
+  const api = {number, integer, compact, money, duration, percent, date, query, seriesPoints, csvCell, price, arrays, speed, speedText, cacheRate, cacheRateText, responseModelMismatch, percentOf, quotaLabel, credentialName, credentialFiles, accountText, credentialKey, describeCredential, quotaLines, summarizeCredentials, rangeBounds, rangeQuery, RANGE_PRESETS, RANGE_DEFAULT};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CPAStats = api;
 })(typeof window === 'undefined' ? globalThis : window);

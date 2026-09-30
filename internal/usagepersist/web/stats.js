@@ -73,6 +73,26 @@
     } finally {state.requests.delete(controller);}
   }
   function filters() {return {range: $('range').value, from: $('from').value, to: $('to').value, model: $('model').value, provider: $('provider').value, status: $('status').value};}
+  // Every range control on the page is filled from the one preset list, so the page
+  // filters and the side window always offer the same choices in the same order.
+  function fillRangeSelects() {
+    for (const id of ['range', 'quota-range']) {
+      const select = $(id), previous = select.value;
+      select.replaceChildren();
+      for (const [value, label] of C.RANGE_PRESETS) select.add(new Option(label, value));
+      select.value = C.RANGE_PRESETS.some(([value]) => value === previous) ? previous : C.RANGE_DEFAULT;
+    }
+  }
+  // A custom range only makes sense once both ends are given, so the inputs stay
+  // hidden until the preset asks for them.
+  function syncRangeInputs() {
+    const custom = $('range').value === 'custom';
+    $('from-label').hidden = !custom;
+    $('to-label').hidden = !custom;
+    const dialogCustom = $('quota-range').value === 'custom';
+    $('quota-from-label').hidden = !dialogCustom;
+    $('quota-to-label').hidden = !dialogCustom;
+  }
   function empty(target, title, description) {target.replaceChildren(); const box = node('div', null, 'empty'); box.append(node('strong', title), node('span', description)); target.append(box);}
   function emptyTable(id, columns, description) {const row = node('tr'); const cell = node('td', description, 'empty'); cell.colSpan = columns; row.append(cell); $(id).replaceChildren(row);}
   // The summary is one compact line inside the overview tab; the request stream
@@ -356,13 +376,21 @@
     const credential = state.dialog;
     if (!credential) return;
     const epoch = state.epoch, window = $('quota-window').value;
-    const range = C.rangeWindow($('quota-range').value);
+    const stream = state.dialogTab === 'requests';
+    // A custom range is validated before anything is read, so an unfinished range
+    // reports itself on the surface instead of rejecting unnoticed.
+    let range;
+    try {
+      range = C.rangeQuery($('quota-range').value, {from: $('quota-from').value, to: $('quota-to').value});
+    } catch (error) {
+      message('quota-dialog-message', error.message, true);
+      return;
+    }
     // The credential-scoped stream is filtered by the recorded facts: the events API
     // no longer accepts a credential index, only `provider` and `account`.
     const params = new URLSearchParams({provider: credential.provider, from: range.from, to: range.to});
     if (credential.account) params.set('account', credential.account);
     if (window) params.set('window', window);
-    const stream = state.dialogTab === 'requests';
     // A paused stream is not read. The poll it owns stops scheduling itself, so
     // pausing the stream must not also stop the quota tab refreshing.
     if (stream && state.dialogPaused) return;
@@ -388,7 +416,7 @@
   }
   function scheduleQuotaDialog(force = false) {clearTimeout(state.dialogTimer); if (!state.dialog || state.stopped) return; if (state.dialogPaused && state.dialogTab === 'requests') return; state.dialogTimer = setTimeout(() => {if (!document.hidden && navigator.onLine !== false) void refreshQuotaDialog(); else scheduleQuotaDialog();}, 5000);}
   function openQuotaDialog(credential) {
-    state.dialog = credential; state.dialogPaused = false; state.dialogTab = 'quota'; renderDialogTab();
+    state.dialog = credential; state.dialogPaused = false; state.dialogTab = 'quota'; renderDialogTab(); syncRangeInputs();
     $('quota-pause').setAttribute('aria-pressed', 'false'); $('quota-pause').textContent = 'Pause stream';
     $('quota-dialog-title').textContent = C.credentialName(credential);
     $('quota-dialog-subtitle').textContent = C.describeCredential(credential).replace('observed', 'last saved');
@@ -452,8 +480,8 @@
   for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => selectTab(button.dataset.tab));
   for (const button of document.querySelectorAll('[data-chart]')) button.addEventListener('click', () => {state.chart = button.dataset.chart; for (const other of document.querySelectorAll('[data-chart]')) other.setAttribute('aria-pressed', String(other === button)); renderChart(state.data || {});});
   $('filters').addEventListener('submit', event => event.preventDefault());
-  $('filters').addEventListener('change', () => {const custom = $('range').value === 'custom'; $('from-label').hidden = !custom; $('to-label').hidden = !custom; state.offset = 0; invalidate(); void refresh();});
-  $('reset-filters').addEventListener('click', () => {$('filters').reset(); $('from-label').hidden = true; $('to-label').hidden = true; state.offset = 0; invalidate(); void refresh();});
+  $('filters').addEventListener('change', () => {syncRangeInputs(); state.offset = 0; invalidate(); void refresh();});
+  $('reset-filters').addEventListener('click', () => {$('filters').reset(); $('range').value = C.RANGE_DEFAULT; syncRangeInputs(); state.offset = 0; invalidate(); void refresh();});
   $('pause-live').addEventListener('click', () => {state.paused = !state.paused; $('pause-live').setAttribute('aria-pressed', String(state.paused)); $('pause-live').textContent = state.paused ? 'Resume updates' : 'Pause updates'; if (!state.paused) {state.offset = 0; void refresh();}});
   $('events-prev').addEventListener('click', () => {state.offset = Math.max(0, state.offset - state.limit); invalidate(); void refresh();});
   $('events-next').addEventListener('click', () => {state.offset += state.limit; invalidate(); void refresh();});
@@ -473,12 +501,15 @@
   for (const button of document.querySelectorAll('[data-dialog-tab]')) button.addEventListener('click', () => selectDialogTab(button.dataset.dialogTab));
   $('quota-dialog').addEventListener('close', () => {state.dialog = null; clearTimeout(state.dialogTimer);});
   $('quota-window').addEventListener('change', () => void refreshQuotaDialog());
-  $('quota-range').addEventListener('change', () => void refreshQuotaDialog());
+  $('quota-range').addEventListener('change', () => {syncRangeInputs(); void refreshQuotaDialog();});
+  for (const id of ['quota-from', 'quota-to']) $(id).addEventListener('change', () => void refreshQuotaDialog());
   $('quota-pause').addEventListener('click', () => {state.dialogPaused = !state.dialogPaused; $('quota-pause').setAttribute('aria-pressed', String(state.dialogPaused)); $('quota-pause').textContent = state.dialogPaused ? 'Resume stream' : 'Pause stream'; if (!state.dialogPaused) void refreshQuotaDialog();});
   window.addEventListener('offline', () => {connection('Offline', 'error'); message('banner', 'You are offline. The last successful snapshot remains visible.', true);});
   window.addEventListener('online', () => {if (!state.stopped) void refresh();});
   document.addEventListener('visibilitychange', () => {if (!document.hidden && !state.stopped && !(state.tab === 'requests' && (state.paused || state.offset))) {void refresh(false); if (state.dialog) void refreshQuotaDialog();}});
   window.addEventListener('pagehide', () => {state.stopped = true; invalidate();});
   window.addEventListener('pageshow', event => {if (event.persisted) {state.stopped = false; void refresh();}});
+  fillRangeSelects();
+  syncRangeInputs();
   const initialTab = location.hash.slice(1); if (['overview', 'requests', 'quota', 'pricing'].includes(initialTab)) selectTab(initialTab); else void refresh();
 })();

@@ -379,13 +379,64 @@ test('the dashboard groups by account facts and never reads a removed credential
   assert.match(source, /api\(`events\?\$\{params\}&limit=25`\)/);
   assert.match(source, /api\(`quota\/summary\?\$\{params\}`\)/);
 });
-test('the credential side window range presets are explicit UTC windows', () => {
+test('one preset list drives every range control, and today is the default', () => {
+  // The page filters and the side window must offer the same choices in the same
+  // order; the markup is empty and filled from this list, so a drift between two
+  // hardcoded <select> blocks is not possible.
+  assert.deepEqual(C.RANGE_PRESETS.map(([value]) => value), ['today', 'yesterday', '24h', '7d', '30d', 'custom', 'all']);
+  assert.deepEqual(C.RANGE_PRESETS.map(([, label]) => label), ['Today', 'Yesterday', 'Last 24 hours', 'Last week', 'Last month', 'Custom range', 'All retained history']);
+  assert.equal(C.RANGE_DEFAULT, 'today');
+  const html = read('stats.html'), source = read('stats.js');
+  for (const id of ['range', 'quota-range']) assert.match(html, new RegExp(`<select id="${id}"></select>`), `${id} must be filled from the shared preset list`);
+  assert.doesNotMatch(html, /<select id="(range|quota-range)"[^>]*>\s*<option/, 'a range control must not hardcode its own options');
+  assert.match(source, /for \(const id of \['range', 'quota-range'\]\)/);
+  assert.match(source, /for \(const \[value, label\] of C\.RANGE_PRESETS\) select\.add\(new Option\(label, value\)\)/);
+  assert.match(source, /fillRangeSelects\(\);\n\s*syncRangeInputs\(\);/);
+  // An empty filters form resets to the default preset, not to whatever option
+  // happens to be first in the markup.
+  assert.match(source, /\$\('range'\)\.value = C\.RANGE_DEFAULT/);
+});
+test('the range presets resolve to explicit instants, with local day boundaries', () => {
   const now = Date.parse('2026-02-10T12:00:00Z');
-  assert.deepEqual(C.rangeWindow('7d', now), {from: '2026-02-03T12:00:00.000Z', to: '2026-02-10T12:00:00.000Z'});
-  assert.deepEqual(C.rangeWindow('14d', now), {from: '2026-01-27T12:00:00.000Z', to: '2026-02-10T12:00:00.000Z'});
-  assert.deepEqual(C.rangeWindow('30d', now), {from: '2026-01-11T12:00:00.000Z', to: '2026-02-10T12:00:00.000Z'});
-  // An unknown preset falls back to the default week instead of an unbounded range.
-  assert.deepEqual(C.rangeWindow('nonsense', now), C.rangeWindow('7d', now));
+  const bounds = (range, filters) => {const {from, to} = C.rangeBounds(range, filters, now); return {from: from.toISOString(), to: to.toISOString()};};
+  // Today starts at local midnight and ends now, so the window grows through the day.
+  const midnight = new Date(now); midnight.setHours(0, 0, 0, 0);
+  assert.deepEqual(bounds('today', {}), {from: midnight.toISOString(), to: '2026-02-10T12:00:00.000Z'});
+  // Yesterday is the previous local day, ending exactly where today begins.
+  const yesterdayStart = new Date(midnight.getTime()); yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+  assert.deepEqual(bounds('yesterday', {}), {from: yesterdayStart.toISOString(), to: midnight.toISOString()});
+  // The rolling presets measure back from now.
+  assert.deepEqual(bounds('24h', {}), {from: '2026-02-09T12:00:00.000Z', to: '2026-02-10T12:00:00.000Z'});
+  assert.deepEqual(bounds('7d', {}), {from: '2026-02-03T12:00:00.000Z', to: '2026-02-10T12:00:00.000Z'});
+  assert.deepEqual(bounds('30d', {}), {from: '2026-01-11T12:00:00.000Z', to: '2026-02-10T12:00:00.000Z'});
+  // All retained history is bounded at the epoch rather than left open, and an
+  // unknown preset reads all history rather than silently narrowing the range.
+  assert.deepEqual(bounds('all', {}), {from: '1970-01-01T00:00:00.000Z', to: '2026-02-10T12:00:00.000Z'});
+  assert.deepEqual(bounds('nonsense', {}), bounds('all', {}));
+  // A custom range is passed through and must be complete and ordered.
+  assert.deepEqual(bounds('custom', {from: '2026-02-01T00:00:00Z', to: '2026-02-02T00:00:00Z'}), {from: '2026-02-01T00:00:00.000Z', to: '2026-02-02T00:00:00.000Z'});
+  assert.throws(() => bounds('custom', {from: '2026-02-02T00:00:00Z', to: '2026-02-01T00:00:00Z'}), /end after the start/);
+  assert.throws(() => bounds('custom', {from: '', to: ''}), /end after the start/);
+  // An hour bucket is used up to three days and a day bucket beyond it.
+  assert.equal(C.rangeQuery('today', {}, now).bucket, 'hour');
+  assert.equal(C.rangeQuery('yesterday', {}, now).bucket, 'hour');
+  assert.equal(C.rangeQuery('24h', {}, now).bucket, 'hour');
+  assert.equal(C.rangeQuery('7d', {}, now).bucket, 'day');
+  assert.equal(C.rangeQuery('30d', {}, now).bucket, 'day');
+  assert.equal(C.rangeQuery('all', {}, now).bucket, 'day');
+});
+test('the page filters default to today and carry the resolved range', () => {
+  const now = Date.parse('2026-02-10T12:00:00Z');
+  const params = C.query({range: '', provider: 'claude', model: 'gpt-5', status: 'success'}, now);
+  // An absent range is the default preset, so a form that never set one still reads today.
+  const midnight = new Date(now); midnight.setHours(0, 0, 0, 0);
+  assert.equal(params.get('from'), midnight.toISOString());
+  assert.equal(params.get('to'), '2026-02-10T12:00:00.000Z');
+  assert.equal(params.get('bucket'), 'hour');
+  assert.equal(params.get('provider'), 'claude');
+  assert.equal(params.get('model'), 'gpt-5');
+  assert.equal(params.get('status'), 'success');
+  assert.equal(params.get('account'), null, 'the page filters must not scope to a credential');
 });
 test('a response model differing from the requested model is flagged, an absent one is not', () => {
   assert.equal(C.responseModelMismatch({model: 'gpt-5', response_model: 'gpt-5-mini'}), true);
