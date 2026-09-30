@@ -128,14 +128,49 @@
     const parsed = Number(fraction);
     return Number.isFinite(parsed) ? percentOf(100 - Math.min(1, Math.max(0, parsed)) * 100) : null;
   };
-  // Reduce one credential's saved state (falling back to the normalized snapshot) to lines.
+  // Saved display state and normalized observations use different window id
+  // namespaces for the same window: the control panel saves display ids
+  // ("five-hour", "weekly"), while the backend records its own ids
+  // ("five_hour" for Claude, "primary"/"additional:<name>" for Codex). Matching
+  // them is what lets a newer observation replace a saved value instead of being
+  // appended as a second line for the same window.
+  const displayWindowID = id => String(id || '').trim().replaceAll('_', '-');
+  function normalizedWindowID(provider, window, items = []) {
+    const id = String(window?.id || '');
+    if (provider === 'claude') return id === 'iguana_necktie' ? 'seven-day-fable' : displayWindowID(id);
+    if (provider !== 'codex') return id;
+    const seconds = Number(window?.window_seconds);
+    const period = seconds === 18000 ? 'five-hour' : seconds >= 2419200 && seconds <= 2678400 ? 'monthly' : seconds === 604800 ? 'weekly' : null;
+    if (!period) return null;
+    if (id === 'primary' || id === 'secondary') return period;
+    if (id.startsWith('code_review:')) return `code-review-${period}`;
+    // Match a uniquely named additional window by name and duration; the UI-only
+    // array index in the id is not stable.
+    if (id.startsWith('additional:')) {
+      const slug = value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+      const name = id.split(':')[1];
+      const matches = items.filter(item => slug(item.labelParams?.name) === name && Number(item.periodHours) * 3600 === seconds);
+      return matches.length === 1 ? displayWindowID(matches[0].id) : null;
+    }
+    return null;
+  }
+  // Reduce one credential's saved state and the account's normalized snapshot to
+  // lines. The saved state is the control panel's own last observation and the
+  // snapshot is a separate timestamped measurement (a provider response or a
+  // manual refresh the backend recorded), so the newer one is authoritative per
+  // window. A window the newer observation does not carry keeps its saved value,
+  // and an older observation never replaces a newer saved value.
   function quotaLines(entry, snapshot) {
-    const lines = [], state = entry?.state || {};
-    const push = (id, label, ratio, hint) => {if (!id && !label) return; lines.push({id: String(id || label), label: String(label || id), percent: ratio == null ? null : percentOf(ratio), hint: hint ? String(hint) : ''});};
+    const lines = [], state = entry?.state || {}, savedIndex = new Map(), rawIndex = new Map();
+    const push = (id, label, ratio, hint) => {if (!id && !label) return null; lines.push({id: String(id || label), label: String(label || id), percent: ratio == null ? null : percentOf(ratio), hint: hint ? String(hint) : ''}); return lines.length - 1;};
     const ratio = (used, limit) => number(limit) > 0 ? number(used) / number(limit) * 100 : null;
-    for (const window of arrays(state, 'windows')) {
+    const stateWindows = arrays(state, 'windows');
+    for (const window of stateWindows) {
       const used = percentOf(window.usedPercent), remaining = percentOf(window.remainingPercent);
-      push(window.id || window.label, window.label || quotaLabel(window.labelKey, window.labelParams) || window.id, used != null ? used : remaining != null ? 100 - remaining : null, window.resetLabel || (number(window.resetAtMs) ? date(window.resetAtMs) : ''));
+      const index = push(window.id || window.label, window.label || quotaLabel(window.labelKey, window.labelParams) || window.id, used != null ? used : remaining != null ? 100 - remaining : null, window.resetLabel || (number(window.resetAtMs) ? date(window.resetAtMs) : ''));
+      if (index == null) continue;
+      savedIndex.set(displayWindowID(window.id || window.label), index);
+      rawIndex.set(String(window.id || window.label), index);
     }
     for (const row of arrays(state, 'rows')) push(row.id || row.label, row.label || quotaLabel(row.labelKey, row.labelParams) || row.id, ratio(row.used, row.limit), row.resetHint || (number(row.resetAtMs) ? date(row.resetAtMs) : ''));
     for (const group of arrays(state, 'groups')) for (const bucket of arrays(group, 'buckets')) {
@@ -144,6 +179,25 @@
     for (const window of arrays(state.data, 'windows')) push(window.id, window.label || window.id, percentOf(window.usedPercent), null);
     if (state.billing) push('billing', state.billing.planType || 'Billing', percentOf(state.billing.usagePercent ?? state.billing.usedPercent), state.billing.periodEnd);
     if (state.subscription?.plan) push('plan', 'Subscription', null, state.subscription.plan);
+    const saved = Date.parse(entry?.observed_at || ''), observed = Date.parse(snapshot?.observed_at || '');
+    const newer = !Number.isFinite(saved) || (Number.isFinite(observed) && observed > saved);
+    if (newer) for (const window of arrays(snapshot, 'windows')) {
+      const used = percentOf(window.used_percent), remaining = percentOf(window.remaining_percent);
+      const percent = used != null ? used : remaining != null ? 100 - remaining : null;
+      // A newer observation is authoritative about reset metadata too: a saved
+      // reset time that the newer window does not report is dropped rather than
+      // mixed with a fresh value.
+      const hint = window.reset_at ? date(window.reset_at) : '';
+      // An unmappable window is still shown rather than hidden, because the fresh
+      // value is the point of the card; a raw id already on the card is updated in
+      // place so a cache written with backend ids cannot render twice.
+      const raw = String(window.id || window.label || '');
+      const index = savedIndex.get(normalizedWindowID(entry?.provider, window, stateWindows)) ?? rawIndex.get(raw);
+      if (index == null) {const at = push(raw, window.label || window.id, null, hint); if (at != null) {lines[at].percent = percent; lines[at].hint = hint; rawIndex.set(raw, at);}}
+      else {if (percent != null) lines[index].percent = percent; lines[index].hint = hint;}
+    }
+    // A saved state that carries no recognizable window at all still shows the
+    // account's last observation rather than an empty card.
     if (!lines.length) for (const window of arrays(snapshot, 'windows')) push(window.id || window.label, window.label || window.id, percentOf(window.used_percent), window.reset_at);
     return lines;
   }

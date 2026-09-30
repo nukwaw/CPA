@@ -220,6 +220,68 @@ test('a normalized snapshot merges into the card carrying the same (provider, ac
   // The unmatched snapshot still becomes its own card instead of polluting the first.
   assert.deepEqual(cards.find(card => card.account === 'other@example.test').lines.map(line => line.percent), [90]);
 });
+test('a newer normalized observation replaces a saved window value, an older one never does', () => {
+  // A manual refresh (or any earlier observation) fills the credential's saved
+  // display state. A later provider response records backend window ids for the
+  // same windows, so the newer observation must win on the window it carries,
+  // must leave a saved-only window alone, and must not appear twice.
+  const entry = {provider: 'claude', key: 'claude.json', account: 'person@example.test', account_kind: 'email', observed_at: '2026-01-02T03:00:00Z', state: {status: 'success', windows: [
+    {id: 'five-hour', label: '5h', usedPercent: 10},
+    {id: 'saved-only', label: 'Saved only', usedPercent: 42},
+  ]}};
+  const snapshot = {provider: 'claude', account: 'person@example.test', account_kind: 'email', observed_at: '2026-01-02T05:00:00Z', windows: [{id: 'five_hour', label: '5h', used_percent: 91}]};
+  const fresh = C.summarizeCredentials([entry], [snapshot], [])[0];
+  assert.deepEqual(fresh.lines.map(line => [line.id, line.percent]), [['five-hour', 91], ['saved-only', 42]]);
+  assert.equal(fresh.observed_at, '2026-01-02T05:00:00Z');
+  // An observation older than the saved state leaves every saved value in place.
+  const older = C.summarizeCredentials([entry], [{...snapshot, observed_at: '2026-01-02T01:00:00Z'}], [])[0];
+  assert.deepEqual(older.lines.map(line => [line.id, line.percent]), [['five-hour', 10], ['saved-only', 42]]);
+  assert.equal(older.observed_at, '2026-01-02T03:00:00Z');
+});
+test('codex backend window ids map onto the saved display windows', () => {
+  const entry = {provider: 'codex', key: 'codex.json', account: '', observed_at: '2026-01-02T03:00:00Z', state: {status: 'success', windows: [
+    {id: 'five-hour', label: '5-hour limit', usedPercent: 10},
+    {id: 'weekly', label: 'Weekly limit', usedPercent: 20},
+  ]}};
+  const snapshot = {provider: 'codex', account: '', observed_at: '2026-01-02T05:00:00Z', windows: [
+    {id: 'primary', label: 'Primary', used_percent: 42, window_seconds: 18000},
+    {id: 'secondary', label: 'Secondary', used_percent: 17, window_seconds: 604800},
+  ]};
+  const card = C.summarizeCredentials([entry], [snapshot], [])[0];
+  assert.deepEqual(card.lines.map(line => [line.id, line.percent]), [['five-hour', 42], ['weekly', 17]]);
+});
+test('lines that legitimately share an id are never collapsed by the snapshot merge', () => {
+  // A grouped provider can repeat the same bucket id inside different groups; those
+  // are two separate lines and must both survive. Only a Window snapshot line is
+  // updated in place, and only against the window line it maps to.
+  const saved = {provider: 'antigravity', observed_at: '2026-01-01T00:00:00Z', state: {status: 'success', groups: [
+    {id: 'g1', label: 'G1', buckets: [{id: 'shared', remainingFraction: 0.5}]},
+    {id: 'g2', label: 'G2', buckets: [{id: 'shared', remainingFraction: 0.25}]},
+  ]}};
+  assert.deepEqual(C.quotaLines(saved, null).map(line => [line.id, line.percent]), [['shared', 50], ['shared', 75]]);
+  assert.deepEqual(C.quotaLines(saved, {observed_at: '2025-12-31T00:00:00Z', windows: [{id: 'shared', used_percent: 1}]}).map(line => [line.id, line.percent]), [['shared', 50], ['shared', 75]]);
+  // A cache already written with backend window ids is updated in place rather than
+  // rendered twice, for both a mapped and an unmapped window.
+  const claude = {provider: 'claude', observed_at: '2026-01-01T00:00:00Z', state: {status: 'success', windows: [{id: 'five_hour', usedPercent: 1}]}};
+  assert.deepEqual(C.quotaLines(claude, {observed_at: '2026-01-02T00:00:00Z', windows: [{id: 'five_hour', used_percent: 88}]}).map(line => [line.id, line.percent]), [['five_hour', 88]]);
+  const durationless = {provider: 'codex', observed_at: '2026-01-01T00:00:00Z', state: {status: 'success', windows: [{id: 'primary', usedPercent: 1}]}};
+  assert.deepEqual(C.quotaLines(durationless, {observed_at: '2026-01-02T00:00:00Z', windows: [{id: 'primary', used_percent: 77}]}).map(line => [line.id, line.percent]), [['primary', 77]]);
+});
+test('the panel refreshes a settled card from a newer snapshot instead of skipping it', () => {
+  const saved = Date.parse('2026-01-02T03:00:00Z'), window = {id: 'five_hour', used_percent: 91};
+  const current = {status: 'success', windows: [{id: 'five-hour', label: '5h', usedPercent: 10, resetLabel: 'saved reset'}]};
+  // The stored state's own observation time is the floor, so an older snapshot
+  // changes nothing while a newer one updates the window it reports.
+  assert.equal(bridge.overlay('claude', current, {observed_at: '2026-01-02T02:00:00Z', windows: [window]}, saved).changed, false);
+  const result = bridge.overlay('claude', current, {observed_at: '2026-01-02T05:00:00Z', windows: [window]}, saved);
+  assert.equal(result.changed, true);
+  assert.equal(result.state.windows.find(item => item.id === 'five-hour').usedPercent, 91);
+  // A settled card must no longer be skipped outright, and the floor must come
+  // from the stored observation rather than from this session alone.
+  const source = read('management-bridge.js');
+  assert.doesNotMatch(source, /existing\?\.status === 'success' && !observation\.has\(id\)\) continue/);
+  assert.match(source, /storedObservation\.get\(id\)/);
+});
 test('the dashboard groups by account facts and never reads a removed credential identity', () => {
   const source = read('stats.js'), core = read('stats-core.js'), html = read('stats.html'), bridgeSource = read('management-bridge.js');
   // Cards are identified by the credential file, matching the control panel's own
@@ -431,7 +493,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 // credential index survives only as transient correlation data for the native page.
 const binding = (account = 'person@example.test', account_kind = 'email', extra = {}) => ({provider: 'codex', key: 'test.json', account, account_kind, auth_index: 'index1', ...extra});
 const success = (usedPercent = 42) => ({status: 'success', windows: [{id: 'five-hour', usedPercent, resetLabel: '-'}]});
-const cachedEntry = (who = binding()) => ({provider: who.provider, key: who.key, account: who.account, account_kind: who.account_kind, observed_at: new Date(Date.now() - 60000).toISOString(), state: {status: 'success', windows: [{id: 'five-hour', usedPercent: 12, label: 'Five hours', resetLabel: '-', periodHours: 5}]}});
+const cachedEntry = (who = binding(), at = Date.now() - 60000) => ({provider: who.provider, key: who.key, account: who.account, account_kind: who.account_kind, observed_at: new Date(at).toISOString(), state: {status: 'success', windows: [{id: 'five-hour', usedPercent: 12, label: 'Five hours', resetLabel: '-', periodHours: 5}]}});
 const providers = ['antigravity', 'claude', 'codex', 'devin', 'kimi', 'meta', 'xai'];
 function harness({cached = [], snapshots = [], origin = 'http://localhost:18317', delayFiles = false, quotaStatus = 200, bindings = [binding()], now = Date.now()} = {}) {
   const calls = [], events = [], timers = new Map(), listeners = new Map(), holds = []; let nextTimer = 0;
@@ -683,7 +745,9 @@ test('cache and normalized payloads recheck bindings after delayed responses', a
 test('a newer normalized observation keeps proving freshness across unchanged polls without re-uploading history', async () => {
   const now = Date.parse('2026-01-02T03:04:05Z'), iso = offset => new Date(now + offset).toISOString();
   const snapshot = (used, offset) => ({provider: 'codex', account: 'person@example.test', account_kind: 'email', windows: [{id: 'primary', window_seconds: 18000, used_percent: used, observed_at: iso(offset)}]});
-  const h = harness({now, cached: [cachedEntry()], snapshots: [snapshot(20, -30000)]}); await settle();
+  // The fixture must sit on the harness clock: the stored display state's own
+  // observation time is the floor below which a normalized snapshot is ignored.
+  const h = harness({now, cached: [cachedEntry(binding(), now - 60000)], snapshots: [snapshot(20, -30000)]}); await settle();
   const live = success(77); h.succeed(h.capture('test.json'), live);
   h.refresh(); await settle();
   assert.equal(h.quota.getState().codexQuota['test.json'], live, 'older cached and normalized data must not replace fresh live state');

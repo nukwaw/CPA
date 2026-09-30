@@ -455,6 +455,11 @@
         installBindings(verified);
         const patch = {}, current = quotaStore.getState(); let hydrated = 0, updated = 0, newest = 0;
         const cutoff = name => Math.max(globalInvalidated, invalidated.get(filename(name)) || 0);
+        // The stored display state carries the time of the observation it holds. A
+        // normalized snapshot may only replace it when the snapshot is newer, which
+        // is why its time is used as the overlay floor: without it a fresh provider
+        // response could not update a card that a manual refresh already filled.
+        const storedObservation = new Map();
         for (const entry of Array.isArray(cached.entries) ? cached.entries : []) {
           if (!entry) continue;
           const group = bindings.get(slot(entry.provider, entry.account));
@@ -463,6 +468,7 @@
           const who = group?.find(candidate => candidate.account === String(entry.account || '') && candidate.account_kind === String(entry.account_kind || '') && currentBinding(candidate));
           if (!who) continue;
           const map = mapNames[who.provider], existing = current[map]?.[who.key], at = stamp(entry.observed_at), id = identityKey(who);
+          if (at) storedObservation.set(id, Math.max(storedObservation.get(id) || 0, at));
           if (existing && existing.status !== 'idle' || !at || at > Date.now() + 300000 || at <= cutoff(who.key)) continue;
           const safe = sanitize(who.provider, entry.state); if (!safe) continue;
           patch[map] ||= {...current[map]}; patch[map][who.key] = safe; observation.set(id, at); newest = Math.max(newest, at); hydrated++;
@@ -472,9 +478,9 @@
           for (const who of [...bindings.values()].flat()) {
             if (who.provider !== snapshot.provider || who.account !== String(snapshot.account || '') || !currentBinding(who)) continue;
             const map = mapNames[who.provider], id = identityKey(who), existing = patch[map]?.[who.key] || current[map]?.[who.key];
-            if (existing?.status === 'success' && !observation.has(id)) continue;
             if (!windowTimes.has(id)) windowTimes.set(id, new Map());
-            const result = overlay(who.provider, existing, snapshot, Math.max(observation.get(id) || 0, cutoff(who.key)), windowTimes.get(id));
+            const floor = Math.max(observation.get(id) || 0, cutoff(who.key), storedObservation.get(id) || 0);
+            const result = overlay(who.provider, existing, snapshot, floor, windowTimes.get(id));
             if (result.changed) {patch[map] ||= {...current[map]}; patch[map][who.key] = result.state; if (!observation.has(id)) observation.set(id, 0); updated++;}
           }
         }
