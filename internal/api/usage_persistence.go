@@ -44,7 +44,7 @@ func WithUsagePersistenceProvider(current func() *usagepersist.Store) ServerOpti
 		current = func() *usagepersist.Store { return nil }
 	}
 	return WithServerConfigurator(func(server *Server) {
-		source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return server.handlers.AuthManager }, server.getConfig)
+		source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return server.handlers.AuthManager })
 		currentStore := func() *usagepersist.Store {
 			store := current()
 			if store != nil {

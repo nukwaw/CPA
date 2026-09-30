@@ -82,14 +82,14 @@ func openPostgresStore(ctx context.Context, db *sql.DB, schema string) (*postgre
 		return nil, err
 	}
 	statements := []string{
-		`CREATE TABLE IF NOT EXISTS ` + s.events + ` (id TEXT PRIMARY KEY,requested_at TIMESTAMPTZ NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,auth_index TEXT NOT NULL,key_id TEXT NOT NULL,failed BOOLEAN NOT NULL,payload JSONB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS ` + s.events + ` (id TEXT PRIMARY KEY,requested_at TIMESTAMPTZ NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,account TEXT NOT NULL,key_id TEXT NOT NULL,failed BOOLEAN NOT NULL,payload JSONB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ` + s.metadata + ` (namespace TEXT NOT NULL,key TEXT NOT NULL,value JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(namespace,key))`,
 	}
 	for _, index := range []struct{ name, columns string }{
 		{"usage_events_time", "requested_at DESC,id DESC"},
 		{"usage_events_model_time", "model,requested_at DESC"},
 		{"usage_events_provider_time", "provider,requested_at DESC"},
-		{"usage_events_auth_time", "auth_index,requested_at DESC"},
+		{"usage_events_account_time", "account,requested_at DESC"},
 		{"usage_events_key_time", "key_id,requested_at DESC"},
 	} {
 		// PostgreSQL creates an index in its table's schema and does not permit a
@@ -118,7 +118,7 @@ func (s *postgresStore) Insert(ctx context.Context, e Event) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO `+s.events+`(id,requested_at,provider,model,auth_index,key_id,failed,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO NOTHING`, e.ID, e.RequestedAt, e.Provider, e.Model, e.AuthIndex, e.KeyID, e.Failed, payload)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO `+s.events+`(id,requested_at,provider,model,account,key_id,failed,payload) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO NOTHING`, e.ID, e.RequestedAt, e.Provider, e.Model, e.Account, e.KeyID, e.Failed, payload)
 	if err != nil {
 		return false, err
 	}
@@ -144,8 +144,8 @@ func postgresWhere(f Filter) (string, []any) {
 	if f.Provider != "" {
 		add("provider", "=", f.Provider)
 	}
-	if f.AuthIndex != "" {
-		add("auth_index", "=", f.AuthIndex)
+	if f.Account != "" {
+		add("account", "=", f.Account)
 	}
 	if f.KeyID != "" {
 		add("key_id", "=", f.KeyID)

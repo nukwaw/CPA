@@ -8,9 +8,12 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
+// TestQuotaIdentityCoreSettingsAreNonSelectors pins the fail-closed metadata
+// contract. Durable identity is (provider, account) and nothing else, so an
+// ordinary management setting must never move a credential to a different account.
+// Shapes here mirror core overrides, request-scoped error rules, file model
+// aliases, and the original management field patcher.
 func TestQuotaIdentityCoreSettingsAreNonSelectors(t *testing.T) {
-	// Shapes mirror core overrides, request-scoped error rules, file model aliases,
-	// and the original management field patcher, not telemetry compatibility keys.
 	settings := map[string]any{
 		"request_retry":         2,
 		"request_scoped_errors": []config.RequestScopedErrorRule{{Status: 429}},
@@ -37,38 +40,58 @@ func TestQuotaIdentityCoreSettingsAreNonSelectors(t *testing.T) {
 			for key, value := range settings {
 				auth.Metadata[key] = value
 				binding, valid := ProjectQuotaBinding(auth)
-				if !valid || binding.CredentialGeneration != original.CredentialGeneration {
-					t.Fatalf("supported setting %s revoked/changed identity", key)
+				if !valid || !sameAccountIdentity(binding, original) {
+					t.Fatalf("supported setting %s moved the credential to another account", key)
 				}
 			}
+			// Other account-ish metadata is tolerated as a fact in real credentials
+			// (codex publishes account_id, antigravity project_id), but it is NOT
+			// identity: only the provider's own account property is. A change here
+			// therefore must not detach the credential from its saved state.
 			for _, key := range []string{"account_id", "organization_id", "project_id", "base_url"} {
 				changed := auth.Clone()
-				changed.Metadata[key] = "different-selector"
+				changed.Metadata[key] = "different-value"
 				binding, valid := ProjectQuotaBinding(changed)
-				if !valid || binding.CredentialGeneration == original.CredentialGeneration {
-					t.Fatalf("selector %s disappeared into settings allowlist", key)
+				if !valid {
+					t.Fatalf("metadata %s must be tolerated on a real credential", key)
+				}
+				if !sameAccountIdentity(binding, original) {
+					t.Fatalf("metadata %s must not change durable identity", key)
 				}
 			}
-			for _, key := range []string{"unknown_setting", "account-selector", "request-retry-compat", "headers"} {
+			// An unaudited key is still refused outright rather than ignored, because
+			// an unrecognized field could change which account serves a request.
+			for _, key := range []string{"unknown_setting", "account-selector", "request-retry-compat"} {
 				changed := auth.Clone()
-				changed.Metadata[key] = map[string]any{"account_id": "different-selector"}
+				changed.Metadata[key] = map[string]any{"account_id": "different-value"}
 				if _, valid := ProjectQuotaBinding(changed); valid {
 					t.Fatalf("unaudited metadata %s accepted", key)
 				}
+			}
+			// A custom header can replace authorization or select an account behind
+			// the projected facts, so it is refused.
+			changed := auth.Clone()
+			changed.Attributes = map[string]string{"header:Authorization": "Bearer attacker"}
+			if _, valid := ProjectQuotaBinding(changed); valid {
+				t.Fatal("custom header attribute accepted as a binding")
 			}
 		})
 	}
 }
 
-func TestQuotaIdentityCoreSettingsPreserveRevisionFences(t *testing.T) {
+// TestQuotaIdentityCoreSettingsKeepAccountFactsStable replaces the former
+// revision-fence test. Revisions no longer exist, so the surviving guarantee is
+// that repeated projections through the live manager report the same account facts
+// no matter how often ordinary settings are rewritten.
+func TestQuotaIdentityCoreSettingsKeepAccountFactsStable(t *testing.T) {
 	ctx := context.Background()
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth := quotaFixtureAuth("claude", "index", "same.json", "secret")
 	if _, err := manager.Register(ctx, auth); err != nil {
 		t.Fatal(err)
 	}
-	source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager }, nil)
-	original := source.QuotaBindings(false)[0]
+	source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager })
+	original := source.QuotaBindings()[0]
 	for _, key := range []string{"request-retry", "request-scoped-errors", "disable-cooling", "model-aliases", "tool-prefix-disabled", "excluded-models", "fingerprint-profile", "proxy-url"} {
 		current, _ := manager.GetByID(auth.ID)
 		var value any = true
@@ -90,10 +113,15 @@ func TestQuotaIdentityCoreSettingsPreserveRevisionFences(t *testing.T) {
 		if _, err := manager.Update(ctx, current); err != nil {
 			t.Fatal(err)
 		}
-		bindings := source.QuotaBindings(true)
-		if len(bindings) != 1 || bindings[0].CredentialGeneration != original.CredentialGeneration || bindings[0].Revision == original.Revision {
-			t.Fatalf("core normalized setting %s changed generation or reused revision", key)
+		bindings := source.QuotaBindings()
+		if len(bindings) != 1 || !sameAccountIdentity(bindings[0], original) {
+			t.Fatalf("core normalized setting %s changed the account facts", key)
 		}
-		original = bindings[0]
 	}
+}
+
+// sameAccountIdentity compares only what is durable identity plus the credential
+// slot that addresses the live entry. Tokens, revisions and generations are gone.
+func sameAccountIdentity(a, b QuotaBinding) bool {
+	return a.Provider == b.Provider && a.Key == b.Key && a.Account == b.Account && a.AccountKind == b.AccountKind
 }

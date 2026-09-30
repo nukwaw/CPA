@@ -16,23 +16,23 @@ import (
 // Store persists a passive copy of the built-in usage provider's JSON output.
 // It neither registers an SDK usage plugin nor changes the provider's gates or queue.
 type Store struct {
-	store               store
-	client              *http.Client
-	mu                  sync.Mutex
-	closing             bool
-	active              sync.WaitGroup
-	closeOnce           sync.Once
-	closed              chan struct{}
-	closeErr            error
-	writeFailures       atomic.Int64
-	lastWriteFailure    atomic.Int64
-	validationFailures  atomic.Int64
-	queueOverflows      atomic.Int64
-	droppedEvents       atomic.Int64
-	lastDrop            atomic.Int64
-	pendingEvents       atomic.Int64
-	quotaSource         atomic.Pointer[quotaSourceHolder]
-	skippedQuotaHeaders atomic.Int64
+	store                store
+	client               *http.Client
+	mu                   sync.Mutex
+	closing              bool
+	active               sync.WaitGroup
+	closeOnce            sync.Once
+	closed               chan struct{}
+	closeErr             error
+	writeFailures        atomic.Int64
+	lastWriteFailure     atomic.Int64
+	validationFailures   atomic.Int64
+	queueOverflows       atomic.Int64
+	droppedEvents        atomic.Int64
+	lastDrop             atomic.Int64
+	pendingEvents        atomic.Int64
+	quotaSource          atomic.Pointer[quotaSourceHolder]
+	quotaHistoryFailures atomic.Int64
 
 	queue         chan queuedUsage
 	workerCtx     context.Context
@@ -229,10 +229,10 @@ func namedSummaries(values map[string]*Summary) []NamedSummary {
 }
 
 type FilterValues struct {
-	Models      []string `json:"models"`
-	Providers   []string `json:"providers"`
-	AuthIndexes []string `json:"auth_indexes"`
-	KeyIDs      []string `json:"key_ids"`
+	Models    []string `json:"models"`
+	Providers []string `json:"providers"`
+	Accounts  []string `json:"accounts"`
+	KeyIDs    []string `json:"key_ids"`
 }
 
 func (s *Store) Filters(ctx context.Context, f Filter) (FilterValues, error) {
@@ -240,19 +240,19 @@ func (s *Store) Filters(ctx context.Context, f Filter) (FilterValues, error) {
 		return FilterValues{}, err
 	}
 	defer s.active.Done()
-	models, providers, auths, keys := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
+	models, providers, accounts, keys := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
 	err := s.store.Walk(ctx, f, func(e Event) error {
 		models[e.Model] = true
 		providers[e.Provider] = true
-		if e.AuthIndex != "" {
-			auths[e.AuthIndex] = true
+		if e.Account != "" {
+			accounts[e.Account] = true
 		}
 		if e.KeyID != "" {
 			keys[e.KeyID] = true
 		}
 		return nil
 	})
-	return FilterValues{Models: sortedKeys(models), Providers: sortedKeys(providers), AuthIndexes: sortedKeys(auths), KeyIDs: sortedKeys(keys)}, err
+	return FilterValues{Models: sortedKeys(models), Providers: sortedKeys(providers), Accounts: sortedKeys(accounts), KeyIDs: sortedKeys(keys)}, err
 }
 func sortedKeys[V any](values map[string]V) []string {
 	keys := make([]string, 0, len(values))

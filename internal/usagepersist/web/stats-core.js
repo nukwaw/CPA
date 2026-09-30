@@ -7,6 +7,25 @@
   const money = value => new Intl.NumberFormat(undefined, {style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: number(value) > 0 && number(value) < .01 ? 6 : 2}).format(number(value));
   const duration = value => value == null ? '—' : number(value) < 1000 ? `${integer(value)} ms` : `${(number(value) / 1000).toFixed(2)} s`;
   const percent = (part, total) => number(total) ? `${Math.min(100, number(part) / number(total) * 100).toFixed(1)}%` : '—';
+  // Decode throughput, matching the keeper dashboard: complete output tokens over
+  // total request time. Undefined when either side is unknown.
+  const speed = (outputTokens, latencyMs) => {
+    const tokens = number(outputTokens), latency = number(latencyMs);
+    return latency > 0 && tokens > 0 ? tokens / (latency / 1000) : null;
+  };
+  const speedText = (outputTokens, latencyMs) => {
+    const value = speed(outputTokens, latencyMs);
+    return value == null ? '—' : `${value >= 100 ? integer(value) : value.toFixed(1)} tok/s`;
+  };
+  // Cache read rate, matching the keeper dashboard: share of input served from cache.
+  const cacheRate = (cacheReadTokens, inputTokens) => number(inputTokens) > 0 ? number(cacheReadTokens) / number(inputTokens) * 100 : null;
+  const cacheRateText = (cacheReadTokens, inputTokens) => {
+    const value = cacheRate(cacheReadTokens, inputTokens);
+    return value == null ? '—' : `${Math.min(100, value).toFixed(1)}%`;
+  };
+  // A response model differing from the requested one is a routing signal, not an
+  // error; the dashboard flags it so an unexpected upstream substitution is visible.
+  const responseModelMismatch = event => Boolean(String(event?.response_model || '').trim()) && String(event.response_model).trim() !== String(event.model || '').trim();
   const date = value => {
     const parsed = new Date(value);
     return value && Number.isFinite(parsed.getTime()) ? parsed.toLocaleString() : '—';
@@ -26,7 +45,7 @@
       params.set('from', '1970-01-01T00:00:00.000Z'); params.set('to', new Date(now).toISOString());
       params.set('bucket', 'day');
     }
-    for (const key of ['provider', 'model', 'auth_index', 'key_id', 'status']) if (filters[key]) params.set(key, filters[key]);
+    for (const key of ['provider', 'model', 'account', 'key_id', 'status']) if (filters[key]) params.set(key, filters[key]);
     return params;
   }
   function seriesPoints(series, field, width = 740, height = 220) {
@@ -54,7 +73,145 @@
     return result;
   }
   function arrays(value, key) { return Array.isArray(value?.[key]) ? value[key].filter(item => item && typeof item === 'object') : []; }
-  const api = {number, integer, compact, money, duration, percent, date, query, seriesPoints, csvCell, price, arrays};
+  /* ---- Saved provider quota state -------------------------------------------------
+     Provider state shapes differ per provider: some ship windows with a display label,
+     others rows with an i18n key plus params, others grouped buckets or a billing
+     object. Every shape is reduced to the same {id, label, percent, hint} line so one
+     card can present any provider honestly, and an unknown value stays null rather
+     than being rendered as zero. */
+  const percentOf = value => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : null;
+  };
+  // Untranslated providers ship an i18n key, sometimes with a duration parameter.
+  const quotaLabel = (key, params) => {
+    const name = String(key || '').split('.').pop();
+    if (!name) return '';
+    if (params && params.duration) return `${params.duration} limit`;
+    const words = name.split('_');
+    return words.map((word, index) => index === 0 && word ? word.charAt(0).toUpperCase() + word.slice(1) : word).join(' ');
+  };
+  // The identities API composes its key from a file name and an internal suffix.
+  // The key is presentation only; the account fact carries the grouping.
+  // The dashboard groups quota by (provider, account), so a card is titled by the
+  // fact that identifies the group. A filename would be wrong here: several
+  // credentials can share one account, and the card is not about any single file.
+  // A card is one credential file, the same unit the control panel's own quota page
+  // uses. The recorded account is shown alongside it as a fact, not as the title.
+  const credentialName = credential => {
+    const file = credentialFiles(credential);
+    return file || accountText(credential) || credential?.provider || 'Credential';
+  };
+  // The credential's file, which is how a card is identified and addressed. A devin
+  // file can expose more than one credential identity, so its suffix is kept.
+  const credentialFiles = credential => {
+    const raw = String(credential?.key || '').trim();
+    if (!raw) return '';
+    return raw.split('\u0000').filter(Boolean).join(' \u00b7 ');
+  };
+  // A credential that exposes no account property is grouped by provider alone, so
+  // the card still says which account fact is missing instead of guessing a value.
+  const accountText = credential => {
+    const account = String(credential?.account || '').trim();
+    if (!account) return '';
+    const kind = String(credential?.account_kind || '').trim();
+    return kind === 'device_id' ? `device ${account}` : kind === 'email' ? account : `${kind ? `${kind} ` : ''}${account}`;
+  };
+  const describeCredential = credential => {
+    const files = credentialFiles(credential);
+    return `${credential?.provider || 'Unknown'}${accountText(credential) ? ` \u00b7 ${accountText(credential)}` : ''}${files ? ` \u00b7 ${files}` : ''}${credential?.observed_at ? ` \u00b7 observed ${date(credential.observed_at)}` : ''}`;
+  };
+  // The dashboard groups every credential by the facts the backend recorded.
+  const credentialKey = (provider, key) => `${provider || ''}\u0000${key || ''}`;
+  // Grouped providers report what is left as a 0..1 fraction of the window.
+  const usedFromRemaining = fraction => {
+    const parsed = Number(fraction);
+    return Number.isFinite(parsed) ? percentOf(100 - Math.min(1, Math.max(0, parsed)) * 100) : null;
+  };
+  // Reduce one credential's saved state (falling back to the normalized snapshot) to lines.
+  function quotaLines(entry, snapshot) {
+    const lines = [], state = entry?.state || {};
+    const push = (id, label, ratio, hint) => {if (!id && !label) return; lines.push({id: String(id || label), label: String(label || id), percent: ratio == null ? null : percentOf(ratio), hint: hint ? String(hint) : ''});};
+    const ratio = (used, limit) => number(limit) > 0 ? number(used) / number(limit) * 100 : null;
+    for (const window of arrays(state, 'windows')) {
+      const used = percentOf(window.usedPercent), remaining = percentOf(window.remainingPercent);
+      push(window.id || window.label, window.label || quotaLabel(window.labelKey, window.labelParams) || window.id, used != null ? used : remaining != null ? 100 - remaining : null, window.resetLabel || (number(window.resetAtMs) ? date(window.resetAtMs) : ''));
+    }
+    for (const row of arrays(state, 'rows')) push(row.id || row.label, row.label || quotaLabel(row.labelKey, row.labelParams) || row.id, ratio(row.used, row.limit), row.resetHint || (number(row.resetAtMs) ? date(row.resetAtMs) : ''));
+    for (const group of arrays(state, 'groups')) for (const bucket of arrays(group, 'buckets')) {
+      push(bucket.id || bucket.window || group.id, `${group.label || quotaLabel(group.labelKey, group.labelParams) || group.id} \u00b7 ${bucket.label || bucket.window || bucket.id}`, usedFromRemaining(bucket.remainingFraction), bucket.description);
+    }
+    for (const window of arrays(state.data, 'windows')) push(window.id, window.label || window.id, percentOf(window.usedPercent), null);
+    if (state.billing) push('billing', state.billing.planType || 'Billing', percentOf(state.billing.usagePercent ?? state.billing.usedPercent), state.billing.periodEnd);
+    if (state.subscription?.plan) push('plan', 'Subscription', null, state.subscription.plan);
+    if (!lines.length) for (const window of arrays(snapshot, 'windows')) push(window.id || window.label, window.label || window.id, percentOf(window.used_percent), window.reset_at);
+    return lines;
+  }
+  // Join saved display state, normalized snapshots and known credentials into cards.
+  // One card is one `(provider, account)` pair: several credentials that resolve to
+  // the same facts are deliberately merged, and an empty account is grouped under
+  // its provider alone.
+  function summarizeCredentials(entries, snapshots, bindings) {
+    const credentials = new Map();
+    const ensure = (provider, account, accountKind, key) => {
+      const id = credentialKey(provider, key);
+      if (!credentials.has(id)) credentials.set(id, {provider, account: account || '', account_kind: accountKind || '', key: key || '', indices: [], lines: [], state: null, observed_at: null});
+      const credential = credentials.get(id);
+      // The account is a fact recorded on the card, never the card's identity, so a
+      // card that was created from an account-only source adopts the fact later.
+      if (!credential.account && account) credential.account = account;
+      if (!credential.account_kind && accountKind) credential.account_kind = accountKind;
+      return credential;
+    };
+    // A card is one credential file: every file the add-on can attribute gets its
+    // own card, even when two files serve one account. Each is separately
+    // refreshable, which is what the control panel's quota page offers.
+    for (const binding of bindings) {
+      const credential = ensure(binding.provider, binding.account, binding.account_kind, binding.key);
+      // `auth_index` is transient correlation: it addresses the live credential in the
+      // core manager so the original quota handler can be asked to refresh it. It is
+      // never rendered, persisted, or uploaded; only the account fact is durable.
+      const index = typeof binding.auth_index === 'string' ? binding.auth_index.trim() : '';
+      if (index && !credential.indices.includes(index)) credential.indices.push(index);
+    }
+    const snapshotFor = (provider, account) => snapshots.find(item => item.provider === provider && String(item.account || '') === String(account || ''));
+    for (const entry of entries) {
+      const credential = ensure(entry.provider, entry.account, entry.account_kind, entry.key), snapshot = snapshotFor(entry.provider, entry.account);
+      credential.state = entry.state || null;
+      credential.lines = quotaLines(entry, snapshot);
+      // Every source contributes its own observation time; the newest one wins so a
+      // fresher normalized snapshot is not hidden by an older saved display state.
+      if (entry.observed_at && (!credential.observed_at || Date.parse(entry.observed_at) > Date.parse(credential.observed_at))) credential.observed_at = entry.observed_at;
+    }
+    // A normalized snapshot records only the account, because that is the quota
+    // subject; it cannot name a file. So it enriches every card serving that account
+    // and stands alone as an account-only card only when no credential file can
+    // carry it, which is how a saved observation outlives its credential file.
+    for (const snapshot of snapshots) {
+      const account = String(snapshot.account || '');
+      let matched = false;
+      for (const credential of credentials.values()) {
+        if (credential.provider !== snapshot.provider || credential.account !== account) continue;
+        matched = true;
+        if (!credential.observed_at || Date.parse(snapshot.observed_at) > Date.parse(credential.observed_at)) credential.observed_at = snapshot.observed_at;
+      }
+      if (!matched) {
+        const orphan = ensure(snapshot.provider, snapshot.account, snapshot.account_kind, '');
+        orphan.observed_at = snapshot.observed_at;
+      }
+    }
+    for (const credential of credentials.values()) if (!credential.lines.length) credential.lines = quotaLines(null, snapshotFor(credential.provider, credential.account));
+    // Ordered by provider then credential file, matching how the control panel lists
+    // its own quota cards.
+    return [...credentials.values()].sort((a, b) => String(a.provider + '\u0000' + a.key).localeCompare(String(b.provider + '\u0000' + b.key)));
+  }
+  // Explicit range presets for the credential side window.
+  function rangeWindow(value, now = Date.now()) {
+    const span = {'7d': 604800000, '14d': 1209600000, '30d': 2592000000}[value] || 604800000;
+    return {from: new Date(now - span).toISOString(), to: new Date(now).toISOString()};
+  }
+
+  const api = {number, integer, compact, money, duration, percent, date, query, seriesPoints, csvCell, price, arrays, speed, speedText, cacheRate, cacheRateText, responseModelMismatch, percentOf, quotaLabel, credentialName, credentialFiles, accountText, credentialKey, describeCredential, quotaLines, summarizeCredentials, rangeWindow};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CPAStats = api;
 })(typeof window === 'undefined' ? globalThis : window);

@@ -184,7 +184,9 @@ func TestUsagePersistenceConsumesBuiltinOutputAndExistingHotReload(t *testing.T)
 	publish := func(suffix string) {
 		t.Helper()
 		id := t.Name() + suffix
-		usage.PublishRecord(context.Background(), usage.Record{RequestID: id, RequestedAt: time.Now().Add(-time.Second), Provider: "claude", Model: "sample-model", AuthIndex: "sample-account", AccessTokenSHA256: coreauth.AccessTokenSHA256(auth), Detail: usage.Detail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120}, ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.24"}}})
+		// The producer stamps the account facts where the live credential exists;
+		// the token is not identity and never groups persisted usage.
+		usage.PublishRecord(context.Background(), usage.Record{RequestID: id, RequestedAt: time.Now().Add(-time.Second), Provider: "claude", Model: "sample-model", AuthIndex: "sample-account", Account: "sample@example.invalid", AccountKind: "email", AccessTokenSHA256: coreauth.AccessTokenSHA256(auth), Detail: usage.Detail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120}, ResponseHeaders: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.24"}}})
 		// A separate existing SDK plugin is only a test barrier. It runs after
 		// the built-in provider has applied its unchanged gate and emitted output.
 		select {

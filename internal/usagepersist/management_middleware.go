@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -71,7 +70,7 @@ func (s *Store) ManagementMiddleware(_ func(string) (string, bool), currentConfi
 		// wait on core storage under its lock, so neither side of c.Next may query
 		// that manager. Missing/stale proof is harmless: skip or queue the captured
 		// evidence, and let the isolated worker authoritatively reject stale work.
-		startBindings := s.quotaBindings(false)
+		startBindings := s.publishedQuotaBindings()
 		if len(startBindings) == 0 {
 			c.Next()
 			return
@@ -174,10 +173,6 @@ func (s *Store) observeMiddlewareQuota(c *gin.Context, kind string, requestBytes
 			return
 		}
 	}
-	if kind != "reset" && !s.validQuotaIdentity(binding.Provider, binding.AuthIndex, binding.CredentialGeneration, binding.Revision, false) {
-		return
-	}
-	provider := binding.Provider
 	ctx := c.Request.Context()
 	switch kind {
 	case "api-call":
@@ -192,11 +187,11 @@ func (s *Store) observeMiddlewareQuota(c *gin.Context, kind string, requestBytes
 		if request.URL == "" || json.Unmarshal(responseBytes, &response) != nil || response.StatusCode < 100 || response.StatusCode > 599 {
 			return
 		}
-		s.ObserveAPICall(ctx, provider, index, request.URL, response.StatusCode, response.Header, []byte(response.Body), binding)
+		s.ObserveAPICall(ctx, binding, request.URL, response.StatusCode, response.Header, []byte(response.Body))
 	case "fetch":
 		response, valid := middlewareFetchResponse(responseBytes)
 		if valid {
-			s.ObserveQuotaFetch(ctx, provider, index, response, binding)
+			s.ObserveQuotaFetch(ctx, binding, response)
 		}
 	case "reset":
 		var response struct {
@@ -206,9 +201,7 @@ func (s *Store) observeMiddlewareQuota(c *gin.Context, kind string, requestBytes
 		if json.Unmarshal(responseBytes, &response) != nil || response.Status != "ok" || response.AuthIndex != index {
 			return
 		}
-		// Core reset itself advances Generation. Permit exactly that one step,
-		// retaining the ORIGINAL generation and registration fence in the queue.
-		s.observeBoundQuotaResetAt(binding, time.Now().UTC(), true)
+		s.ObserveQuotaReset(ctx, binding)
 	}
 }
 

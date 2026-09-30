@@ -8,41 +8,47 @@ import (
 
 // Event intentionally excludes API keys, auth files, URLs, headers and request/response bodies.
 // Input includes cache reads/writes; output includes reasoning, using SDK canonical accounting.
+// ErrorText is an already-sanitized, bounded provider message, never a raw body.
 type Event struct {
-	ID                 string    `json:"id"`
-	RequestedAt        time.Time `json:"requested_at"`
-	Provider           string    `json:"provider"`
-	Model              string    `json:"model"`
-	Alias              string    `json:"alias,omitempty"`
-	AuthIndex          string    `json:"auth_index,omitempty"`
-	KeyID              string    `json:"key_id,omitempty"`
-	InputTokens        int64     `json:"input_tokens"`
-	OutputTokens       int64     `json:"output_tokens"`
-	ReasoningTokens    int64     `json:"reasoning_tokens"`
-	CacheReadTokens    int64     `json:"cache_read_tokens"`
-	CacheWriteTokens   int64     `json:"cache_write_tokens"`
-	TotalTokens        int64     `json:"total_tokens"`
-	UnclassifiedTokens int64     `json:"unclassified_tokens"`
-	AccountingQuality  string    `json:"accounting_quality"`
-	LatencyMS          float64   `json:"latency_ms"`
-	TTFTMS             float64   `json:"ttft_ms"`
-	Failed             bool      `json:"failed"`
-	StatusCode         int       `json:"status_code"`
-	Stream             bool      `json:"stream"`
-	CostUSD            float64   `json:"cost_usd"`
-	Priced             bool      `json:"priced"`
+	ID                  string    `json:"id"`
+	RequestedAt         time.Time `json:"requested_at"`
+	Provider            string    `json:"provider"`
+	Model               string    `json:"model"`
+	Alias               string    `json:"alias,omitempty"`
+	ResponseModel       string    `json:"response_model,omitempty"`
+	ServiceTier         string    `json:"service_tier,omitempty"`
+	ResponseServiceTier string    `json:"response_service_tier,omitempty"`
+	ErrorText           string    `json:"error_text,omitempty"`
+	Account             string    `json:"account,omitempty"`
+	AccountKind         string    `json:"account_kind,omitempty"`
+	KeyID               string    `json:"key_id,omitempty"`
+	InputTokens         int64     `json:"input_tokens"`
+	OutputTokens        int64     `json:"output_tokens"`
+	ReasoningTokens     int64     `json:"reasoning_tokens"`
+	CacheReadTokens     int64     `json:"cache_read_tokens"`
+	CacheWriteTokens    int64     `json:"cache_write_tokens"`
+	TotalTokens         int64     `json:"total_tokens"`
+	UnclassifiedTokens  int64     `json:"unclassified_tokens"`
+	AccountingQuality   string    `json:"accounting_quality"`
+	LatencyMS           float64   `json:"latency_ms"`
+	TTFTMS              float64   `json:"ttft_ms"`
+	Failed              bool      `json:"failed"`
+	StatusCode          int       `json:"status_code"`
+	Stream              bool      `json:"stream"`
+	CostUSD             float64   `json:"cost_usd"`
+	Priced              bool      `json:"priced"`
 }
 
 type Filter struct {
-	From, To                                  time.Time
-	Model, Provider, AuthIndex, KeyID, Status string
+	From, To                                time.Time
+	Model, Provider, Account, KeyID, Status string
 }
 
 func (f Filter) matches(e Event) bool {
 	return (f.From.IsZero() || !e.RequestedAt.Before(f.From)) &&
 		(f.To.IsZero() || e.RequestedAt.Before(f.To)) &&
 		(f.Model == "" || e.Model == f.Model) && (f.Provider == "" || e.Provider == f.Provider) &&
-		(f.AuthIndex == "" || e.AuthIndex == f.AuthIndex) && (f.KeyID == "" || e.KeyID == f.KeyID) &&
+		(f.Account == "" || e.Account == f.Account) && (f.KeyID == "" || e.KeyID == f.KeyID) &&
 		(f.Status == "" || f.Status == "failed" && e.Failed || f.Status == "success" && !e.Failed)
 }
 

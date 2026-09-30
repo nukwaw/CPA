@@ -3,7 +3,6 @@ package usagepersist
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -15,15 +14,100 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-func fixtureRecord(id string, at time.Time) usage.Record {
-	return usage.Record{RequestID: id, Provider: "codex", Model: "gpt-test", AuthIndex: "account-1", APIKey: "sk-private-test-key", Source: "private-source", AuthID: "private-auth-file", BaseURL: "https://user:secret@upstream.invalid", RequestedAt: at, Latency: 250 * time.Millisecond, TTFT: 20 * time.Millisecond, Detail: usage.Detail{InputTokens: 1000, OutputTokens: 300, CacheReadTokens: 200, CacheCreationTokens: 100, ReasoningTokens: 50, TotalTokens: 1300, TokenBreakdown: usage.NewSubsetTokenBreakdown(1000, 200, 100, 300, 50, 1300)}, Fail: usage.Failure{Body: "private-error-body"}, ResponseHeaders: http.Header{"Set-Cookie": []string{"private-cookie"}, "Authorization": []string{"private-header-token"}}}
+// fixtureAccount is the account fact every fixture credential publishes. It is a
+// plain account label, never a credential: the record below still carries a real
+// token, key and failure body that must never reach storage.
+const fixtureAccount = "user@example.invalid"
+
+// fixturePayload encodes a usage.Record into the built-in provider's JSON shape.
+// It deliberately emits only the fields the migrated decoder accepts: account
+// facts are `account`/`account_kind`, `api_key` is hashed on the way in, and the
+// deleted `auth_index`/`access_token_sha256` identity fields are absent. No
+// production API accepts raw SDK records.
+func fixturePayload(r usage.Record) []byte {
+	value := map[string]any{
+		"execution_id": r.RequestID, "timestamp": r.RequestedAt, "provider": r.Provider,
+		"executor_type": r.ExecutorType, "model": r.Model, "alias": r.Alias,
+		"account": r.Account, "account_kind": r.AccountKind, "api_key": r.APIKey,
+		"latency_ms": r.Latency.Milliseconds(),
+		"ttft_ms":    r.TTFT.Milliseconds(), "failed": r.Failed, "stream": r.Stream,
+		"generate": usage.GenerateEnabled(r.Generate), "token_breakdown": r.Detail.TokenBreakdown,
+		"tokens":           map[string]int64{"input_tokens": r.Detail.InputTokens, "output_tokens": r.Detail.OutputTokens, "reasoning_tokens": r.Detail.ReasoningTokens, "cached_tokens": r.Detail.CachedTokens, "cache_read_tokens": r.Detail.CacheReadTokens, "cache_creation_tokens": r.Detail.CacheCreationTokens, "total_tokens": r.Detail.TotalTokens},
+		"fail":             map[string]any{"status_code": r.Fail.StatusCode, "body": r.Fail.Body},
+		"response_headers": r.ResponseHeaders, "source": r.Source, "auth_id": r.AuthID, "endpoint": r.BaseURL,
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return payload
 }
+
+func (s *Store) recordFixture(ctx context.Context, r usage.Record) error {
+	s.Consume(ctx, fixturePayload(r))
+	return s.Flush(ctx)
+}
+
+func flushFixture(t *testing.T, s *Store) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fixtureEvent(r usage.Record) Event {
+	var p providerUsage
+	if err := json.Unmarshal(fixturePayload(r), &p); err != nil {
+		panic(err)
+	}
+	event, err := eventFromProvider(p)
+	if err != nil {
+		panic(err)
+	}
+	return event
+}
+
+type usageConsumerFunc func(context.Context, usage.Record)
+
+func (f usageConsumerFunc) HandleUsage(ctx context.Context, r usage.Record) { f(ctx, r) }
+
+// A test-only last SDK plugin provides a deterministic processing barrier without
+// changing, stopping, or adding a drain method to the upstream SDK manager.
+func publishThroughBuiltin(t *testing.T, r usage.Record) {
+	t.Helper()
+	done := make(chan struct{})
+	usage.RegisterNamedPlugin("usagepersist-test-barrier", usageConsumerFunc(func(_ context.Context, record usage.Record) {
+		if record.RequestID == r.RequestID {
+			close(done)
+		}
+	}))
+	usage.PublishRecord(context.Background(), r)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("built-in usage provider did not finish test record")
+	}
+	usage.RegisterNamedPlugin("usagepersist-test-barrier", usageConsumerFunc(func(context.Context, usage.Record) {}))
+}
+
+// fixtureRecord carries account facts plus secrets. The failure body deliberately
+// contains a credential: only its sanitized message may reach storage, while the
+// account label is now persisted on purpose.
+func fixtureRecord(id string, at time.Time) usage.Record {
+	return usage.Record{RequestID: id, Provider: "codex", Model: "gpt-test", Account: fixtureAccount, AccountKind: "email", APIKey: "sk-private-test-key", Source: "private-source", AuthID: "private-auth-file", BaseURL: "https://user:secret@upstream.invalid", RequestedAt: at, Latency: 250 * time.Millisecond, TTFT: 20 * time.Millisecond, Detail: usage.Detail{InputTokens: 1000, OutputTokens: 300, CacheReadTokens: 200, CacheCreationTokens: 100, ReasoningTokens: 50, TotalTokens: 1300, TokenBreakdown: usage.NewSubsetTokenBreakdown(1000, 200, 100, 300, 50, 1300)}, Fail: usage.Failure{StatusCode: 429, Body: `{"error":{"type":"rate_limit_error","message":"slow down, key sk-private-error-key rejected"}}`}, ResponseHeaders: http.Header{"Set-Cookie": []string{"private-cookie"}, "Authorization": []string{"private-header-token"}}}
+}
+
 func fixturePrice() Price {
 	return Price{Model: "gpt-test", InputPerMillion: 2, OutputPerMillion: 4, CacheReadPerMillion: 1, CacheWritePerMillion: 3}
 }
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(context.Background(), Options{DataDir: t.TempDir()})
@@ -38,6 +122,89 @@ func openTestStore(t *testing.T) *Store {
 		}
 	})
 	return s
+}
+
+// wpQuotaAuth builds a credential whose account fact is its email metadata,
+// the property every provider except kimi identifies an account by. The transient
+// index still addresses the live credential in the manager.
+func wpQuotaAuth(provider, index, name, token string) *coreauth.Auth {
+	return wpQuotaAuthWithAccount(provider, index, name, token, fixtureAccount)
+}
+
+// wpQuotaAuthWithAccount books a distinct account fact on one credential, so
+// fixtures can prove that two accounts never share a quota row.
+func wpQuotaAuthWithAccount(provider, index, name, token, account string) *coreauth.Auth {
+	metadata := map[string]any{"access_token": token}
+	if account != "" {
+		metadata["email"] = account
+	}
+	return &coreauth.Auth{ID: name, Index: index, FileName: name, Provider: provider, Metadata: metadata}
+}
+
+// wpBindFixtures registers the credentials and publishes an advisory binding
+// copy, modelling the explicit add-on identity GET that arms observation.
+func wpBindFixtures(t *testing.T, s *Store, auths ...*coreauth.Auth) *coreauth.Manager {
+	t.Helper()
+	manager := coreauth.NewManager(nil, nil, nil)
+	for _, auth := range auths {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.BindQuotaIdentitySource(NewQuotaIdentitySource(func() *coreauth.Manager { return manager }))
+	s.publishQuotaBindings()
+	return manager
+}
+
+// wpBindManagementFixtures registers the two codex credentials the middleware and
+// worker fixtures address by their transient index.
+func wpBindManagementFixtures(t *testing.T, s *Store) *coreauth.Manager {
+	t.Helper()
+	return wpBindFixtures(t, s, wpQuotaAuth("codex", "account", "account.json", "fixture-secret"), wpQuotaAuth("codex", "later", "later.json", "later-secret"))
+}
+
+// wpReadBinding performs the authoritative read a trusted caller would use,
+// then returns the live binding for one transient credential index, normalized
+// exactly as the producer normalizes the index it reports.
+func wpReadBinding(s *Store, provider, index string) QuotaBinding {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	index = strings.TrimSpace(index)
+	for _, binding := range s.publishQuotaBindings() {
+		if binding.Provider == provider && binding.AuthIndex == index {
+			return binding
+		}
+	}
+	panic("test requires a registered quota source fixture")
+}
+
+func wpObserveAPICall(s *Store, ctx context.Context, provider, index, url string, status int, header http.Header, body []byte) {
+	s.ObserveAPICall(ctx, wpReadBinding(s, provider, index), url, status, header, body)
+}
+
+func wpObserveQuotaFetch(s *Store, ctx context.Context, provider, index string, response pluginapi.QuotaFetchResponse) {
+	s.ObserveQuotaFetch(ctx, wpReadBinding(s, provider, index), response)
+}
+
+func wpObserveQuotaReset(s *Store, ctx context.Context, provider, index string) {
+	s.ObserveQuotaReset(ctx, wpReadBinding(s, provider, index))
+}
+
+// wpObserveResetAt admits a reset with an explicit receipt time so ordering
+// can be tested without a wall-clock sleep.
+func wpObserveResetAt(s *Store, provider, index string, at time.Time) {
+	binding := wpReadBinding(s, provider, index)
+	s.observeQuotaResetAt(binding, at)
+}
+
+// wpBindCacheFixture fills a display entry from the live credential it addresses
+// transiently: on input Key holds the credential index, on output it holds the
+// durable display key and the account facts.
+func wpBindCacheFixture(s *Store, entry QuotaCacheEntry) QuotaCacheEntry {
+	binding := wpReadBinding(s, entry.Provider, entry.Key)
+	entry.Key = binding.Key
+	entry.Account = binding.Account
+	entry.AccountKind = binding.AccountKind
+	return entry
 }
 
 func TestFilePersistenceDedupAndSecretExclusion(t *testing.T) {
@@ -64,10 +231,18 @@ func TestFilePersistenceDedupAndSecretExclusion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{record.APIKey, record.Source, record.AuthID, record.BaseURL, record.Fail.Body, "private-cookie", "private-header-token"} {
+	for _, secret := range []string{record.APIKey, record.Source, record.AuthID, record.BaseURL, record.Fail.Body, "sk-private-error-key", "private-cookie", "private-header-token"} {
 		if strings.Contains(string(journal), secret) {
 			t.Errorf("journal leaked %q", secret)
 		}
+	}
+	// The account fact is persisted deliberately: grouping usage by (provider,
+	// account) is the approved model, and an account label is not a credential.
+	if !strings.Contains(string(journal), `"account":"`+fixtureAccount+`"`) || !strings.Contains(string(journal), `"account_kind":"email"`) {
+		t.Errorf("journal lost the persisted account facts: %s", journal)
+	}
+	if !strings.Contains(string(journal), "rate_limit_error: slow down, key [redacted] rejected") {
+		t.Errorf("journal lost the sanitized failure message: %s", journal)
 	}
 	s, err = Open(ctx, Options{DataDir: dir})
 	if err != nil {
@@ -132,12 +307,26 @@ func TestAnalysisFiltersAndCanonicalCacheCosts(t *testing.T) {
 	if page.Total != 1 || page.Events[0].ID != "second" {
 		t.Fatalf("filter mismatch: %#v", page)
 	}
+	// The per-credential request stream is now filtered by the account fact.
+	page, err = s.Events(ctx, Filter{Provider: "codex", Account: fixtureAccount}, 10, 0)
+	if err != nil || page.Total != 2 || page.Events[0].ID != "second" || page.Events[1].ID != "first" {
+		t.Fatalf("account filter mismatch: %#v %v", page, err)
+	}
+	other := fixtureRecord("other-account", at.Add(3*time.Hour))
+	other.Account, other.AccountKind = "other@example.invalid", "email"
+	if err := s.recordFixture(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	page, err = s.Events(ctx, Filter{Provider: "codex", Account: fixtureAccount}, 10, 0)
+	if err != nil || page.Total != 2 {
+		t.Fatalf("a different account leaked into the per-account stream: %#v %v", page, err)
+	}
 	page, err = s.Events(ctx, Filter{}, 1, 1)
-	if err != nil || page.Total != 3 || page.Events[0].ID != "second" {
+	if err != nil || page.Total != 4 || page.Events[0].ID != "third" {
 		t.Fatalf("page order: %#v %v", page, err)
 	}
 	values, err := s.Filters(ctx, Filter{})
-	if err != nil || len(values.Models) != 2 || len(values.Providers) != 2 || len(values.AuthIndexes) != 1 || len(values.KeyIDs) != 1 {
+	if err != nil || len(values.Models) != 2 || len(values.Providers) != 2 || len(values.Accounts) != 2 || len(values.KeyIDs) != 1 {
 		t.Fatalf("filter options: %#v %v", values, err)
 	}
 }
@@ -282,8 +471,11 @@ func TestQuotaCacheValidationFreshnessAndHeaders(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	at := time.Now().UTC().Add(-time.Minute)
-	bindQuotaFixtures(t, s, quotaFixtureAuth("claude", "account-1", "auth.json", "source-token"))
-	e := bindCacheFixture(s, QuotaCacheEntry{Provider: "claude", AuthIndex: "account-1", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"five-hour","usedPercent":20,"resetAtMs":1234}],"planType":"plus"}`)})
+	wpBindFixtures(t, s, wpQuotaAuth("claude", "account-1", "auth.json", "source-token"))
+	e := wpBindCacheFixture(s, QuotaCacheEntry{Provider: "claude", Key: "account-1", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"five-hour","usedPercent":20,"resetAtMs":1234}],"planType":"plus"}`)})
+	if e.Account != fixtureAccount || e.AccountKind != "email" {
+		t.Fatalf("display entry lost its account facts: %#v", e)
+	}
 	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{e}); err != nil {
 		t.Fatal(err)
 	}
@@ -300,13 +492,12 @@ func TestQuotaCacheValidationFreshnessAndHeaders(t *testing.T) {
 	for _, state := range []string{`{"status":"error","error":"secret"}`, `{"status":"success","access_token":"secret"}`, `{"status":"success","windows":[{"id":"x","authorization":"secret"}]}`, `{"status":"success","windows":[{"labelParams":{"token":"secret"}}]}`} {
 		bad := e
 		bad.State = json.RawMessage(state)
-		if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{bad}); err == nil || errors.Is(err, ErrQuotaIdentity) {
-			t.Errorf("unsafe state was not rejected by schema validation: %s: %v", state, err)
+		if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{bad}); err == nil {
+			t.Errorf("unsafe state was not rejected by schema validation: %s", state)
 		}
 	}
 	r := fixtureRecord("quota-event", at)
 	r.Provider = "claude"
-	r.AccessTokenSHA256 = quotaHash("source-token")
 	r.ResponseHeaders = http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"}}
 	if err := s.recordFixture(ctx, r); err != nil {
 		t.Fatal(err)
@@ -315,10 +506,13 @@ func TestQuotaCacheValidationFreshnessAndHeaders(t *testing.T) {
 	if err != nil || len(snapshots) != 1 || len(snapshots[0].Windows) != 1 {
 		t.Fatalf("header capture: %#v %v", snapshots, err)
 	}
+	if snapshots[0].Account != fixtureAccount || snapshots[0].AccountKind != "email" {
+		t.Fatalf("header capture lost its account facts: %#v", snapshots[0])
+	}
 	if !snapshots[0].ObservedAt.Equal(at.Add(r.Latency)) {
 		t.Fatalf("quota timestamp used start: %v", snapshots[0].ObservedAt)
 	}
-	if err := s.ResetQuota(ctx, "claude", "account-1"); err != nil {
+	if err := s.ResetQuota(ctx, "claude", fixtureAccount); err != nil {
 		t.Fatal(err)
 	}
 	cached, err = s.QuotaCache(ctx)
@@ -327,46 +521,55 @@ func TestQuotaCacheValidationFreshnessAndHeaders(t *testing.T) {
 	}
 }
 
-func TestQuotaCacheRejectsMissingOrMismatchedBindingBeforeBatchWrite(t *testing.T) {
+// TestQuotaCacheRejectsUnsafeStateBeforeBatchWrite keeps the pre-write protection
+// that survives the migration: a batch is validated in full before any row is
+// written, an account fact used in a storage key stays bounded and separator-free,
+// and an older observed_at never overwrites a newer entry.
+func TestQuotaCacheRejectsUnsafeStateBeforeBatchWrite(t *testing.T) {
 	ctx := context.Background()
 	for _, test := range []struct {
 		name   string
 		mutate func(*QuotaCacheEntry)
 	}{
-		{"missing-generation", func(e *QuotaCacheEntry) { e.CredentialGeneration = "" }},
-		{"missing-revision", func(e *QuotaCacheEntry) { e.Revision = "" }},
-		{"wrong-generation", func(e *QuotaCacheEntry) { e.CredentialGeneration += "-stale" }},
-		{"wrong-provider", func(e *QuotaCacheEntry) { e.Provider = "codex" }},
-		{"wrong-index", func(e *QuotaCacheEntry) { e.AuthIndex = "other-index" }},
-		{"wrong-key", func(e *QuotaCacheEntry) { e.Key = "other.json" }},
+		{"account-separator", func(e *QuotaCacheEntry) { e.Account = "a:b" }},
+		{"account-control-character", func(e *QuotaCacheEntry) { e.Account = "a\x00b" }},
+		{"account-too-long", func(e *QuotaCacheEntry) { e.Account = strings.Repeat("a", maxAccountFactBytes+1) }},
+		{"empty-key", func(e *QuotaCacheEntry) { e.Key = "" }},
+		{"unknown-provider", func(e *QuotaCacheEntry) { e.Provider = "unknown" }},
+		{"missing-observation-time", func(e *QuotaCacheEntry) { e.ObservedAt = time.Time{} }},
+		{"future-observation-time", func(e *QuotaCacheEntry) { e.ObservedAt = time.Now().Add(time.Hour) }},
+		{"unsafe-state", func(e *QuotaCacheEntry) {
+			e.State = json.RawMessage(`{"status":"success","windows":[{"id":"x","authorization":"secret"}]}`)
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := openTestStore(t)
-			bindQuotaFixtures(t, s, quotaFixtureAuth("claude", "account-1", "auth.json", "source-token"))
-			valid := bindCacheFixture(s, QuotaCacheEntry{Provider: "claude", AuthIndex: "account-1", ObservedAt: time.Now().Add(-time.Minute), State: json.RawMessage(`{"status":"success","windows":[]}`)})
+			wpBindFixtures(t, s, wpQuotaAuth("claude", "account-1", "auth.json", "source-token"))
+			valid := wpBindCacheFixture(s, QuotaCacheEntry{Provider: "claude", Key: "account-1", ObservedAt: time.Now().Add(-time.Minute), State: json.RawMessage(`{"status":"success","windows":[]}`)})
 			invalid := valid
 			test.mutate(&invalid)
-			if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{valid, invalid}); !errors.Is(err, ErrQuotaIdentity) {
-				t.Fatalf("unbound cache entry accepted: %v", err)
+			if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{valid, invalid}); err == nil {
+				t.Fatal("invalid cache entry accepted")
 			}
 			if raw, err := s.ListCache(ctx, quotaNamespace); err != nil || len(raw) != 0 {
 				t.Fatalf("invalid batch partially wrote quota state: %s %v", raw, err)
 			}
 			if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{valid}); err != nil {
-				t.Fatalf("valid source binding rejected: %v", err)
+				t.Fatalf("valid account-bound entry rejected: %v", err)
 			}
-			// A request-start revision that drifted while the credential stayed the
-			// same must still be accepted, otherwise a browser refresh that raced an
-			// ordinary auth-file write would silently lose its displayed state.
+			// A newer observation for the same account must be accepted: observed_at
+			// is the only ordering fence left, and ordinary activity keeps advancing.
 			drifted := valid
-			drifted.Revision = "drifted-revision"
 			drifted.ObservedAt = time.Now()
+			drifted.State = json.RawMessage(`{"status":"success","windows":[]}`)
 			if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{drifted}); err != nil {
-				t.Fatalf("same-credential revision drift rejected: %v", err)
+				t.Fatalf("newer same-account observation rejected: %v", err)
 			}
+			// A display cache write needs no bound identity source: the account fact
+			// is durable data now, so an unbound store still persists valid entries.
 			withoutSource := openTestStore(t)
-			if err := withoutSource.SaveQuotaCache(ctx, []QuotaCacheEntry{valid}); !errors.Is(err, ErrQuotaIdentity) {
-				t.Fatalf("store without identity source accepted cache: %v", err)
+			if err := withoutSource.SaveQuotaCache(ctx, []QuotaCacheEntry{valid}); err != nil {
+				t.Fatalf("unbound store rejected a valid entry: %v", err)
 			}
 		})
 	}

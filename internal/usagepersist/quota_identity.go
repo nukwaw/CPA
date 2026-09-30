@@ -1,11 +1,9 @@
 package usagepersist
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/url"
 	"sort"
@@ -16,36 +14,39 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// QuotaBinding exposes only opaque identity/fence values. Proof fields are
-// transient, bounded hashes; neither credentials nor account metadata escape.
+// QuotaBinding is a bounded, secret-free projection of one live credential.
+//
+// Durable identity is (Provider, Account). There is no credential generation, no
+// revision and no token: the token rotates during ordinary operation, so it
+// cannot identify an account, and a generation that changed on every rotation
+// only made a healthy account look like a new credential.
+//
+// Account is the value of the credential's account property (see accountProperty).
+// It is empty for a credential that exposes none, and such a credential is then
+// grouped by provider alone rather than guessed at.
+//
+// AuthIndex addresses a live credential in the core manager and matches a native
+// original-page request to its credential. It is transient: it is never persisted
+// and never a storage key, because it changes when a credential is re-registered.
+//
+// SelectorHashes are digests of the operation selectors a browser-originated
+// manual quota fetch must supply (codex account_id, antigravity project_id, xai
+// sub/user_id). They are a precondition for trusting such a capture. They are not
+// identity and never take part in grouping.
 type QuotaBinding struct {
-	Provider             string            `json:"provider"`
-	Key                  string            `json:"key"`
-	AuthIndex            string            `json:"auth_index"`
-	CredentialGeneration string            `json:"credential_generation"`
-	Revision             string            `json:"revision"`
-	AccessTokenSHA256    string            `json:"-"`
-	APITokenSHA256       string            `json:"-"`
-	TokenScoped          bool              `json:"-"`
-	SelectorHashes       map[string]string `json:"-"`
-	Lifetime             string            `json:"-"`
-	RuntimeGeneration    uint64            `json:"-"`
+	Provider       string            `json:"provider"`
+	Key            string            `json:"key"`
+	Account        string            `json:"account"`
+	AccountKind    string            `json:"account_kind"`
+	AuthIndex      string            `json:"auth_index"`
+	SelectorHashes map[string]string `json:"-"`
 }
 
-// QuotaIdentitySource must return immutable, sanitized projections. Both methods
-// may block on credential-manager locks, even when validateStorage is false:
-// core can hold those locks during storage I/O. Only the independent worker and
-// explicit add-on APIs may call a source. Original handlers use a published copy.
+// QuotaIdentitySource must return immutable, sanitized projections. It may block
+// on credential-manager locks. Only the independent worker and explicit add-on
+// APIs may call a source; original handlers read a published copy instead.
 type QuotaIdentitySource interface {
-	QuotaBindings(validateStorage bool) []QuotaBinding
-}
-
-// TargetedQuotaIdentitySource optionally avoids validating unrelated backing
-// files during a locked mutation. It must resolve current credentials and refuse
-// ambiguous indexes/keys, not reuse a previously validated binding. It has the same
-// possibly-blocking source contract as QuotaBindings, regardless of the bool.
-type TargetedQuotaIdentitySource interface {
-	QuotaBinding(provider, index string, validateStorage bool) (QuotaBinding, bool)
+	QuotaBindings() []QuotaBinding
 }
 
 type quotaSourceHolder struct {
@@ -56,9 +57,8 @@ type quotaSourceHolder struct {
 }
 
 // Published bindings are advisory request-start evidence, never write authority.
-// They contain only bounded projection copies and can be stale indefinitely; the
-// worker revalidates captured generation/revision against the live source before
-// writing. No available publication means original quota observations are skipped.
+// They are bounded projection copies and can be stale indefinitely. No available
+// publication means an original handler observation is skipped rather than guessed.
 // There is deliberately no refresher goroutine that can become stuck on core I/O.
 type quotaIdentityPublication struct {
 	sequence uint64
@@ -88,12 +88,9 @@ func (source *quotaSourceHolder) publish(sequence uint64, bindings []QuotaBindin
 		}
 		binding.Provider = strings.Clone(binding.Provider)
 		binding.Key = strings.Clone(binding.Key)
+		binding.Account = strings.Clone(binding.Account)
+		binding.AccountKind = strings.Clone(binding.AccountKind)
 		binding.AuthIndex = strings.Clone(binding.AuthIndex)
-		binding.CredentialGeneration = strings.Clone(binding.CredentialGeneration)
-		binding.Revision = strings.Clone(binding.Revision)
-		binding.AccessTokenSHA256 = strings.Clone(binding.AccessTokenSHA256)
-		binding.APITokenSHA256 = strings.Clone(binding.APITokenSHA256)
-		binding.Lifetime = strings.Clone(binding.Lifetime)
 		if binding.SelectorHashes != nil {
 			selectors := make(map[string]string, len(binding.SelectorHashes))
 			for key, value := range binding.SelectorHashes {
@@ -119,23 +116,23 @@ func (source *quotaSourceHolder) publish(sequence uint64, bindings []QuotaBindin
 }
 
 func boundedPublishedBinding(binding QuotaBinding) bool {
-	if _, known := quotaCacheSchemas[binding.Provider]; !known || binding.Key == "" || !safeCacheText(strings.ReplaceAll(binding.Key, "\x00", ""), 512) || len(binding.Key) > 512 || binding.AuthIndex == "" || !safeCacheText(binding.AuthIndex, 256) || len(binding.SelectorHashes) > len(quotaSelectorFields) {
+	if _, known := quotaCacheSchemas[binding.Provider]; !known || binding.Key == "" || len(binding.Key) > 512 || binding.AuthIndex == "" {
 		return false
 	}
-	if !strings.HasPrefix(binding.CredentialGeneration, "qg1:") || !validTokenHash(strings.TrimPrefix(binding.CredentialGeneration, "qg1:")) || !validTokenHash(binding.Revision) {
+	if !safeCacheText(strings.ReplaceAll(binding.Key, "\x00", ""), 512) || !safeCacheText(binding.AuthIndex, 256) {
 		return false
 	}
-	for _, hash := range []string{binding.AccessTokenSHA256, binding.APITokenSHA256, binding.Lifetime} {
-		if hash != "" && !validTokenHash(hash) {
-			return false
-		}
+	if binding.Account != "" && (len(binding.Account) > 256 || !safeCacheText(binding.Account, 256)) {
+		return false
+	}
+	if binding.AccountKind != "" && binding.AccountKind != accountProperty(binding.Provider) {
+		return false
+	}
+	if len(binding.SelectorHashes) > 4 {
+		return false
 	}
 	for key, hash := range binding.SelectorHashes {
-		known := false
-		for _, selector := range quotaSelectorFields {
-			known = known || key == selector
-		}
-		if !known || !validTokenHash(hash) {
+		if !operationSelectorKnown(binding.Provider, key) || !validTokenHash(hash) {
 			return false
 		}
 	}
@@ -144,9 +141,8 @@ func boundedPublishedBinding(binding QuotaBinding) bool {
 
 const maxQuotaIdentities = 4096
 
-// quotaIdentityIndex contains only sanitized projections, never credentials.
-// Live read/write validation and advisory immutable publications use separate
-// instances; cached evidence is never used as mutation authority.
+// quotaIdentityIndex maps a transient credential index to its binding. Cached
+// evidence is never used as mutation authority.
 type quotaIdentityIndex map[string]QuotaBinding
 
 func indexQuotaBindings(bindings []QuotaBinding) quotaIdentityIndex {
@@ -154,18 +150,11 @@ func indexQuotaBindings(bindings []QuotaBinding) quotaIdentityIndex {
 		return nil
 	}
 	byIndex := make(quotaIdentityIndex, len(bindings))
-	keys := make(map[string]int, len(bindings))
 	for _, binding := range bindings {
-		keys[binding.Provider+"\x00"+binding.Key]++
 		if _, exists := byIndex[binding.AuthIndex]; exists {
 			byIndex[binding.AuthIndex] = QuotaBinding{} // Duplicate indexes stay refused.
 		} else {
 			byIndex[binding.AuthIndex] = binding
-		}
-	}
-	for index, binding := range byIndex {
-		if keys[binding.Provider+"\x00"+binding.Key] != 1 {
-			byIndex[index] = QuotaBinding{}
 		}
 	}
 	return byIndex
@@ -175,25 +164,6 @@ func (bindings quotaIdentityIndex) binding(provider, index string) (QuotaBinding
 	binding := bindings[strings.TrimSpace(index)]
 	return binding, binding.AuthIndex != "" && (provider == "" || binding.Provider == strings.ToLower(strings.TrimSpace(provider)))
 }
-
-func (bindings quotaIdentityIndex) valid(provider, index, generation, revision string) bool {
-	binding, ok := bindings.binding(provider, index)
-	return ok && generation != "" && binding.CredentialGeneration == generation && (revision == "" || binding.Revision == revision)
-}
-
-func (s *Store) quotaIdentitySnapshot(validateStorage bool) quotaIdentityIndex {
-	if !validateStorage {
-		if s != nil {
-			if snapshot := s.quotaSource.Load().snapshot(); snapshot != nil {
-				return snapshot.index
-			}
-		}
-		return nil
-	}
-	return indexQuotaBindings(s.quotaBindings(true))
-}
-
-var ErrQuotaIdentity = errors.New("quota credential binding is stale or unknown")
 
 // BindQuotaIdentitySource binds once without querying the source. It is safe in
 // the first per-request adapter call even if core currently holds a credential
@@ -210,11 +180,9 @@ func (s *Store) BindQuotaIdentitySource(source QuotaIdentitySource) {
 	}
 }
 
-// false is an atomic advisory read, not a live "memory-only" manager lookup.
-// true is authoritative and may block: only explicit add-on APIs and independent
-// worker validation use it. A successful full lookup publishes bounded immutable
-// evidence before returning, so an identity GET can immediately arm the UI.
-func (s *Store) quotaBindings(validateStorage bool) []QuotaBinding {
+// publishQuotaBindings performs a live projection and publishes bounded immutable
+// evidence before returning, so an identity GET immediately arms the dashboard.
+func (s *Store) publishQuotaBindings() []QuotaBinding {
 	if s == nil {
 		return nil
 	}
@@ -222,40 +190,45 @@ func (s *Store) quotaBindings(validateStorage bool) []QuotaBinding {
 	if source == nil {
 		return nil
 	}
-	if !validateStorage {
-		if snapshot := source.snapshot(); snapshot != nil {
-			return snapshot.bindings
-		}
-		return nil
-	}
 	sequence := source.reads.Add(1)
-	bindings := source.source.QuotaBindings(true)
+	bindings := source.source.QuotaBindings()
 	source.publish(sequence, bindings)
 	return bindings
 }
-func (s *Store) quotaBinding(provider, index string, validateStorage bool) (QuotaBinding, bool) {
+
+// publishedQuotaBindings is an atomic advisory read for original handlers. It
+// never queries the source and therefore never waits on core credential locks.
+func (s *Store) publishedQuotaBindings() []QuotaBinding {
+	if s == nil {
+		return nil
+	}
+	source := s.quotaSource.Load()
+	if source == nil {
+		return nil
+	}
+	if snapshot := source.snapshot(); snapshot != nil {
+		return snapshot.bindings
+	}
+	return nil
+}
+
+func (s *Store) publishedQuotaBinding(provider, index string) (QuotaBinding, bool) {
 	if s == nil {
 		return QuotaBinding{}, false
 	}
-	if !validateStorage {
-		return s.quotaIdentitySnapshot(false).binding(provider, index)
+	source := s.quotaSource.Load()
+	if source == nil {
+		return QuotaBinding{}, false
 	}
-	if source := s.quotaSource.Load(); source != nil {
-		if targeted, ok := source.source.(TargetedQuotaIdentitySource); ok {
-			return targeted.QuotaBinding(provider, index, true)
-		}
+	snapshot := source.snapshot()
+	if snapshot == nil {
+		return QuotaBinding{}, false
 	}
-	return s.quotaIdentitySnapshot(true).binding(provider, index)
+	return snapshot.index.binding(provider, index)
 }
-func (s *Store) validQuotaIdentity(provider, index, generation, revision string, validateStorage bool) bool {
-	if generation == "" {
-		return false
-	}
-	b, ok := s.quotaBinding(provider, index, validateStorage)
-	return ok && b.CredentialGeneration == generation && (revision == "" || b.Revision == revision)
-}
+
 func (s *Store) quotaIdentitiesHTTP(c *gin.Context) {
-	bindings := s.quotaBindings(true)
+	bindings := s.publishQuotaBindings()
 	public := make([]publicQuotaBinding, 0, len(bindings))
 	for _, binding := range bindings {
 		public = append(public, quotaBindingPublic(binding))
@@ -263,11 +236,13 @@ func (s *Store) quotaIdentitiesHTTP(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"bindings": public})
 }
 
-// quotaAPICallProof is intentionally fail-closed. auth_index only selects a
-// proxy/credential route; a literal bearer (even with a valid index) proves
-// nothing. Only the existing handler's known $TOKEN$ placement is accepted.
+// quotaAPICallProof is intentionally fail-closed. A literal bearer, even with a
+// valid index, proves nothing: only the original handler's known $TOKEN$ placement
+// is accepted. When the provider has operation selectors, the request must supply
+// exactly the digests this credential published; otherwise a captured response
+// could be attributed to a credential the request never addressed.
 func quotaAPICallProof(binding QuotaBinding, rawURL string, headers map[string]string, data string) bool {
-	if binding.APITokenSHA256 == "" || len(headers) > 32 {
+	if len(headers) > 32 {
 		return false
 	}
 	endpoint, err := url.Parse(rawURL)
@@ -336,20 +311,73 @@ func quotaAPICallProof(binding QuotaBinding, rawURL string, headers map[string]s
 	return true
 }
 
+// accountProperty names the single credential property that identifies an account
+// for a provider.
+//
+// There is deliberately no fallback. An account is identified by exactly one
+// property, so an unrelated metadata edit cannot silently re-key a credential, and
+// an identifier that a provider regenerates (a uuid minted per session) is never
+// consulted. A credential that does not expose its property has no account fact
+// and is grouped by provider alone.
+func accountProperty(provider string) string {
+	if provider == "kimi" {
+		// Kimi issues no email; its credential carries the device it belongs to.
+		return "device_id"
+	}
+	return "email"
+}
+
+// quotaInformationalFields and quotaCredentialFields bound which metadata a
+// projection tolerates. They are an allowlist, not an identity input: an
+// unaudited key is refused rather than ignored, because an unrecognized field
+// could change which account actually serves a request. No field below takes part
+// in identity — identity is the provider's single account property.
+var quotaInformationalFields = strings.Fields("type auth_kind email label note disabled priority weight prefix proxy_url excluded_models oauth_model_aliases model_aliases models request_retry request_scoped_errors disable_cooling websockets tool_prefix_disabled last_refresh last_refreshed_at expired expires_at expiry expires_in expire expires token_type scope scopes plan_type plan tier subscription created_at updated_at timestamp dca_expired dca_expires_at subs_tier_name subs_tier_id is_subs_active has_payment_method organization_name org_name user_name username name picture avatar claude_device_ids fingerprint_profile device_id device_seed refresh_token refreshToken id_token idToken token_endpoint redirect_uri")
+var quotaCredentialFields = strings.Fields("access_token accessToken token Token api_key session_token dca_token account_id account_uuid organization_uuid organization_id org_id project_id team_id user_id sub domain base_url")
+
+// quotaOperationSelectors are the per-provider selectors a browser-originated
+// manual quota fetch supplies and that must match the credential before the
+// capture is trusted. They are not identity.
+var quotaOperationSelectors = map[string][]string{
+	"codex":       {"account_id"},
+	"antigravity": {"project_id"},
+	"xai":         {"sub", "user_id"},
+}
+
+func operationSelectorKnown(provider, name string) bool {
+	for _, candidate := range quotaOperationSelectors[provider] {
+		if candidate == name {
+			return true
+		}
+	}
+	return false
+}
+
+func accountValue(auth *coreauth.Auth, property string) string {
+	if auth == nil || property == "" {
+		return ""
+	}
+	if raw, exists := auth.Metadata[property]; exists && raw != nil {
+		if value, ok := raw.(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return strings.TrimSpace(auth.Attributes[property])
+}
+
+func selectorValue(auth *coreauth.Auth, name string) string {
+	return accountValue(auth, name)
+}
+
+// quotaHash is a one-way digest for operation selectors, which are compared but
+// never displayed or persisted.
 func quotaHash(value string) string {
 	digest := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(digest[:])
 }
-func quotaDigest(parts []string) string {
-	data, _ := json.Marshal(parts)
-	return "qg1:" + quotaHash(string(data))
-}
 
-// TokenQuotaGeneration derives identity solely from producer-supplied evidence.
-// It is eligible only for verified token-scoped projections (never Codex).
-func TokenQuotaGeneration(provider, hash string) string {
-	return quotaDigest([]string{"quota-credential-v1", provider, "access_token", hash})
-}
 func validTokenHash(hash string) bool {
 	if len(hash) != 64 || strings.ToLower(hash) != hash {
 		return false
@@ -359,24 +387,18 @@ func validTokenHash(hash string) bool {
 }
 
 type managerQuotaIdentitySource struct {
-	current  func() *coreauth.Manager
-	validate func(*coreauth.Auth) bool
-	nonce    string
+	current func() *coreauth.Manager
 }
 
 // NewQuotaIdentitySource projects the existing manager without changing core
-// fields. validate, if supplied, runs only on add-on read/write/worker paths.
-func NewQuotaIdentitySource(current func() *coreauth.Manager, validate func(*coreauth.Auth) bool) QuotaIdentitySource {
-	nonce := make([]byte, 32)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil
-	}
-	return &managerQuotaIdentitySource{current: current, validate: validate, nonce: hex.EncodeToString(nonce)}
+// fields.
+func NewQuotaIdentitySource(current func() *coreauth.Manager) QuotaIdentitySource {
+	return &managerQuotaIdentitySource{current: current}
 }
 
 // quotaAuthCatalog is bounded and local to a synchronous source call. Count
-// addresses before projection/disk validation: an invalid competing credential
-// must not make a duplicated index or display key appear unambiguous.
+// addresses before projection: a duplicated index or display key must not appear
+// unambiguous.
 type quotaAuthCatalog struct {
 	byIndex map[string]*coreauth.Auth
 	keys    map[string]int
@@ -422,25 +444,8 @@ func (catalog quotaAuthCatalog) auth(provider, index string) *coreauth.Auth {
 	return auth
 }
 
-func sameQuotaAuthRevision(before, after *coreauth.Auth) bool {
-	return before != nil && after != nil && before.ID == after.ID && before.Index == after.Index && quotaAuthKey(before) == quotaAuthKey(after) && before.RegistrationEpoch == after.RegistrationEpoch && before.Generation == after.Generation
-}
-
-func (source *managerQuotaIdentitySource) project(auth *coreauth.Auth) (QuotaBinding, bool) {
-	binding, ok := ProjectQuotaBinding(auth)
-	if !ok {
-		return QuotaBinding{}, false
-	}
-	lifetime, _ := json.Marshal([]any{source.nonce, auth.ID, auth.RegistrationEpoch})
-	revision, _ := json.Marshal([]any{source.nonce, auth.ID, auth.RegistrationEpoch, auth.Generation})
-	binding.Lifetime = quotaHash(string(lifetime))
-	binding.Revision = quotaHash(string(revision))
-	binding.RuntimeGeneration = auth.Generation
-	return binding, true
-}
-
-func (source *managerQuotaIdentitySource) QuotaBindings(validateStorage bool) []QuotaBinding {
-	if source.current == nil {
+func (source *managerQuotaIdentitySource) QuotaBindings() []QuotaBinding {
+	if source == nil || source.current == nil {
 		return nil
 	}
 	manager := source.current()
@@ -450,24 +455,11 @@ func (source *managerQuotaIdentitySource) QuotaBindings(validateStorage bool) []
 	catalog := newQuotaAuthCatalog(manager.List())
 	result := make([]QuotaBinding, 0, len(catalog.byIndex))
 	for index := range catalog.byIndex {
-		auth := catalog.auth("", index)
-		binding, ok := source.project(auth)
-		if !ok || (validateStorage && source.validate != nil && !source.validate(auth)) {
+		binding, ok := ProjectQuotaBinding(catalog.auth("", index))
+		if !ok {
 			continue
 		}
 		result = append(result, binding)
-	}
-	if validateStorage {
-		// I/O may have overlapped replacement, removal, or new ambiguity. Recheck
-		// the entire catalog once, in memory, rather than trusting the old clones.
-		current := newQuotaAuthCatalog(manager.List())
-		filtered := result[:0]
-		for _, binding := range result {
-			if sameQuotaAuthRevision(catalog.auth(binding.Provider, binding.AuthIndex), current.auth(binding.Provider, binding.AuthIndex)) {
-				filtered = append(filtered, binding)
-			}
-		}
-		result = filtered
 	}
 	if source.current() != manager {
 		return nil
@@ -481,106 +473,34 @@ func (source *managerQuotaIdentitySource) QuotaBindings(validateStorage bool) []
 	return result
 }
 
-func (source *managerQuotaIdentitySource) QuotaBinding(provider, index string, validateStorage bool) (QuotaBinding, bool) {
-	if source.current == nil {
-		return QuotaBinding{}, false
-	}
-	manager := source.current()
-	if manager == nil {
-		return QuotaBinding{}, false
-	}
-	// Core has no public catalog version/index lookup. A fresh memory-only scan
-	// is necessary to refuse newly introduced ambiguity; never cache bindings.
-	catalog := newQuotaAuthCatalog(manager.List())
-	auth := catalog.auth(provider, index)
-	if auth == nil {
-		return QuotaBinding{}, false
-	}
-	current, exists := manager.GetByID(auth.ID)
-	if !exists || !sameQuotaAuthRevision(auth, current) {
-		return QuotaBinding{}, false
-	}
-	binding, ok := source.project(current)
-	if !ok || (validateStorage && source.validate != nil && !source.validate(current)) {
-		return QuotaBinding{}, false
-	}
-	if validateStorage {
-		// Only this credential's backing file was opened. Recheck its current
-		// registration/revision AND competing addresses after the I/O, including
-		// replacement while a queued mutation waited for its storage row lock.
-		latest := newQuotaAuthCatalog(manager.List()).auth(provider, index)
-		if !sameQuotaAuthRevision(current, latest) {
-			return QuotaBinding{}, false
-		}
-	}
-	return binding, source.current() == manager
-}
-
-// Known non-identity fields may be ignored. Unknown metadata is deliberately not
-// guessed: a plugin may give it credential/selector semantics we cannot prove.
-// Core metadata_keys.go, auth overrides/model aliases, and the original
-// auth_files_fields.go support these canonical retry/routing/transport settings.
-// They do not select quota credentials/accounts. Custom headers and unknown
-// plugin settings are deliberately NOT included.
-var quotaInformationalFields = strings.Fields("type auth_kind email label note disabled priority weight prefix proxy_url excluded_models oauth_model_aliases model_aliases models request_retry request_scoped_errors disable_cooling websockets tool_prefix_disabled last_refresh last_refreshed_at expired expires_at expiry expires_in expire expires token_type scope scopes plan_type plan tier subscription created_at updated_at timestamp dca_expired dca_expires_at subs_tier_name subs_tier_id is_subs_active has_payment_method organization_name org_name user_name username name picture avatar claude_device_ids fingerprint_profile device_id device_seed refresh_token refreshToken id_token idToken token_endpoint redirect_uri")
-var quotaSelectorFields = strings.Fields("account_id account_uuid organization_uuid organization_id org_id project_id team_id user_id sub domain base_url")
-
-// ProjectDiskQuotaBinding projects the credential a backing file currently
-// describes, for comparison with the live runtime projection.
-//
-// Only metadata is replaced with the file's: metadata is what a file credential
-// restates, while the runtime attributes are shared read-only because a file cannot
-// restate them. Core derives attributes for file credentials that do take part in
-// identity, such as the Kimi domain/base_url pair that every Kimi file credential
-// receives, so dropping them would make every comparison fail rather than detect a
-// real change to the file.
-func ProjectDiskQuotaBinding(runtime *coreauth.Auth, metadata map[string]any) (QuotaBinding, bool) {
-	if runtime == nil || len(metadata) > 128 {
-		return QuotaBinding{}, false
-	}
-	return ProjectQuotaBinding(&coreauth.Auth{
-		ID:         runtime.ID,
-		Index:      runtime.Index,
-		Provider:   runtime.Provider,
-		FileName:   runtime.FileName,
-		Attributes: runtime.Attributes,
-		Metadata:   metadata,
-	})
-}
-
-// ProjectQuotaBinding is a bounded, restart-stable projection of effective
-// credentials and quota-affecting selectors. It does not use email, mtime or ID
-// as account evidence. It returns no raw token or selector value.
+// ProjectQuotaBinding is a bounded, restart-stable projection of the facts that
+// identify a credential: its provider, its account and its display key. It returns
+// no token and no selector value.
 func ProjectQuotaBinding(auth *coreauth.Auth) (QuotaBinding, bool) {
-	if auth == nil || len(auth.Metadata) > 128 || len(auth.Attributes) > 128 || len(auth.ID) > 1024 {
+	if auth == nil {
 		return QuotaBinding{}, false
 	}
 	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if _, known := quotaCacheSchemas[provider]; !known {
 		return QuotaBinding{}, false
 	}
-	b := QuotaBinding{Provider: provider, AuthIndex: auth.EnsureIndex(), Key: strings.TrimSpace(auth.FileName), SelectorHashes: map[string]string{}}
-	if b.Key == "" {
-		b.Key = auth.ID
-	}
-	if b.Key == "" || !safeCacheText(b.Key, 512) || b.AuthIndex == "" || !safeCacheText(b.AuthIndex, 256) {
+	// Fail closed on anything that could change which account actually serves a
+	// request: an unaudited metadata key, or a custom header that can replace
+	// authorization or select an account independently of the projected facts.
+	if len(auth.Metadata) > 128 || len(auth.Attributes) > 128 || len(auth.ID) > 1024 {
 		return QuotaBinding{}, false
 	}
-	if provider == "devin" {
-		b.Key += "\x00" + b.AuthIndex
-	}
-	if len(b.Key) > 512 {
-		return QuotaBinding{}, false
+	for key := range auth.Attributes {
+		if strings.HasPrefix(strings.ToLower(key), "header:") {
+			return QuotaBinding{}, false
+		}
 	}
 	known := map[string]bool{}
-	for _, key := range quotaInformationalFields {
-		known[key] = true
+	for _, field := range quotaInformationalFields {
+		known[field] = true
 	}
-	for _, key := range quotaSelectorFields {
-		known[key] = true
-	}
-	for _, key := range []string{"access_token", "accessToken", "token", "Token", "api_key", "session_token", "dca_token"} {
-		known[key] = true
+	for _, field := range quotaCredentialFields {
+		known[field] = true
 	}
 	for key, value := range auth.Metadata {
 		if !known[key] {
@@ -590,174 +510,42 @@ func ProjectQuotaBinding(auth *coreauth.Auth) (QuotaBinding, bool) {
 			return QuotaBinding{}, false
 		}
 	}
-	// Custom headers can independently select an account or replace authorization.
-	for key := range auth.Attributes {
-		if strings.HasPrefix(strings.ToLower(key), "header:") {
-			return QuotaBinding{}, false
-		}
-	}
+	// The credential's declared type must agree with the provider it is filed under.
 	if typ, exists := auth.Metadata["type"]; exists && typ != nil && typ != "" {
 		value, ok := typ.(string)
 		if !ok || strings.ToLower(strings.TrimSpace(value)) != provider {
 			return QuotaBinding{}, false
 		}
 	}
-	scalar := func(key string) (string, bool) {
-		value := ""
-		if raw, exists := auth.Metadata[key]; exists && raw != nil {
-			var ok bool
-			value, ok = raw.(string)
-			if !ok {
-				return "", false
-			}
-			value = strings.TrimSpace(value)
-		}
-		attr := strings.TrimSpace(auth.Attributes[key])
-		if len(value) > 16384 || len(attr) > 16384 {
-			return "", false
-		}
-		if attr != "" {
-			if value != "" && value != attr {
-				return "", false
-			}
-			value = attr
-		}
-		return value, true
+	index := auth.EnsureIndex()
+	key := strings.TrimSpace(auth.FileName)
+	if key == "" {
+		key = auth.ID
 	}
-	// OAuth spellings must agree. In particular core fingerprint and management
-	// token resolution have different precedence: disagreement is not a binding.
-	access := ""
-	addAccess := func(v any) bool {
-		if v == nil {
-			return true
-		}
-		str, ok := v.(string)
-		if !ok || len(str) > 16384 {
-			return false
-		}
-		str = strings.TrimSpace(str)
-		if str == "" {
-			return true
-		}
-		if access != "" && access != str {
-			return false
-		}
-		access = str
-		return true
-	}
-	for _, key := range []string{"access_token", "accessToken"} {
-		if !addAccess(auth.Metadata[key]) || !addAccess(auth.Attributes[key]) {
-			return QuotaBinding{}, false
-		}
-	}
-	stringToken := ""
-	for _, key := range []string{"token", "Token"} {
-		raw := auth.Metadata[key]
-		if raw == nil {
-			continue
-		}
-		switch value := raw.(type) {
-		case string:
-			if len(value) > 16384 {
-				return QuotaBinding{}, false
-			}
-			value = strings.TrimSpace(value)
-			if stringToken != "" && stringToken != value {
-				return QuotaBinding{}, false
-			}
-			stringToken = value
-		case map[string]any:
-			if len(value) > 16 {
-				return QuotaBinding{}, false
-			}
-			for k := range value {
-				if k != "access_token" && k != "accessToken" && k != "refresh_token" && k != "token_type" && k != "expiry" && k != "expires_in" && k != "expires_at" && k != "scope" {
-					return QuotaBinding{}, false
-				}
-			}
-			if !addAccess(value["access_token"]) || !addAccess(value["accessToken"]) {
-				return QuotaBinding{}, false
-			}
-		case map[string]string:
-			if len(value) > 16 {
-				return QuotaBinding{}, false
-			}
-			for k := range value {
-				if k != "access_token" && k != "accessToken" && k != "refresh_token" && k != "token_type" && k != "expiry" && k != "expires_in" && k != "expires_at" && k != "scope" {
-					return QuotaBinding{}, false
-				}
-			}
-			if !addAccess(value["access_token"]) || !addAccess(value["accessToken"]) {
-				return QuotaBinding{}, false
-			}
-		default:
-			return QuotaBinding{}, false
-		}
-	}
-	apiKey, ok := scalar("api_key")
-	if !ok {
+	if key == "" || index == "" {
 		return QuotaBinding{}, false
 	}
-	session, ok := scalar("session_token")
-	if !ok {
+	if provider == "devin" {
+		key += "\x00" + index
+	}
+	if len(key) > 512 || !safeCacheText(strings.ReplaceAll(key, "\x00", ""), 512) || !safeCacheText(index, 256) {
 		return QuotaBinding{}, false
 	}
-	dca, ok := scalar("dca_token")
-	if !ok {
+	kind := accountProperty(provider)
+	account := accountValue(auth, kind)
+	// An account fact is an opaque label used in a storage key, so it must stay
+	// short, printable and free of the key separator.
+	if account != "" && (len(account) > 256 || !safeCacheText(account, 256) || strings.Contains(account, ":")) {
 		return QuotaBinding{}, false
 	}
-	if attr := strings.TrimSpace(auth.Attributes["token"]); attr != "" {
-		if stringToken != "" && stringToken != attr {
-			return QuotaBinding{}, false
-		}
-		stringToken = attr
+	binding := QuotaBinding{Provider: provider, Key: key, Account: account, AuthIndex: index, SelectorHashes: map[string]string{}}
+	if account != "" {
+		binding.AccountKind = kind
 	}
-	effective := ""
-	// Primary credential aliases must not disagree; DCA is an independent Meta
-	// acquisition credential and is hashed separately from the minted API key.
-	for _, value := range []string{access, apiKey, session, stringToken} {
-		if value == "" {
-			continue
-		}
-		if effective != "" && effective != value {
-			return QuotaBinding{}, false
-		}
-		effective = value
-	}
-	if dca != "" && provider != "meta" {
-		return QuotaBinding{}, false
-	}
-	if effective == "" {
-		if provider != "meta" || dca == "" {
-			return QuotaBinding{}, false
-		}
-		effective = dca
-	}
-	parts := []string{"quota-credential-v1", provider, "access_token", quotaHash(effective)}
-	if dca != "" && dca != effective {
-		parts = append(parts, "dca_token", quotaHash(dca))
-	}
-	for _, key := range quotaSelectorFields {
-		value, valid := scalar(key)
-		if !valid {
-			return QuotaBinding{}, false
-		}
-		if value != "" {
-			hash := quotaHash(value)
-			b.SelectorHashes[key] = hash
-			parts = append(parts, key, hash)
+	for _, name := range quotaOperationSelectors[provider] {
+		if value := selectorValue(auth, name); value != "" && len(value) <= 16384 {
+			binding.SelectorHashes[name] = quotaHash(value)
 		}
 	}
-	b.CredentialGeneration = quotaDigest(parts)
-	b.AccessTokenSHA256 = coreauth.AccessTokenSHA256(auth)
-	if b.AccessTokenSHA256 != "" && b.AccessTokenSHA256 != quotaHash(effective) {
-		return QuotaBinding{}, false
-	}
-	b.TokenScoped = provider == "claude" && access != "" && b.AccessTokenSHA256 != "" && len(b.SelectorHashes) == 0 && dca == ""
-	// $TOKEN$ support is intentionally narrower than manual browser cache support.
-	// The capitalized Token variant is fingerprinted by core, but not API-call.
-	if access != "" && (auth.Metadata["access_token"] != nil || auth.Metadata["accessToken"] != nil || auth.Metadata["token"] != nil) || apiKey != "" || session != "" || (stringToken != "" && auth.Metadata["token"] != nil) {
-		b.APITokenSHA256 = quotaHash(effective)
-	}
-	return b, true
+	return binding, true
 }

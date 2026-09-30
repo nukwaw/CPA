@@ -118,7 +118,7 @@
   if (typeof module !== 'undefined' && module.exports) {module.exports = {...api, selectorDigest}; return;}
   if (root.CPAQuotaPersistence) return;
   root.CPAQuotaPersistence = api;
-  let attached = false, captureBinding = () => null, activeCommit = null, updaterFrame = null;
+  let attached = false, captureBinding = () => null, activeCommit = null, pendingCommit = null, updaterFrame = null;
   const captures = new WeakMap(), updaterProvenance = new WeakMap(), proofs = new WeakMap();
   let checkSource = () => {}, beginSource = () => () => {};
   api.wrapQuotaSource = (original, project) => function (...args) {
@@ -145,18 +145,26 @@
   // Return the ORIGINAL generation object. No fields are added to upstream state.
   api.wrapCapture = original => function (...args) {
     const generation = Reflect.apply(original, this, args);
-    if (generation && typeof generation === 'object') captures.set(generation, captureBinding(generation));
+    // A capture taken while this tab cannot trust the binding table still records an
+    // untrusted operation, so no later subscriber can adopt it by accident.
+    if (generation && typeof generation === 'object') {const scope = captureBinding(generation); captures.set(generation, scope || {untrusted: 0});}
     return generation;
   };
   api.wrapCommit = original => function (...args) {
     const callback = args[1], generation = args[0];
     // Preserve omitted/default third arguments: only replace the callback.
     args[1] = function (...callbackArgs) {
-      const previous = activeCommit;
+      const previous = activeCommit, previousPending = pendingCommit;
       const scope = {operation: captures.get(generation), name: args[2] === undefined ? generation.name : args[2]};
       activeCommit = scope;
       if (updaterFrame) updaterFrame.scopes.push(scope);
-      try {return Reflect.apply(callback, this, callbackArgs);} finally {activeCommit = previous;}
+      // The bundle resolves its own updaters through a lexical helper instead of this
+      // wrapper, so a synchronous state write made by the callback must still find the
+      // same scope. The subscription that write triggers consumes it, and it is dropped
+      // when the callback ends -- including when it throws -- so no later unguarded
+      // write can inherit a finished operation's provenance.
+      pendingCommit = scope;
+      try {return Reflect.apply(callback, this, callbackArgs);} finally {activeCommit = previous; if (pendingCommit === scope) pendingCommit = previousPending;}
     };
     // The ORIGINAL native guard alone decides whether the callback runs.
     return Reflect.apply(original, this, args);
@@ -169,6 +177,9 @@
     updaterFrame = frame;
     try {
       const result = Reflect.apply(original, this, args);
+      // An updater resolved inside a commit callback is the same synchronous scope,
+      // even when the app calls its own resolver instead of this wrapper.
+      if (activeCommit && !frame.scopes.includes(activeCommit)) frame.scopes.push(activeCommit);
       if (result && typeof result === 'object' && result !== args[1] && frame.scopes.length) updaterProvenance.set(result, frame.scopes.slice());
       return result;
     } finally {updaterFrame = previous;}
@@ -187,20 +198,20 @@
       try {if (authenticated && key) window.sessionStorage.setItem('cpa-stats-management-key', key);} catch {}
     };
     let bindings = new Map(), poll = 0, debounce = 0, flushing = null, refreshTicket = 0, globalInvalidated = 0;
-    const pending = new Map(), observation = new Map(), invalidated = new Map(), windowTimes = new Map(), denied = new Set(), unknownNames = new Set();
     let unknownBatch = false;
+    const pending = new Map(), observation = new Map(), invalidated = new Map(), windowTimes = new Map(), denied = new Set(), unknownNames = new Set();
     const requests = new Set(), filename = name => name.split('\0')[0];
     const sourceFences = new Map(), sourcePending = new Map();
     let globalSourceFence = {};
     const sourceName = value => typeof value === 'string' && value.length > 0 && value.length <= 4096 && !value.includes('\0') ? value : null;
     const sourceToken = name => {if (!sourceFences.has(name)) sourceFences.set(name, {}); return sourceFences.get(name);};
     function rejectSource(name) {if (sourceName(name)) sourceFences.set(name, {}); else globalSourceFence = {};}
-    function sourceCurrent(operation, name) {return operation?.globalSourceFence === globalSourceFence && operation.sourceFences.get(name) === sourceToken(name) && !sourcePending.has(name);}
+    function sourceCurrent(operation, name) {return !!operation && !operation.untrusted && operation.globalSourceFence === globalSourceFence && operation.sourceFences.get(name) === sourceToken(name) && !sourcePending.has(name) && bindingCurrent(operation, name);}
     function validateSource(source, result) {
       const name = sourceName(source?.name);
       if (!authenticated || !name || !Object.hasOwn(mapNames, source?.provider)) return false;
       const index = source.index, key = source.provider === 'devin' ? `${name}\0${index}` : name;
-      const who = bindings.get(slot(source.provider, key));
+      const who = bindingFor(source.provider, key);
       if (!who || !currentBinding(who) || typeof index !== 'string' || index !== who.auth_index) return false;
       let selectors = source.selectors;
       if (source.mode === 'async-result') selectors = {project_id: result};
@@ -228,26 +239,62 @@
       };
     };
     const slot = (provider, name) => JSON.stringify([provider, name]);
-    const identityKey = who => JSON.stringify([who.provider, who.key, who.auth_index, who.credential_generation, who.revision]);
+    // Records carry plain account facts. The backend publishes no opaque credential
+    // identity any more, so the exact published binding is the operation fence: a
+    // removed binding revokes its own operations and nothing else. `auth_index` is
+    // transient correlation data only — it is compared to the native request and
+    // never stored, uploaded, or used as a map key.
+    const identityKey = who => JSON.stringify([who.provider, who.key, who.account, who.account_kind, who.auth_index]);
     const same = (a, b) => !!a && !!b && identityKey(a) === identityKey(b);
-    function currentBinding(who) {return same(who, bindings.get(slot(who.provider, who.key))) && !denied.has(identityKey(who));}
+    // The dashboard groups by (provider, account), so the bridge keys its own
+    // bookkeeping the same way. Several live credentials can resolve to one pair;
+    // they share the one persisted cache row the backend keeps for it.
+    const groupOf = (map, provider, account, create = false) => {
+      const id = slot(provider, account);
+      let group = map.get(id);
+      if (group) return group;
+      if (!create) return undefined;
+      group = [];
+      map.set(id, group);
+      return group;
+    };
+    const sameGroup = (a, b) => !!a && !!b && a.length === b.length && a.every((who, index) => same(who, b[index]));
+    // A binding stays current while the exact published form it was captured from is
+    // still in its group and no 409 has revoked that exact form. Membership in the
+    // group is the fence: a rotation inside one pair fences only its own old
+    // operations, and every other credential is left alone.
+    function currentBinding(who) {return (bindings.get(slot(who.provider, who.account)) || []).some(candidate => same(who, candidate)) && !denied.has(identityKey(who));}
+    function bindingFor(provider, key) {
+      for (const group of bindings.values()) for (const who of group) if (who.provider === provider && who.key === key) return who;
+      return undefined;
+    }
     function nativeCurrent(operation, name) {
       if (!operation || operation.session !== session) return false;
       const current = quotaStore.getState(), generation = operation.generation;
       return current.cacheGeneration === generation.cacheGeneration && (current.fileGenerations?.[name] ?? 0) === (generation.fileGenerations?.[name] ?? 0);
     }
+    // The captured binding table must still describe the same credentials: a poll
+    // that learned a different state for that pair has fenced its older operations.
+    function bindingCurrent(operation, name) {
+      if (operation.bindings === bindings) return true;
+      const who = [...operation.bindings.values()].flat().find(candidate => filename(candidate.key) === name);
+      return !!who && sameGroup(operation.bindings.get(slot(who.provider, who.account)), bindings.get(slot(who.provider, who.account)));
+    }
     captureBinding = generation => {
       if (!authenticated) return null;
-      const selected = new Map([...bindings].filter(([, who]) => !denied.has(identityKey(who)) && (generation.name === undefined || filename(who.key) === generation.name)));
+      const selected = [...bindings.values()].flat().filter(who => !denied.has(identityKey(who)) && (generation.name === undefined || filename(who.key) === generation.name));
+      // A named capture for a filename no binding covers is remembered: a binding
+      // that appears later must fence it instead of adopting it. A bulk capture is
+      // remembered with it, because it covers every filename at once.
       if (generation.name === undefined) unknownBatch = true;
-      else if (!selected.size) unknownNames.add(generation.name);
+      else if (!selected.length) unknownNames.add(generation.name);
       const fences = new Map();
-      for (const who of selected.values()) {const name = filename(who.key); fences.set(name, sourcePending.has(name) ? {} : sourceToken(name));}
-      return {session, generation, bindings: selected, sourceFences: fences, globalSourceFence};
+      for (const who of selected) {const name = filename(who.key); if (!fences.has(name)) fences.set(name, sourcePending.has(name) ? {} : sourceToken(name));}
+      return {session, generation, provider: generation.provider, bindings, sourceFences: fences, globalSourceFence};
     };
     function clearNative(names) {if (!names.length) return; identityClearing = true; try {clearQuotaCache(names);} finally {identityClearing = false;}}
     function reset() {
-      if (authenticated) clearNative([...new Set([...bindings.values()].map(who => filename(who.key)))]);
+      if (authenticated) clearNative([...new Set([...bindings.values()].flat().map(who => filename(who.key)))]);
       session++; refreshTicket++; authenticated = false; key = ''; base = ''; bindings = new Map();
       pending.clear(); observation.clear(); invalidated.clear(); windowTimes.clear(); denied.clear(); unknownNames.clear(); unknownBatch = false; globalInvalidated = 0;
       sourceFences.clear(); sourcePending.clear(); globalSourceFence = {};
@@ -266,56 +313,60 @@
       } finally {requests.delete(controller);}
     }
     function installBindings(payload) {
-      // Parse only secret-free server bindings. Missing/ambiguous entries revoke
-      // trust; auth-files, email, tokens and client-derived fingerprints are absent.
-      const next = new Map(), ambiguous = new Set();
+      // Parse only secret-free server bindings. Malformed entries are dropped, and
+      // no token ever appears in them. The account fact is persisted deliberately;
+      // `auth_index` stays transient correlation data and is never used as a key.
+      const next = new Map();
       for (const item of Array.isArray(payload?.bindings) ? payload.bindings : []) {
-        if (!item || !Object.hasOwn(mapNames, item.provider) || !['key', 'auth_index', 'credential_generation', 'revision'].every(field => typeof item[field] === 'string' && item[field].length > 0 && item[field].length <= 4096)) continue;
-        const who = Object.freeze({provider: item.provider, key: item.key, auth_index: item.auth_index, credential_generation: item.credential_generation, revision: item.revision});
+        if (!item || !Object.hasOwn(mapNames, item.provider) || typeof item.key !== 'string' || !item.key || item.key.length > 4096) continue;
+        if (!['account', 'account_kind', 'auth_index'].every(field => typeof item[field] === 'string' && item[field].length <= 4096)) continue;
+        const who = Object.freeze({provider: item.provider, key: item.key, account: item.account, account_kind: item.account_kind, auth_index: item.auth_index});
         if (!filename(who.key) || (who.provider === 'devin' ? who.key !== `${filename(who.key)}\0${who.auth_index}` : who.key.includes('\0'))) continue;
         const proof = manualProof(item.manual_source_proof);
         if (proof) proofs.set(who, proof);
-        const id = slot(who.provider, who.key);
-        const old = bindings.get(id);
-        if (old && JSON.stringify(proofs.get(old)) !== JSON.stringify(proof || undefined)) rejectSource(filename(who.key));
-        if (next.has(id) || ambiguous.has(id)) {next.delete(id); ambiguous.add(id);} else next.set(id, who);
+        const group = groupOf(next, who.provider, who.account, true);
+        // Compare against the binding table still in force, not the table being built.
+        // A selector proof that changed rotates this filename's source fence so an
+        // operation captured under the previous proof can never be re-stamped.
+        const previous = (groupOf(bindings, who.provider, who.account, false) || []).find(candidate => same(candidate, who));
+        if (previous && JSON.stringify(proofs.get(previous)) !== JSON.stringify(proof || undefined)) rejectSource(filename(who.key));
+        // Several live credentials may resolve to one account. They all remain
+        // correlatable, and they share the single persisted cache row for the pair.
+        if (!group.some(candidate => same(candidate, who))) group.push(who);
       }
-      const changed = new Set(), replaced = new Set();
-      for (const [id, old] of bindings) if (!same(old, next.get(id))) {
-        const name = filename(old.key), replacement = next.get(id); changed.add(name);
-        // A -> B -> A in this tab must not revive A's pre-replacement history.
-        // Revision-only churn fences operations, not settled same-generation data.
-        if (!replacement || replacement.credential_generation !== old.credential_generation || replacement.auth_index !== old.auth_index) {replaced.add(name); invalidated.set(name, Date.now());}
+      const changed = new Set();
+      const touched = new Set([...bindings.keys(), ...next.keys()]);
+      for (const id of touched) {
+        const before = bindings.get(id), after = next.get(id);
+        const removed = [...(before || [])].filter(who => !(after || []).some(candidate => same(candidate, who)));
+        if (!removed.length) continue;
+        for (const who of removed) {
+          const name = filename(who.key); changed.add(name);
+          // A -> B -> A in this tab must not revive A's pre-replacement history.
+          invalidated.set(name, Date.now());
+        }
       }
-      for (const [id, who] of next) if (!bindings.has(id)) {
-        const name = filename(who.key); replaced.add(name);
+      for (const group of next.values()) for (const who of group) {
+        const name = filename(who.key);
+        const before = bindings.get(slot(who.provider, who.account)) || [];
+        if (before.some(candidate => same(candidate, who))) continue;
+        // A named capture already proved that this tab ran an operation the binding
+        // table did not cover, so the new binding must fence and clear it. A bulk
+        // capture keeps no such proof, and a binding appearing after one owns no old
+        // operation: nothing is cleared for it.
         if (unknownBatch || unknownNames.has(name)) changed.add(name);
       }
-      // Native clears are filename-wide, including unchanged sibling bindings.
-      // Preserve only settled values when EVERY binding for that name is stable;
-      // loading states and pending uploads still belong to the old operation.
-      const settled = [], before = quotaStore.getState();
-      for (const [id, old] of bindings) if (changed.has(filename(old.key)) && !replaced.has(filename(old.key))) {
-        const value = before[mapNames[old.provider]]?.[old.key], history = identityKey(old);
-        if (['success', 'error', 'idle'].includes(value?.status)) settled.push({who: next.get(id), value, observed: observation.get(history), times: windowTimes.get(history)});
-      }
+      // Native clears are filename-wide, including unchanged sibling bindings. A
+      // binding that was dropped or newly observed in this tab is treated as
+      // replaced: its old operations are fenced and its display state reloads from
+      // the server cache. An unchanged binding is never cleared here.
       bindings = next;
       for (const name of changed) discardFile(name);
       // A successful fresh lookup permits NEW operations even when one valid
       // sibling was dropped in a 409 batch. Old operations remain natively fenced.
       denied.clear();
-      clearNative([...changed]);
-      const patch = {}, current = quotaStore.getState();
-      for (const {who, value, observed, times} of settled) {
-        const map = mapNames[who.provider], name = filename(who.key), id = identityKey(who);
-        // Do not overwrite any newer state/reset installed by a native subscriber.
-        if (!currentBinding(who) || current.cacheGeneration !== before.cacheGeneration || current.fileGenerations?.[name] !== (before.fileGenerations?.[name] ?? 0) + 1 || Object.hasOwn(current[map], who.key)) continue;
-        patch[map] ||= {...current[map]}; patch[map][who.key] = value;
-        if (observed !== undefined) observation.set(id, observed);
-        if (times) windowTimes.set(id, times);
-      }
-      if (Object.keys(patch).length) {applying = true; try {quotaStore.setState(patch);} finally {applying = false;}}
-      for (const who of bindings.values()) unknownNames.delete(filename(who.key));
+      if (changed.size) clearNative([...changed]);
+      for (const who of [...bindings.values()].flat()) unknownNames.delete(filename(who.key));
     }
     function discardFile(name) {
       for (const [id, value] of pending) if (filename(value.entry.key) === name) pending.delete(id);
@@ -327,7 +378,7 @@
       const operation = matches[0].operation;
       // Distinct operations touching one output are ambiguous, never guessed.
       if (matches.some(scope => scope.operation !== operation) || !nativeCurrent(operation, filename(name)) || !sourceCurrent(operation, filename(name))) return null;
-      const who = operation.bindings.get(slot(provider, name));
+      const who = bindingFor(provider, name);
       return who && currentBinding(who) ? {who, operation} : null;
     }
     function queue(provider, name, value, scopes) {
@@ -335,23 +386,29 @@
       if (!source || !safe) return; // Unknown-at-start success is NEVER promoted.
       const {who, operation} = source, id = identityKey(who), observed = new Date().toISOString();
       observation.set(id, stamp(observed)); windowTimes.delete(id);
+      // The queued entry keeps the captured binding so a retry can still prove it is
+      // current; `uploadEntry` alone decides what leaves this page.
       pending.set(id, {entry: {...who, observed_at: observed, state: safe}, operation});
       clearTimeout(debounce); debounce = setTimeout(() => void flush(), 500);
     }
+    // Plain account facts only: the transient credential index that correlates the
+    // native request never leaves the page, and no opaque credential identity is
+    // recorded at all.
+    const uploadEntry = entry => ({provider: entry.provider, key: entry.key, account: entry.account, account_kind: entry.account_kind, observed_at: entry.observed_at, state: entry.state});
     const uploadCurrent = value => currentBinding(value.entry) && nativeCurrent(value.operation, filename(value.entry.key)) && sourceCurrent(value.operation, filename(value.entry.key));
     async function flush() {
       if (!authenticated || !pending.size || flushing) return;
       const token = {}; flushing = token; const epoch = session, batch = []; let bytes = 32;
       for (const [id, value] of pending) {
         if (!uploadCurrent(value)) {pending.delete(id); continue;}
-        const size = new TextEncoder().encode(JSON.stringify(value.entry)).length + 1;
+        const size = new TextEncoder().encode(JSON.stringify(uploadEntry(value.entry))).length + 1;
         if (size > 900000) {pending.delete(id); report('error', {message: 'A quota observation exceeds the persistence size limit; refresh remains available but this observation was not saved.'}); continue;}
         if (batch.length >= 100 || bytes + size > 900000) break;
         batch.push([id, value]); bytes += size;
       }
       for (const [id] of batch) pending.delete(id);
       try {
-        if (batch.length) {await request('stats/quota/cache', {method: 'PUT', body: {entries: batch.map(([, value]) => value.entry)}}); if (epoch === session) report('ready');}
+        if (batch.length) {await request('stats/quota/cache', {method: 'PUT', body: {entries: batch.map(([, value]) => uploadEntry(value.entry))}}); if (epoch === session) report('ready');}
       } catch (error) {
         if (epoch === session && error.name !== 'AbortError') {
           if (error.status === 409) {
@@ -380,8 +437,9 @@
       if (applying) return;
       for (const [provider, map] of Object.entries(mapNames)) {
         if (next[map] === previous[map]) continue;
-        const scopes = updaterProvenance.get(next[map]) || (activeCommit ? [activeCommit] : []);
+        const scopes = updaterProvenance.get(next[map]) || (activeCommit ? [activeCommit] : pendingCommit ? [pendingCommit] : []);
         updaterProvenance.delete(next[map]);
+        pendingCommit = null;
         for (const [name, value] of Object.entries(next[map] || {})) if (value !== previous[map]?.[name] && value?.status === 'success') queue(provider, name, value, scopes);
       }
     });
@@ -399,19 +457,20 @@
         const cutoff = name => Math.max(globalInvalidated, invalidated.get(filename(name)) || 0);
         for (const entry of Array.isArray(cached.entries) ? cached.entries : []) {
           if (!entry) continue;
-          const who = bindings.get(slot(entry.provider, entry.key));
-          // Runtime revisions intentionally do not affect durable cache identity:
-          // same-generation history can hydrate after a server restart, never upload.
-          if (!who || !currentBinding(who) || entry.auth_index !== who.auth_index || entry.credential_generation !== who.credential_generation) continue;
+          const group = bindings.get(slot(entry.provider, entry.account));
+          // Durable cache identity is the account fact alone; stored history
+          // hydrates, and it is never uploaded back as a new observation.
+          const who = group?.find(candidate => candidate.account === String(entry.account || '') && candidate.account_kind === String(entry.account_kind || '') && currentBinding(candidate));
+          if (!who) continue;
           const map = mapNames[who.provider], existing = current[map]?.[who.key], at = stamp(entry.observed_at), id = identityKey(who);
           if (existing && existing.status !== 'idle' || !at || at > Date.now() + 300000 || at <= cutoff(who.key)) continue;
           const safe = sanitize(who.provider, entry.state); if (!safe) continue;
           patch[map] ||= {...current[map]}; patch[map][who.key] = safe; observation.set(id, at); newest = Math.max(newest, at); hydrated++;
         }
         for (const snapshot of Array.isArray(normalized.snapshots) ? normalized.snapshots : []) {
-          if (!snapshot || !Object.hasOwn(mapNames, snapshot.provider) || !snapshot.credential_generation) continue;
-          for (const who of bindings.values()) {
-            if (who.provider !== snapshot.provider || who.auth_index !== String(snapshot.auth_index) || who.credential_generation !== snapshot.credential_generation || !currentBinding(who)) continue;
+          if (!snapshot || !Object.hasOwn(mapNames, snapshot.provider)) continue;
+          for (const who of [...bindings.values()].flat()) {
+            if (who.provider !== snapshot.provider || who.account !== String(snapshot.account || '') || !currentBinding(who)) continue;
             const map = mapNames[who.provider], id = identityKey(who), existing = patch[map]?.[who.key] || current[map]?.[who.key];
             if (existing?.status === 'success' && !observation.has(id)) continue;
             if (!windowTimes.has(id)) windowTimes.set(id, new Map());

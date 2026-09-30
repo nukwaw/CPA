@@ -86,12 +86,47 @@ func endpointKind(provider, host, path string) string {
 }
 
 func newSnapshot(identity Identity, source string, observedAt time.Time) (Snapshot, bool) {
-	provider := strings.ToLower(safeText(identity.Provider))
-	authIndex := safeText(identity.AuthIndex)
-	if provider == "" || authIndex == "" || observedAt.IsZero() {
+	provider, account, accountKind, valid := identityFacts(identity)
+	if !valid || observedAt.IsZero() {
 		return Snapshot{}, false
 	}
-	return Snapshot{Provider: provider, AuthIndex: authIndex, CredentialGeneration: identity.CredentialGeneration, Revision: identity.Revision, Source: source, ObservedAt: observedAt.UTC(), Windows: []Window{}}, true
+	return Snapshot{Provider: provider, Account: account, AccountKind: accountKind, Source: source, ObservedAt: observedAt.UTC(), Windows: []Window{}}, true
+}
+
+// identityFacts validates and normalizes the caller-supplied account facts.
+// The provider must be present and well formed. The account property is
+// optional: a credential without one is still recorded, grouped by provider
+// alone. A non-empty account must stay bounded and free of control characters
+// so that persisted facts cannot carry injected content.
+func identityFacts(identity Identity) (provider, account, accountKind string, valid bool) {
+	provider = strings.ToLower(safeText(identity.Provider))
+	if provider == "" {
+		return "", "", "", false
+	}
+	account, ok := accountFact(identity.Account)
+	if !ok {
+		return "", "", "", false
+	}
+	return provider, account, safeText(identity.AccountKind), true
+}
+
+// accountFact bounds an optional account property. Oversized or
+// control-character-bearing values are rejected instead of silently dropped,
+// because an invalid account must never be recorded as a different credential.
+func accountFact(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", true
+	}
+	if len(value) > maxText {
+		return "", false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return "", false
+		}
+	}
+	return value, true
 }
 
 func finish(snapshot Snapshot) (Snapshot, bool) {

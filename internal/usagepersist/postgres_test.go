@@ -50,6 +50,8 @@ func testPostgresCore(t *testing.T) *corestore.PostgresStore {
 }
 
 // TestPostgresPersistence borrows an initialized core pool rather than opening one.
+// Identity is (provider, account); there is no generation or revision, so the same
+// account keeps one row across reopen, replicas and token rotations.
 func TestPostgresPersistence(t *testing.T) {
 	core := testPostgresCore(t)
 	db, schema := core.UsageDatabase()
@@ -59,13 +61,16 @@ func TestPostgresPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close(ctx) }()
-	// Each adapter has its own operation revision, but unchanged credentials
-	// must retain the same persistent identity across reopen and replicas.
+	// Three distinct accounts: claude with the fixture account fact, devin with its
+	// own account, and a third claude credential whose different account must land
+	// in its own row and never mix with the first.
+	const devinAccount = "devin@example.invalid"
+	const parallelAccount = "parallel@example.invalid"
 	bindFixtures := func(target *Store) {
-		bindQuotaFixtures(t, target,
-			quotaFixtureAuth("claude", "account-1", "claude.json", "source-token"),
-			quotaFixtureAuth("devin", "devin-account", "devin.json", "devin-token"),
-			quotaFixtureAuth("claude", "parallel", "parallel.json", "parallel-token"))
+		wpBindFixtures(t, target,
+			wpQuotaAuth("claude", "account-1", "claude.json", "source-token"),
+			wpQuotaAuthWithAccount("devin", "devin-account", "devin.json", "devin-token", devinAccount),
+			wpQuotaAuthWithAccount("claude", "parallel", "parallel.json", "parallel-token", parallelAccount))
 	}
 	bindFixtures(s)
 	at := time.Now().UTC().Add(-time.Minute)
@@ -73,7 +78,6 @@ func TestPostgresPersistence(t *testing.T) {
 	record.Model = "gpt-test\x00suffix"
 	record.Alias = "alias\x00suffix"
 	record.Provider = "claude"
-	record.AccessTokenSHA256 = quotaHash("source-token")
 	record.ResponseHeaders = http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.2"}}
 	if err = s.recordFixture(ctx, record); err != nil {
 		t.Fatal(err)
@@ -86,9 +90,12 @@ func TestPostgresPersistence(t *testing.T) {
 	if _, err = s.SetPrice(ctx, price); err != nil {
 		t.Fatal(err)
 	}
-	cache := bindCacheFixture(s, QuotaCacheEntry{Provider: "devin", AuthIndex: "devin-account", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"daily","remainingPercent":80,"resetAtMs":1800000000000,"periodHours":24}],"observedAtMs":1700000000000,"plan":"pro"}`)})
+	cache := wpBindCacheFixture(s, QuotaCacheEntry{Provider: "devin", Key: "devin-account", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"daily","remainingPercent":80,"resetAtMs":1800000000000,"periodHours":24}],"observedAtMs":1700000000000,"plan":"pro"}`)})
 	if cache.Key != "devin.json\x00devin-account" {
 		t.Fatalf("fixture lost Devin's native composite key: %q", cache.Key)
+	}
+	if cache.Account != devinAccount || cache.AccountKind != "email" {
+		t.Fatalf("fixture lost devin's account facts: %#v", cache)
 	}
 	if err = s.SaveQuotaCache(ctx, []QuotaCacheEntry{cache}); err != nil {
 		t.Fatalf("Devin NUL composite key must round trip through JSONB: %v", err)
@@ -105,15 +112,16 @@ func TestPostgresPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page.Total != 1 || !page.Events[0].Priced || page.Events[0].Model != price.Model {
+	if page.Total != 1 || !page.Events[0].Priced || page.Events[0].Model != price.Model || page.Events[0].Account != fixtureAccount {
 		t.Fatalf("PostgreSQL event/price persistence: %#v", page)
 	}
 	cached, err := s.QuotaCache(ctx)
-	if err != nil || len(cached) != 1 || cached[0].Key != cache.Key || cached[0].CredentialGeneration != cache.CredentialGeneration || cached[0].Revision != "" {
+	if err != nil || len(cached) != 1 || cached[0].Key != cache.Key || cached[0].Account != cache.Account || cached[0].AccountKind != cache.AccountKind {
 		t.Fatalf("PostgreSQL cache roundtrip: %#v %v", cached, err)
 	}
-	if current := fixtureBinding(s, "devin", "devin-account"); current.CredentialGeneration != cache.CredentialGeneration || current.Revision == cache.Revision {
-		t.Fatal("reopen changed stable credential identity or reused an old request revision")
+	// A token rotation changes nothing durable: the account keeps its row.
+	if current := wpReadBinding(s, "devin", "devin-account"); current.Account != cache.Account || current.AccountKind != cache.AccountKind {
+		t.Fatal("reopen changed stable account identity")
 	}
 	snapshots, err := s.Quotas(ctx)
 	if err != nil || len(snapshots) != 1 || len(snapshots[0].Windows) != 1 {
@@ -123,7 +131,7 @@ func TestPostgresPersistence(t *testing.T) {
 	if err = db.PingContext(ctx); err != nil {
 		t.Fatalf("usage Close closed the borrowed core pool: %v", err)
 	}
-	// Independent adapters share the initialized core pool. Per-identity advisory
+	// Independent adapters share the initialized core pool. Per-account advisory
 	// locks retain all independently arriving windows during concurrent updates.
 	other, err := Open(ctx, Options{Database: db, Schema: schema})
 	if err != nil {
@@ -143,7 +151,7 @@ func TestPostgresPersistence(t *testing.T) {
 			}
 			percent := float64(i)
 			observed := at.Add(time.Duration(i) * time.Millisecond)
-			snapshot := bindSnapshotFixture(target, quota.Snapshot{Provider: "claude", AuthIndex: "parallel", ObservedAt: observed, Source: quota.SourceHeaders, Windows: []quota.Window{{ID: fmt.Sprintf("window-%d", i), UsedPercent: &percent, ObservedAt: observed, Source: quota.SourceHeaders}}})
+			snapshot := quota.Snapshot{Provider: "claude", Account: fixtureAccount, AccountKind: "email", ObservedAt: observed, Source: quota.SourceHeaders, Windows: []quota.Window{{ID: fmt.Sprintf("window-%d", i), UsedPercent: &percent, ObservedAt: observed, Source: quota.SourceHeaders}}}
 			errs <- target.mergeQuota(ctx, snapshot)
 		}(i)
 	}
@@ -160,7 +168,7 @@ func TestPostgresPersistence(t *testing.T) {
 	}
 	found := false
 	for _, snapshot := range snapshots {
-		if snapshot.AuthIndex == "parallel" {
+		if snapshot.Account == parallelAccount {
 			found = true
 			if len(snapshot.Windows) != 12 {
 				t.Fatalf("lost concurrent windows: %d", len(snapshot.Windows))
@@ -171,22 +179,19 @@ func TestPostgresPersistence(t *testing.T) {
 		t.Fatal("parallel snapshot missing")
 	}
 
-	if err = s.ResetQuota(ctx, "devin", "devin-account"); err != nil {
+	if err = s.ResetQuota(ctx, "devin", devinAccount); err != nil {
 		t.Fatal(err)
 	}
-	// A replica must acquire its own live revision rather than replay another
-	// process's request fence; the old observation time still hits the reset.
-	if err = other.SaveQuotaCache(ctx, []QuotaCacheEntry{cache}); !errors.Is(err, ErrQuotaIdentity) {
-		t.Fatalf("replica accepted another process's request revision: %v", err)
-	}
-	if err = other.SaveQuotaCache(ctx, []QuotaCacheEntry{bindCacheFixture(other, cache)}); err != nil {
+	// The cutoff is durable and shared by every replica: a stale display write
+	// from another process cannot resurrect pre-reset state.
+	if err = other.SaveQuotaCache(ctx, []QuotaCacheEntry{cache}); err != nil {
 		t.Fatal(err)
 	}
 	cached, err = other.QuotaCache(ctx)
 	if err != nil || len(cached) != 0 {
 		t.Fatalf("reset allowed stale cache resurrection: %#v %v", cached, err)
 	}
-	if err = s.ResetQuota(ctx, "claude", "account-1"); err != nil {
+	if err = s.ResetQuota(ctx, "claude", fixtureAccount); err != nil {
 		t.Fatal(err)
 	}
 	if err = other.recordFixture(ctx, record); err != nil {
@@ -197,7 +202,7 @@ func TestPostgresPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, snapshot := range snapshots {
-		if snapshot.AuthIndex == "account-1" {
+		if snapshot.Account == fixtureAccount && snapshot.Provider == "claude" {
 			t.Fatal("reset allowed stale header resurrection")
 		}
 	}
@@ -209,7 +214,7 @@ func TestPostgresPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	bindFixtures(s)
-	if err = s.SaveQuotaCache(ctx, []QuotaCacheEntry{bindCacheFixture(s, cache)}); err != nil {
+	if err = s.SaveQuotaCache(ctx, []QuotaCacheEntry{cache}); err != nil {
 		t.Fatal(err)
 	}
 	cached, err = s.QuotaCache(ctx)

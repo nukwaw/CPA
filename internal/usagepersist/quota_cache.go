@@ -16,16 +16,15 @@ import (
 
 // QuotaCacheEntry is the existing management UI's display-only quota state.
 // Its strict recursive schema excludes arbitrary response/request objects and errors.
-// Revision is the client's request-start fence. It is accepted for diagnostics but
-// never persisted and never required to match durable credential identity.
+// It is keyed by (Provider, Account); there is no credential generation or revision,
+// because neither survives ordinary credential activity.
 type QuotaCacheEntry struct {
-	Provider             string          `json:"provider"`
-	Key                  string          `json:"key"`
-	AuthIndex            string          `json:"auth_index"`
-	CredentialGeneration string          `json:"credential_generation"`
-	Revision             string          `json:"revision,omitempty"`
-	ObservedAt           time.Time       `json:"observed_at"`
-	State                json.RawMessage `json:"state"`
+	Provider    string          `json:"provider"`
+	Key         string          `json:"key"`
+	Account     string          `json:"account"`
+	AccountKind string          `json:"account_kind,omitempty"`
+	ObservedAt  time.Time       `json:"observed_at"`
+	State       json.RawMessage `json:"state"`
 }
 type quotaCacheEnvelope struct {
 	Entries []QuotaCacheEntry `json:"entries"`
@@ -137,8 +136,8 @@ func validateQuotaCacheEntry(entry QuotaCacheEntry) error {
 	if entry.Key == "" || len(entry.Key) > 512 || !safeCacheText(strings.ReplaceAll(entry.Key, "\x00", ""), 512) {
 		return errors.New("invalid quota cache key")
 	}
-	if entry.AuthIndex == "" || len(entry.AuthIndex) > 256 || !safeCacheText(entry.AuthIndex, 256) {
-		return errors.New("invalid auth index")
+	if entry.Account != "" && (len(entry.Account) > 256 || !safeCacheText(entry.Account, 256) || strings.Contains(entry.Account, ":")) {
+		return errors.New("invalid account fact")
 	}
 	schema, ok := quotaCacheSchemas[entry.Provider]
 	if !ok {
@@ -165,7 +164,6 @@ func (s *Store) QuotaCache(ctx context.Context) ([]QuotaCacheEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	bindings := s.quotaIdentitySnapshot(true)
 	result := make([]QuotaCacheEntry, 0)
 	for _, identity := range sortedKeys(states) {
 		for _, key := range sortedKeys(states[identity].UIEntries) {
@@ -175,11 +173,6 @@ func (s *Store) QuotaCache(ctx context.Context) ([]QuotaCacheEntry, error) {
 				return nil, errDecode
 			}
 			entry.Key = string(decoded)
-			binding, valid := bindings.binding(entry.Provider, entry.AuthIndex)
-			if !valid || entry.CredentialGeneration == "" || states[identity].CredentialGeneration != entry.CredentialGeneration || binding.CredentialGeneration != entry.CredentialGeneration || binding.Key != entry.Key {
-				continue
-			}
-			entry.Revision = "" // Request-start revisions are never persistent identity.
 			result = append(result, entry)
 		}
 	}
@@ -193,14 +186,7 @@ func (s *Store) SaveQuotaCache(ctx context.Context, entries []QuotaCacheEntry) e
 	if len(entries) > 1000 {
 		return errors.New("too many quota cache entries")
 	}
-	// Validate the complete batch against one indexed, disk-validated snapshot.
-	// Each locked mutation below still rechecks its current credential/file.
-	bindings := s.quotaIdentitySnapshot(true)
 	for _, entry := range entries {
-		binding, ok := bindings.binding(entry.Provider, entry.AuthIndex)
-		if !ok || !quotaCacheBindingMatches(entry, binding) {
-			return ErrQuotaIdentity
-		}
 		if err := validateQuotaCacheEntry(entry); err != nil {
 			return err
 		}
@@ -210,19 +196,13 @@ func (s *Store) SaveQuotaCache(ctx context.Context, entries []QuotaCacheEntry) e
 		// represent NUL, so encode the map key and reconstruct it only at the API boundary.
 		encodedKey := base64.RawURLEncoding.EncodeToString([]byte(entry.Key))
 		persisted := entry
-		persisted.Key, persisted.Revision = "", ""
-		err := s.store.MutateCache(ctx, quotaNamespace, quotaKey(entry.Provider, entry.AuthIndex), func(raw json.RawMessage) (json.RawMessage, error) {
-			if !s.validQuotaCacheBinding(entry) {
-				return nil, ErrQuotaIdentity
-			}
+		persisted.Key = ""
+		err := s.store.MutateCache(ctx, quotaNamespace, quotaStoreKey(entry.Provider, entry.Account), func(raw json.RawMessage) (json.RawMessage, error) {
 			var state quotaState
 			if len(raw) > 0 {
 				if err := json.Unmarshal(raw, &state); err != nil {
 					return nil, err
 				}
-			}
-			if state.CredentialGeneration != entry.CredentialGeneration {
-				state = quotaState{CredentialGeneration: entry.CredentialGeneration}
 			}
 			if !state.ResetAt.IsZero() && !entry.ObservedAt.After(state.ResetAt) {
 				return raw, nil
@@ -243,23 +223,6 @@ func (s *Store) SaveQuotaCache(ctx context.Context, entries []QuotaCacheEntry) e
 	return nil
 }
 
-// quotaCacheBindingMatches accepts displayed state for the durable credential it
-// was observed with. A request-start revision must still be present, proving the
-// client captured identity evidence before observing, but it is never required to
-// match: it advances on ordinary credential activity such as an auth-file write or
-// a token refresh, while the credential generation it fences stays identical. A
-// real replacement is still refused by its different credential generation and key.
-func quotaCacheBindingMatches(entry QuotaCacheEntry, binding QuotaBinding) bool {
-	return entry.CredentialGeneration != "" && entry.Revision != "" && binding.Key == entry.Key && binding.CredentialGeneration == entry.CredentialGeneration
-}
-
-func (s *Store) validQuotaCacheBinding(entry QuotaCacheEntry) bool {
-	if entry.CredentialGeneration == "" || entry.Revision == "" {
-		return false
-	}
-	binding, ok := s.quotaBinding(entry.Provider, entry.AuthIndex, true)
-	return ok && quotaCacheBindingMatches(entry, binding)
-}
 func (s *Store) quotaCacheGetHTTP(c *gin.Context) {
 	entries, err := s.QuotaCache(c.Request.Context())
 	respond(c, quotaCacheEnvelope{Entries: entries}, err)

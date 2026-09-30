@@ -1268,3 +1268,78 @@ func TestUsageReporter_ExplicitTraceIDPrecedenceOverLogRequestID(t *testing.T) {
 		t.Fatalf("record.TraceID = %q, want explicit-trace-1", record.TraceID)
 	}
 }
+
+func TestUsageReporter_AccountFacts(t *testing.T) {
+	cases := []struct {
+		name        string
+		provider    string
+		metadata    map[string]any
+		authNil     bool
+		wantAccount string
+		wantKind    string
+	}{
+		{
+			name:        "email for a non-kimi provider",
+			provider:    "claude",
+			metadata:    map[string]any{"email": "  user@example.com  "},
+			wantAccount: "user@example.com",
+			wantKind:    "email",
+		},
+		{
+			name:        "device_id for kimi",
+			provider:    "kimi",
+			metadata:    map[string]any{"device_id": "dev-1", "email": "user@example.com"},
+			wantAccount: "dev-1",
+			wantKind:    "device_id",
+		},
+		{
+			name:     "kimi without device_id stays empty",
+			provider: "kimi",
+			metadata: map[string]any{"email": "user@example.com"},
+		},
+		{
+			name:     "missing property is not substituted",
+			provider: "codex",
+			metadata: map[string]any{"account_id": "acct-1", "user_id": "user-1"},
+		},
+		{
+			name:     "empty property",
+			provider: "codex",
+			metadata: map[string]any{"email": "   "},
+		},
+		{
+			name:     "non-string property",
+			provider: "codex",
+			metadata: map[string]any{"email": 42},
+		},
+		{
+			name:     "nil metadata",
+			provider: "codex",
+		},
+		{
+			name:     "nil auth",
+			provider: "codex",
+			authNil:  true,
+		},
+		{
+			name:        "provider match is case-insensitive",
+			provider:    "Kimi",
+			metadata:    map[string]any{"device_id": "dev-2"},
+			wantAccount: "dev-2",
+			wantKind:    "device_id",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var auth *cliproxyauth.Auth
+			if !tc.authNil {
+				auth = &cliproxyauth.Auth{ID: "auth-1", Metadata: tc.metadata}
+			}
+			reporter := NewUsageReporter(context.Background(), tc.provider, "gpt-5.4", auth)
+			record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false, usage.Failure{})
+			if record.Account != tc.wantAccount || record.AccountKind != tc.wantKind {
+				t.Fatalf("account facts = (%q, %q), want (%q, %q)", record.Account, record.AccountKind, tc.wantAccount, tc.wantKind)
+			}
+		})
+	}
+}

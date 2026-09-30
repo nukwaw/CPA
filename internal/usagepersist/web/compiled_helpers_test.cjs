@@ -17,7 +17,7 @@ function store(initializer) {
 }
 function setup(wrapped = true) {
   const timers = new Map(), calls = [], events = new Map(); let nextTimer = 0;
-  const h = {calls, bindings: providers.map(provider => ({provider, key: provider === 'devin' ? 'devin.json\0i' : `${provider}.json`, auth_index: 'i', credential_generation: `g-${provider}`, revision: `r-${provider}`}))};
+  const h = {calls, bindings: providers.map(provider => ({provider, key: provider === 'devin' ? 'devin.json\0i' : `${provider}.json`, account: `acct-${provider}`, account_kind: 'email', auth_index: 'i'}))};
   const window = {dispatchEvent() {}, addEventListener(type, fn) {events.set(type, fn);}};
   const context = vm.createContext({window, URL, AbortController, DOMException, TextEncoder, console: {warn() {}}, location: {origin: 'http://localhost', href: 'http://localhost/management.html'}, document: {hidden: false}, navigator: {onLine: true}, CustomEvent: class {}, setTimeout(fn, ms) {const id = ++nextTimer; timers.set(id, {fn, ms}); return id;}, clearTimeout(id) {timers.delete(id);}, fetch: async (url, options) => {calls.push({url, options}); const body = url.endsWith('/identities') ? {bindings: h.bindings} : url.endsWith('/cache') ? {entries: []} : {snapshots: []}; return {ok: true, status: 200, json: async () => structuredClone(body)};}});
   context[input.names.create] = store;
@@ -79,21 +79,23 @@ async function main() {
   const entries = JSON.parse(h.puts()[0].options.body).entries;
   assert.equal(entries.length, 7);
   for (const entry of entries) {
-    assert.equal(entry.credential_generation, `g-${entry.provider}`);
-    assert.equal(entry.revision, `r-${entry.provider}`);
+    assert.deepEqual(Object.keys(entry).sort(), ['account', 'account_kind', 'key', 'observed_at', 'provider', 'state']);
+    assert.equal(entry.account, `acct-${entry.provider}`);
+    assert.equal(entry.account_kind, 'email');
     assert.deepEqual(plain(h.store.getState()[`${entry.provider}Quota`][entry.key]), states[entry.provider]);
   }
+  assert.equal(JSON.stringify(entries).includes('auth_index'), false, 'the transient credential index never leaves the page');
   // Actual original native file clear prevents stale compiled commits after
   // replacement, including Devin's filename+NUL+index map entry.
   const old = h.capture('devin.json');
-  h.bindings = h.bindings.map(who => who.provider === 'devin' ? {...who, credential_generation: 'replacement', revision: 'replacement-revision'} : who);
+  h.bindings = h.bindings.map(who => who.provider === 'devin' ? {...who, account: 'replacement-account'} : who);
   await h.refresh();
   assert.equal(h.store.getState().devinQuota['devin.json\0i'], undefined);
   assert.equal(h.commit(old, () => {throw new Error('stale callback ran');}), false);
   const latest = h.capture('devin.json');
   assert.equal(h.commit(latest, () => setter('devin')(previous => ({...previous, ['devin.json\0i']: states.devin}))), true);
   await h.flush(); assert.equal(h.puts().length, 2);
-  assert.equal(JSON.parse(h.puts()[1].options.body).entries[0].credential_generation, 'replacement');
+  assert.equal(JSON.parse(h.puts()[1].options.body).entries[0].account, 'replacement-account');
   assert.ok(h.calls.every(call => !call.url.includes('NOT_IN_STATE_OR_URL')));
   // A callback throw restores active context; unguarded subsequent setters must
   // not inherit operation provenance and silently become persisted observations.

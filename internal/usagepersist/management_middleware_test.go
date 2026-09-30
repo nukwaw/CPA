@@ -20,6 +20,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 const middlewareQuotaURL = "https://chatgpt.com/backend-api/wham/usage"
@@ -48,7 +49,7 @@ func middlewareTestStore(t *testing.T) *Store {
 			t.Error(errClose)
 		}
 	})
-	bindManagementFixtures(t, store)
+	wpBindManagementFixtures(t, store)
 	return store
 }
 
@@ -219,7 +220,7 @@ func TestManagementMiddlewareResetRequiresConfirmedSuccessfulResponse(t *testing
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := middlewareTestStore(t)
-			store.fixtureObserveAPICall(context.Background(), "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
+			wpObserveAPICall(store, context.Background(), "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
 			engine := gin.New()
 			engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
 			engine.Handle(test.method, strings.Split(test.path, "?")[0], func(c *gin.Context) {
@@ -625,6 +626,67 @@ func TestManagementMiddlewareActualHTMLBuild(t *testing.T) {
 	if errBody != nil || response.StatusCode != 200 || len(body) <= len(original) || !bytes.Contains(body, []byte("CPAQuotaPersistence.attach")) || response.Header.Get("X-CPA-Quota-Persistence") != "enabled" || response.ContentLength != int64(len(body)) {
 		t.Fatalf("real HTTP HTML buffer failed: status=%d bytes=%d original=%d length=%d err=%v", response.StatusCode, len(body), len(original), response.ContentLength, errBody)
 	}
+}
+
+// TestManagementMiddlewareSkipsObservationUntilIdentityIsPublished pins the
+// boundary a "refresh quota" click actually depends on. The original handler always
+// performs the provider call and returns its own response; this add-on only copies
+// the captured evidence, and only for a credential it can already name. Publication
+// happens when the add-on identity endpoint is read, so a refresh before that read
+// is skipped silently rather than guessed at.
+func TestManagementMiddlewareSkipsObservationUntilIdentityIsPublished(t *testing.T) {
+	input := []byte(`{"auth_index":"account","url":"` + middlewareQuotaURL + `","header":{"Authorization":"Bearer $TOKEN$"},"data":"{}"}`)
+	output := middlewareQuotaEnvelope(t, "")
+	serve := func(t *testing.T, store *Store) (*httptest.ResponseRecorder, *Store) {
+		t.Helper()
+		engine := gin.New()
+		engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
+		engine.POST("/v0/management/api-call", func(c *gin.Context) {
+			// The capture is a passive tee: it fills only as the original handler
+			// reads, exactly like the real handler binding its JSON body.
+			_, _ = io.ReadAll(c.Request.Body)
+			c.Header("Content-Type", "application/json")
+			c.Status(http.StatusOK)
+			_, _ = c.Writer.Write(output)
+		})
+		return middlewareRequest(t, engine, http.MethodPost, "/v0/management/api-call", input), store
+	}
+
+	t.Run("unprimed", func(t *testing.T) {
+		store := openTestStore(t)
+		// A source is bound, but nothing has read identities yet: no advisory
+		// binding copy exists, which is the state after a fresh start.
+		manager := coreauth.NewManager(nil, nil, nil)
+		if _, errRegister := manager.Register(context.Background(), wpQuotaAuth("codex", "account", "account.json", "fixture-secret")); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		store.BindQuotaIdentitySource(NewQuotaIdentitySource(func() *coreauth.Manager { return manager }))
+		if len(store.publishedQuotaBindings()) != 0 {
+			t.Fatal("fixture unexpectedly published bindings before any identity read")
+		}
+		response, store := serve(t, store)
+		// The original response is returned byte-for-byte; only the copy is skipped.
+		if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), output) {
+			t.Fatalf("original response altered: %d, %q", response.Code, response.Body.String())
+		}
+		if count := middlewareQuotaCount(t, store); count != 0 {
+			t.Fatalf("quota state recorded without published identity: %d", count)
+		}
+	})
+
+	t.Run("primed", func(t *testing.T) {
+		store := middlewareTestStore(t) // publishes an advisory binding copy
+		if len(store.publishedQuotaBindings()) == 0 {
+			t.Fatal("fixture did not publish bindings")
+		}
+		response, store := serve(t, store)
+		if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), output) {
+			t.Fatalf("original response altered: %d, %q", response.Code, response.Body.String())
+		}
+		if count := middlewareQuotaCount(t, store); count != 1 {
+			t.Fatalf("primed observation was not recorded: %d", count)
+		}
+	})
 }
 
 func TestManagementMiddlewareRouteAllowlist(t *testing.T) {

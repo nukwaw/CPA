@@ -9,7 +9,8 @@ import (
 // It performs no request and retains no response content. A successful status
 // alone is insufficient: keeper's protocol requires code=reset and windows_reset.
 func IsAPICallReset(identity Identity, rawURL string, statusCode int, body []byte) bool {
-	if strings.ToLower(safeText(identity.Provider)) != "codex" || safeText(identity.AuthIndex) == "" || statusCode < 200 || statusCode >= 300 || len(body) > maxBodyBytes {
+	provider, _, _, valid := identityFacts(identity)
+	if !valid || provider != "codex" || statusCode < 200 || statusCode >= 300 || len(body) > maxBodyBytes {
 		return false
 	}
 	endpoint, errURL := url.Parse(rawURL)

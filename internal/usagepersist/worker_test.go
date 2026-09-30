@@ -125,9 +125,7 @@ func TestQueuedUsageContainsOnlySanitizedSnapshots(t *testing.T) {
 	s := &Store{queue: make(chan queuedUsage, usageQueueCapacity), workerCtx: context.Background()}
 	r := fixtureRecord("sanitized", time.Now())
 	r.Provider = "claude"
-	r.AccessTokenSHA256 = quotaHash("private-source-token")
-	bindQuotaFixtures(t, s, quotaFixtureAuth(r.Provider, r.AuthIndex, "auth.json", "private-source-token"))
-	binding := fixtureBinding(s, r.Provider, r.AuthIndex)
+	wpBindFixtures(t, s, wpQuotaAuth(r.Provider, "sanitized", "auth.json", "private-source-token"))
 	r.ResponseHeaders = http.Header{
 		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"},
 		"Authorization":      []string{"private-header"},
@@ -152,7 +150,6 @@ func TestQueuedUsageContainsOnlySanitizedSnapshots(t *testing.T) {
 		{"Quota", reflect.TypeOf((*quota.Snapshot)(nil))},
 		{"Kind", reflect.TypeOf(queuedWorkKind(0))},
 		{"Reset", reflect.TypeOf((*queuedQuotaReset)(nil))},
-		{"AccessTokenSHA256", reflect.TypeOf("")},
 	}
 	if typ.NumField() != len(fields) {
 		t.Fatalf("queue retains fields outside the sanitized work union: %v", typ)
@@ -168,14 +165,16 @@ func TestQueuedUsageContainsOnlySanitizedSnapshots(t *testing.T) {
 	if item.Event.ID != r.RequestID || len(item.Event.KeyID) != 64 || item.Quota == nil || len(item.Quota.Windows) != 1 {
 		t.Fatalf("normalization must happen before enqueue: %#v", item)
 	}
-	if item.AccessTokenSHA256 != r.AccessTokenSHA256 || !validTokenHash(item.AccessTokenSHA256) || item.Quota.CredentialGeneration != binding.CredentialGeneration || item.Quota.Revision != "" {
-		t.Fatal("queued quota lost source-time evidence or queried a live revision in admission")
+	// Admission carries the producer's account facts directly: the worker performs
+	// no credential lookup, and no identity field survives on the queued work.
+	if item.Event.Account != fixtureAccount || item.Event.AccountKind != "email" || item.Quota.Account != fixtureAccount {
+		t.Fatalf("queued work lost the producer's account facts: %#v", item)
 	}
 	encoded, err := json.Marshal(item)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{r.APIKey, r.Source, r.AuthID, r.BaseURL, r.Fail.Body, "private-source-token", "private-header", "private-cookie", "private-arbitrary", "private-unknown", "private-context", "Authorization", `"response_headers":`} {
+	for _, secret := range []string{r.APIKey, r.Source, r.AuthID, r.BaseURL, "sk-private-error-key", "private-source-token", "private-header", "private-cookie", "private-arbitrary", "private-unknown", "private-context", "Authorization", `"response_headers":`} {
 		if bytes.Contains(encoded, []byte(secret)) {
 			t.Fatalf("queued data retained forbidden input %q", secret)
 		}

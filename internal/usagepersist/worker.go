@@ -29,22 +29,18 @@ const (
 // credentials, callbacks or request contexts here. Only usage work inserts Event;
 // quota-only observations and resets never produce dummy accounting events.
 type queuedUsage struct {
-	Event             Event             `json:"event"`
-	Quota             *quota.Snapshot   `json:"quota,omitempty"`
-	Kind              queuedWorkKind    `json:"kind,omitempty"`
-	Reset             *queuedQuotaReset `json:"reset,omitempty"`
-	AccessTokenSHA256 string            `json:"access_token_sha256,omitempty"`
+	Event Event             `json:"event"`
+	Quota *quota.Snapshot   `json:"quota,omitempty"`
+	Kind  queuedWorkKind    `json:"kind,omitempty"`
+	Reset *queuedQuotaReset `json:"reset,omitempty"`
 }
 
+// queuedQuotaReset carries only the account a reset applies to and when it was
+// received. There is no credential fence to retain.
 type queuedQuotaReset struct {
-	Provider             string    `json:"provider"`
-	AuthIndex            string    `json:"auth_index"`
-	ObservedAt           time.Time `json:"observed_at"`
-	CredentialGeneration string    `json:"credential_generation"`
-	Revision             string    `json:"revision"`
-	Lifetime             string    `json:"lifetime,omitempty"`
-	RuntimeGeneration    uint64    `json:"runtime_generation,omitempty"`
-	AllowResetAdvance    bool      `json:"allow_reset_advance,omitempty"`
+	Provider   string    `json:"provider"`
+	Account    string    `json:"account"`
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 // enqueueManagement uses the same admission/bookkeeping contract as Consume.
@@ -136,9 +132,6 @@ func (s *Store) persistUsage(ctx context.Context, item queuedUsage) error {
 		if _, err := s.store.Insert(ctx, item.Event); err != nil {
 			return err
 		}
-		// Live credential validation belongs here, never in shared dispatch.
-		// Insertion remains independent of whether quota provenance can be proved.
-		s.bindQueuedUsageQuota(ctx, &item)
 		if err := ctx.Err(); err != nil {
 			return err
 		}

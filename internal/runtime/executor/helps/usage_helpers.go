@@ -66,6 +66,11 @@ type UsageReporter struct {
 	// upstreamModel holds the canonical upstream model expected to be served when
 	// it differs from the requested model (e.g. local Kimi model mappings).
 	upstreamModel string
+
+	// account and accountKind are the account facts used to group usage by
+	// (provider, account). See usageAccountFacts.
+	account     string
+	accountKind string
 }
 
 type usageExecutor interface {
@@ -135,8 +140,35 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
 		reporter.accessTokenHash = authAccessTokenSHA256(auth)
+		reporter.account, reporter.accountKind = usageAccountFacts(provider, auth)
 	}
 	return reporter
+}
+
+// usageAccountFacts returns the account fact used to group usage by
+// (provider, account), together with the credential property it came from.
+// kimi credentials are identified by their device_id metadata property; every
+// other provider by its email metadata property. These facts are account
+// identifiers, never credentials: no token, header or key is read. A missing,
+// nil or empty property yields two empty strings, and no other property is
+// used as a fallback.
+func usageAccountFacts(provider string, auth *cliproxyauth.Auth) (account string, accountKind string) {
+	if auth == nil {
+		return "", ""
+	}
+	property := "email"
+	if strings.EqualFold(strings.TrimSpace(provider), "kimi") {
+		property = "device_id"
+	}
+	value, ok := auth.Metadata[property].(string)
+	if !ok {
+		return "", ""
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", ""
+	}
+	return value, property
 }
 
 // SetStream records whether the request was executed in streaming mode.
@@ -647,6 +679,8 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		ParentSessionID:     r.parentSessionID,
 		AuthID:              r.authID,
 		AuthIndex:           r.authIndex,
+		Account:             r.account,
+		AccountKind:         r.accountKind,
 		AccessTokenSHA256:   r.accessTokenFingerprint(),
 		AuthType:            r.authType,
 		ReasoningEffort:     r.reasoning,

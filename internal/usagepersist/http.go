@@ -113,6 +113,7 @@ func RegisterDynamicRoutes(group *gin.RouterGroup, current func() *Store, collec
 		c.JSON(http.StatusOK, result)
 	})
 	register(http.MethodGet, "/quota", (*Store).quotaHTTP)
+	register(http.MethodGet, "/quota/summary", (*Store).quotaSummaryHTTP)
 	register(http.MethodGet, "/quota/identities", (*Store).quotaIdentitiesHTTP)
 	register(http.MethodGet, "/quota/cache", (*Store).quotaCacheGetHTTP)
 	register(http.MethodPut, "/quota/cache", (*Store).quotaCachePutHTTP)
@@ -135,8 +136,7 @@ func RegisterDynamicRoutes(group *gin.RouterGroup, current func() *Store, collec
 			"dropped_events": s.droppedEvents.Load(), "last_drop_at": lastDrop,
 			"queue_overflows": s.queueOverflows.Load(), "validation_failures": s.validationFailures.Load(),
 			"pending_events": s.pendingEvents.Load(), "queue_capacity": usageQueueCapacity,
-			"skipped_quota_headers": s.skippedQuotaHeaders.Load(),
-			"quota_header_scope":    "only verified token-scoped Claude samples; Codex account scope unavailable in producer",
+			"quota_header_scope": "header samples are attributed by provider and account (an email, or a device id for Kimi); a credential with no account property is grouped by provider",
 		}
 		if capacity, local := s.LocalCapacity(); local {
 			status["local_capacity"] = capacity
@@ -178,7 +178,7 @@ func (s *Store) eventsHTTP(c *gin.Context) {
 	respond(c, page, err)
 }
 func parseFilter(c *gin.Context) (Filter, error) {
-	f := Filter{Model: c.Query("model"), Provider: c.Query("provider"), AuthIndex: c.Query("auth_index"), KeyID: c.Query("key_id"), Status: c.Query("status")}
+	f := Filter{Model: c.Query("model"), Provider: c.Query("provider"), Account: c.Query("account"), KeyID: c.Query("key_id"), Status: c.Query("status")}
 	if f.Status != "" && f.Status != "success" && f.Status != "failed" {
 		return f, errors.New("status must be success or failed")
 	}
@@ -222,10 +222,6 @@ func badRequest(c *gin.Context, err error) {
 func respond(c *gin.Context, value any, err error) {
 	if err == nil {
 		c.JSON(http.StatusOK, value)
-		return
-	}
-	if errors.Is(err, ErrQuotaIdentity) {
-		c.JSON(http.StatusConflict, gin.H{"error": ErrQuotaIdentity.Error()})
 		return
 	}
 	if errors.Is(err, ErrClosed) {

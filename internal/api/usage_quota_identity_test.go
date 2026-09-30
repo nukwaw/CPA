@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -45,122 +44,105 @@ func installUsageQuotaFixture(server *Server) {
 	server.mgmt.SetPluginHost(host)
 }
 
-func TestUsageQuotaIdentityDiskReplacementAndRestart(t *testing.T) {
+// Identity is projected from the live credential: a codex credential is grouped
+// by its email account fact, and a credential that exposes no account property is
+// still projected with empty account facts rather than dropped.
+func TestUsageQuotaIdentityProjectsAccountFacts(t *testing.T) {
 	ctx := context.Background()
-	directory := t.TempDir()
-	path := filepath.Join(directory, "same.json")
-	write := func(token, account string) {
-		t.Helper()
-		data, _ := json.Marshal(map[string]any{"type": "codex", "access_token": token, "account_id": account, "email": "same@example.invalid"})
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-		stamp := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
-		if err := os.Chtimes(path, stamp, stamp); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("secret-A", "account-A")
-	auth := &coreauth.Auth{ID: "same.json", FileName: "same.json", Provider: "codex", Attributes: map[string]string{coreauth.AttributePath: path, coreauth.AttributeSourceBackend: coreauth.AuthSourceFile}, Metadata: map[string]any{"type": "codex", "access_token": "secret-A", "account_id": "account-A", "email": "same@example.invalid"}}
+	auth := &coreauth.Auth{ID: "same.json", FileName: "same.json", Provider: "codex", Metadata: map[string]any{"type": "codex", "access_token": "secret-A", "account_id": "account-A", "email": "same@example.invalid"}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	if _, err := manager.Register(ctx, auth); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{AuthDir: directory}
-	source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager }, func() *config.Config { return cfg })
-	original := source.QuotaBindings(true)
+	source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager })
+	original := source.QuotaBindings()
 	if len(original) != 1 {
-		t.Fatal("known OAuth file not bound")
+		t.Fatal("live credential not projected")
 	}
-	write("secret-B", "account-A")
-	if len(source.QuotaBindings(false)) != 1 {
-		t.Fatal("request path performed disk reconciliation")
+	if original[0].Provider != "codex" || original[0].Account != "same@example.invalid" || original[0].AccountKind != "email" {
+		t.Fatalf("projected facts = %+v", original[0])
 	}
-	if len(source.QuotaBindings(true)) != 0 {
-		t.Fatal("same name/index/email/copied-mtime replacement restored A quota")
-	}
-	auth.Metadata["access_token"] = "secret-B"
+	// Rotating the access token is the ordinary refresh core performs; it must not
+	// change the account the credential is grouped under.
+	delete(auth.Metadata, "access_token")
 	if _, err := manager.Update(ctx, auth); err != nil {
 		t.Fatal(err)
 	}
-	changed := source.QuotaBindings(true)
-	if len(changed) != 1 || changed[0].CredentialGeneration == original[0].CredentialGeneration {
-		t.Fatal("reconciled replacement not identified")
+	rotated := source.QuotaBindings()
+	if len(rotated) != 1 || rotated[0].Account != original[0].Account || rotated[0].AccountKind != original[0].AccountKind || rotated[0].Key != original[0].Key {
+		t.Fatal("token rotation changed durable identity")
 	}
-	write("secret-B", "account-B")
-	if len(source.QuotaBindings(true)) != 0 {
-		t.Fatal("same-token account selector replacement trusted")
-	}
+	// An account selector is not the account property: it never takes part.
 	auth.Metadata["account_id"] = "account-B"
-	_, _ = manager.Update(ctx, auth)
-	current := source.QuotaBindings(true)
-	if len(current) != 1 || current[0].CredentialGeneration == changed[0].CredentialGeneration {
-		t.Fatal("account selector omitted from generation")
-	}
-	restartedManager := coreauth.NewManager(nil, nil, nil)
-	_, _ = restartedManager.Register(ctx, auth)
-	restarted := newUsageQuotaIdentitySource(func() *coreauth.Manager { return restartedManager }, func() *config.Config { return cfg }).QuotaBindings(true)
-	if len(restarted) != 1 || restarted[0].CredentialGeneration != current[0].CredentialGeneration || restarted[0].Revision == current[0].Revision {
-		t.Fatal("unchanged restart failed stable identity/process revision")
-	}
-	if err := os.Remove(path); err != nil {
+	if _, err := manager.Update(ctx, auth); err != nil {
 		t.Fatal(err)
 	}
-	if len(source.QuotaBindings(true)) != 0 {
-		t.Fatal("deleted file still eligible")
+	if changed := source.QuotaBindings(); len(changed) != 1 || changed[0].Account != original[0].Account {
+		t.Fatal("account selector was treated as identity")
+	}
+	auth.Metadata["email"] = "other@example.invalid"
+	if _, err := manager.Update(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	if moved := source.QuotaBindings(); len(moved) != 1 || moved[0].Account != "other@example.invalid" {
+		t.Fatal("changed account property was not projected")
+	}
+	manager.Remove(ctx, auth.ID)
+	if len(source.QuotaBindings()) != 0 {
+		t.Fatal("removed credential still eligible")
+	}
+	// A credential with no account property is valid and grouped by provider alone.
+	bare := &coreauth.Auth{ID: "bare.json", FileName: "bare.json", Provider: "codex", Metadata: map[string]any{"type": "codex", "access_token": "secret-C"}}
+	if _, err := manager.Register(ctx, bare); err != nil {
+		t.Fatal(err)
+	}
+	empty := source.QuotaBindings()
+	if len(empty) != 1 || empty[0].Provider != "codex" || empty[0].Account != "" || empty[0].AccountKind != "" {
+		t.Fatalf("credential without an account property = %+v", empty)
 	}
 }
 
-// A Kimi file credential always receives derived `domain` and `base_url` attributes
-// from the file synthesizer, and both participate in credential identity. The disk
-// reconciliation must not treat those runtime-only values as missing file evidence,
-// or every Kimi credential would silently lose its persisted quota state.
-func TestUsageQuotaIdentityKeepsDerivedSelectorAttributes(t *testing.T) {
+// Kimi identifies its account by device_id, not by email: the projection must use
+// device_id and must keep it stable while the access token rotates.
+func TestUsageQuotaIdentityKimiAccountIsDeviceID(t *testing.T) {
 	ctx := context.Background()
-	directory := t.TempDir()
-	path := filepath.Join(directory, "kimi.json")
-	metadata := map[string]any{"type": "kimi", "access_token": "kimi-token", "refresh_token": "rt-kimi", "email": "kimi@example.invalid"}
-	writeFile := func(value map[string]any) {
-		t.Helper()
-		data, _ := json.Marshal(value)
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeFile(metadata)
 	auth := &coreauth.Auth{ID: "kimi.json", FileName: "kimi.json", Provider: "kimi", Attributes: map[string]string{
-		coreauth.AttributePath:          path,
+		coreauth.AttributePath:          filepath.Join(t.TempDir(), "kimi.json"),
 		coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
 		"auth_kind":                     "oauth",
-		"base_url":                      "https://api.kimi.com/coding",
-		"domain":                        "kimi.com",
-	}, Metadata: map[string]any{"type": "kimi", "access_token": "kimi-token", "refresh_token": "rt-kimi", "email": "kimi@example.invalid"}}
+	}, Metadata: map[string]any{"type": "kimi", "access_token": "kimi-token", "refresh_token": "rt-kimi", "email": "kimi@example.invalid", "device_id": "device-a"}}
 	manager := coreauth.NewManager(nil, nil, nil)
 	if _, err := manager.Register(ctx, auth); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{AuthDir: directory}
-	source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager }, func() *config.Config { return cfg })
-	bindings := source.QuotaBindings(true)
-	if len(bindings) != 1 {
-		t.Fatal("derived selector attributes made a file credential unverifiable")
+	source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager })
+	bindings := source.QuotaBindings()
+	if len(bindings) != 1 || bindings[0].Account != "device-a" || bindings[0].AccountKind != "device_id" {
+		t.Fatalf("kimi account facts = %+v", bindings)
 	}
-	if _, ok := bindings[0].SelectorHashes["base_url"]; !ok {
-		t.Fatal("derived base_url selector is not part of identity")
+	// Kimi issues no email, so the email value must not become the account.
+	if bindings[0].Account == "kimi@example.invalid" {
+		t.Fatal("kimi identity fell back to email")
 	}
-	// A genuinely different on-disk credential must still be refused.
-	writeFile(map[string]any{"type": "kimi", "access_token": "other-token", "refresh_token": "rt-kimi", "email": "kimi@example.invalid"})
-	if len(source.QuotaBindings(true)) != 0 {
-		t.Fatal("changed file credential still verified")
+	auth.Metadata["access_token"] = "other-token"
+	if _, err := manager.Update(ctx, auth); err != nil {
+		t.Fatal(err)
+	}
+	rotated := source.QuotaBindings()
+	if len(rotated) != 1 || rotated[0].Account != "device-a" || rotated[0].AccountKind != "device_id" {
+		t.Fatal("kimi token rotation changed durable identity")
 	}
 }
 
+// Stale-write protection is observation-time ordering only: there is no credential
+// generation or revision fence, so an older observation must never overwrite newer
+// stored state, while a newer observation replaces it.
 func TestUsageQuotaIdentitiesAuthenticatedDynamicAndStalePUT(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	cfg := &config.Config{CommercialMode: true, AuthDir: t.TempDir()}
 	cfg.RemoteManagement.SecretKey = "configured-secret"
 	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{ID: "same.json", FileName: "same.json", Provider: "codex", Metadata: map[string]any{"access_token": "fixture-token", "account_id": "private-account"}}
+	auth := &coreauth.Auth{ID: "same.json", FileName: "same.json", Provider: "codex", Metadata: map[string]any{"access_token": "fixture-token", "account_id": "private-account", "email": "first@example.invalid"}}
 	_, _ = manager.Register(context.Background(), auth)
 	var current atomic.Pointer[usagepersist.Store]
 	server := NewServer(cfg, manager, nil, filepath.Join(t.TempDir(), "config.yaml"), WithUsagePersistenceProvider(current.Load), WithLocalManagementPassword("identity-test-key"))
@@ -195,22 +177,53 @@ func TestUsageQuotaIdentitiesAuthenticatedDynamicAndStalePUT(t *testing.T) {
 	if json.Unmarshal(response.Body.Bytes(), &envelope) != nil || len(envelope.Bindings) != 1 {
 		t.Fatalf("binding missing: %s", response.Body)
 	}
+	// The transient auth_index is published for in-page correlation, but the raw
+	// credential token and the unrelated account selector are never published.
 	if strings.Contains(response.Body.String(), "fixture-token") || strings.Contains(response.Body.String(), "private-account") {
-		t.Fatal("identity response leaked credential/account")
+		t.Fatal("identity response leaked credential or unrelated selector")
+	}
+	// The account fact IS published deliberately: it is the durable identity.
+	if !strings.Contains(response.Body.String(), "first@example.invalid") {
+		t.Fatalf("identity response withheld the account fact: %s", response.Body)
 	}
 	binding := envelope.Bindings[0]
-	entry := usagepersist.QuotaCacheEntry{Provider: binding.Provider, Key: binding.Key, AuthIndex: binding.AuthIndex, CredentialGeneration: binding.CredentialGeneration, Revision: binding.Revision, ObservedAt: time.Now().UTC(), State: json.RawMessage(`{"status":"success","windows":[]}`)}
+	if binding.Account != "first@example.invalid" || binding.AccountKind != "email" {
+		t.Fatalf("published account facts = %+v", binding)
+	}
+	// Rotating the access token must not change the account a stored observation
+	// belongs to, and the identity endpoint must keep publishing that account.
+	auth.Metadata["access_token"] = "replacement-token"
+	_, _ = manager.Update(context.Background(), auth)
+	if response = request("GET", endpoint, nil, true); response.Code != 200 || !strings.Contains(response.Body.String(), "first@example.invalid") {
+		t.Fatalf("identity after token rotation: %d %s", response.Code, response.Body)
+	}
+	// Rotation must not re-key stored state either.
+	newer := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
+	entry := usagepersist.QuotaCacheEntry{Provider: binding.Provider, Key: binding.Key, Account: binding.Account, AccountKind: binding.AccountKind, ObservedAt: newer, State: json.RawMessage(`{"status":"success","windows":[]}`)}
 	payload, _ := json.Marshal(map[string]any{"entries": []usagepersist.QuotaCacheEntry{entry}})
 	if response = request("PUT", "/v0/management/stats/quota/cache", payload, true); response.Code != 200 {
 		t.Fatalf("valid PUT: %d %s", response.Code, response.Body)
 	}
-	auth.Metadata["access_token"] = "replacement-token"
-	_, _ = manager.Update(context.Background(), auth)
-	if response = request("PUT", "/v0/management/stats/quota/cache", payload, true); response.Code != 409 {
+	// An older observation for the same key must not overwrite the newer one.
+	stale := entry
+	stale.ObservedAt = newer.Add(-time.Hour)
+	stalePayload, _ := json.Marshal(map[string]any{"entries": []usagepersist.QuotaCacheEntry{stale}})
+	if response = request("PUT", "/v0/management/stats/quota/cache", stalePayload, true); response.Code != 200 {
 		t.Fatalf("stale PUT: %d %s", response.Code, response.Body)
 	}
-	if response = request("GET", "/v0/management/stats/quota/cache", nil, true); response.Code != 200 || !strings.Contains(response.Body.String(), `"entries":[]`) {
-		t.Fatalf("stale GET: %d %s", response.Code, response.Body)
+	entries, err := store.QuotaCache(context.Background())
+	if err != nil || len(entries) != 1 || !entries[0].ObservedAt.Equal(newer) || entries[0].Account != "first@example.invalid" {
+		t.Fatalf("stale observation overwrote newer state: %#v %v", entries, err)
+	}
+	// A newer observation for the same account does replace it.
+	entry.ObservedAt = newer.Add(time.Minute)
+	newerPayload, _ := json.Marshal(map[string]any{"entries": []usagepersist.QuotaCacheEntry{entry}})
+	if response = request("PUT", "/v0/management/stats/quota/cache", newerPayload, true); response.Code != 200 {
+		t.Fatalf("newer PUT: %d %s", response.Code, response.Body)
+	}
+	entries, err = store.QuotaCache(context.Background())
+	if err != nil || len(entries) != 1 || !entries[0].ObservedAt.Equal(entry.ObservedAt) {
+		t.Fatalf("newer observation did not replace older state: %#v %v", entries, err)
 	}
 	// F's alias paths must still belong to the original handlers, not the addon.
 	if response = request("POST", "/v8/management/requests/api-call", []byte(`{}`), true); response.Code != 400 {

@@ -1,20 +1,18 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-func TestUsageQuotaIdentityCoreDiskSettingsAndAliases(t *testing.T) {
+// Unrelated credential settings and legacy aliases must not disturb the account
+// facts the live projection publishes: identity is (provider, account) only.
+func TestUsageQuotaIdentityCoreSettingsAndAliasesDoNotChangeIdentity(t *testing.T) {
 	settings := []struct {
 		canonical, alias string
 		value            any
@@ -36,14 +34,9 @@ func TestUsageQuotaIdentityCoreDiskSettingsAndAliases(t *testing.T) {
 			}
 			t.Run(spelling, func(t *testing.T) {
 				ctx := context.Background()
-				directory := t.TempDir()
-				path := filepath.Join(directory, "same.json")
-				document := map[string]any{"type": "claude", "access_token": "secret", spelling: setting.value}
+				document := map[string]any{"type": "claude", "access_token": "secret", "email": "same@example.invalid", spelling: setting.value}
 				data, err := json.Marshal(document)
 				if err != nil {
-					t.Fatal(err)
-				}
-				if err = os.WriteFile(path, data, 0600); err != nil {
 					t.Fatal(err)
 				}
 				var runtimeMetadata map[string]any
@@ -56,72 +49,70 @@ func TestUsageQuotaIdentityCoreDiskSettingsAndAliases(t *testing.T) {
 					t.Fatal(err)
 				}
 				before, _ := manager.GetByID(auth.ID)
-				cfg := &config.Config{AuthDir: directory}
-				source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager }, func() *config.Config { return cfg })
-				memory := source.QuotaBindings(false)
-				disk := source.QuotaBindings(true)
-				if len(memory) != 1 || len(disk) != 1 || memory[0].CredentialGeneration != disk[0].CredentialGeneration || memory[0].Revision != disk[0].Revision {
-					t.Fatal("supported core disk setting revoked runtime identity")
+				snapshot := *before
+				source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager })
+				bindings := source.QuotaBindings()
+				if len(bindings) != 1 {
+					t.Fatalf("supported core setting revoked runtime identity: %+v", bindings)
 				}
-				if binding, ok := source.(usagepersist.TargetedQuotaIdentitySource).QuotaBinding("claude", before.Index, true); !ok || binding.Revision != disk[0].Revision {
-					t.Fatal("targeted disk check disagreed with normalized snapshot")
+				if bindings[0].Provider != "claude" || bindings[0].Account != "same@example.invalid" || bindings[0].AccountKind != "email" {
+					t.Fatalf("projected facts = %+v", bindings[0])
 				}
+				if strings.Contains(bindings[0].Key, "secret") || len(bindings[0].SelectorHashes) != 0 {
+					t.Fatal("projection leaked a credential or invented selectors")
+				}
+				// Projection reads the live credential; it must never mutate it.
 				after, _ := manager.GetByID(auth.ID)
-				unchanged, err := os.ReadFile(path)
-				if err != nil || !bytes.Equal(data, unchanged) || !reflect.DeepEqual(before, after) {
-					t.Fatal("add-on normalization mutated the core credential or file")
+				if !reflect.DeepEqual(snapshot.Metadata, after.Metadata) || !reflect.DeepEqual(snapshot.Attributes, after.Attributes) {
+					t.Fatal("add-on normalization mutated the core credential")
 				}
-				// A genuine account selector still revokes a stale runtime binding,
-				// even when ordinary settings and legacy aliases are present.
-				document["organization_id"] = "different-account"
-				data, _ = json.Marshal(document)
-				if err = os.WriteFile(path, data, 0600); err != nil {
+				// The account property is the only field that re-keys identity.
+				before.Metadata["email"] = "different@example.invalid"
+				if _, err = manager.Update(ctx, before); err != nil {
 					t.Fatal(err)
 				}
-				if len(source.QuotaBindings(true)) != 0 || len(source.QuotaBindings(false)) != 1 {
-					t.Fatal("selector change was ignored or memory-only path read disk")
+				changed := source.QuotaBindings()
+				if len(changed) != 1 || changed[0].Account != "different@example.invalid" {
+					t.Fatalf("account change was not projected: %+v", changed)
 				}
 			})
 		}
 	}
 }
 
-func TestUsageQuotaIdentityCredentialAliasPrecedenceAndSelectors(t *testing.T) {
-	for _, changed := range []string{"api-key", "base-url", "canonical-api-key", "canonical-base-url", "unknown", "custom-headers"} {
+// Credential secrets, base URLs and operation selectors are not identity, so
+// changing them must not re-key an account, while unaudited metadata and custom
+// headers fail closed: they could select a different account than the projection
+// describes, so the credential is refused rather than silently trusted.
+func TestUsageQuotaIdentityIgnoresCredentialFieldsAndFollowsAccount(t *testing.T) {
+	for _, changed := range []string{"api-key", "base-url", "canonical-api-key", "canonical-base-url", "account-selector", "unknown", "custom-headers"} {
 		t.Run(changed, func(t *testing.T) {
+			refused := changed == "unknown" || changed == "custom-headers"
 			ctx := context.Background()
-			path := filepath.Join(t.TempDir(), "same.json")
-			document := map[string]any{"type": "codex", "api-key": "secret", "base-url": "https://quota.invalid/A", "excluded-models": []any{"model-*"}}
+			document := map[string]any{"type": "codex", "api-key": "secret", "base-url": "https://quota.invalid/A", "email": "same@example.invalid", "excluded-models": []any{"model-*"}}
 			if changed == "canonical-api-key" || changed == "canonical-base-url" {
 				document["api_key"] = "secret"
 				document["api-key"] = "ignored-secret"
 				document["base_url"] = "https://quota.invalid/A"
 				document["base-url"] = "https://quota.invalid/ignored"
 			}
-			write := func() {
-				t.Helper()
-				data, err := json.Marshal(document)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err = os.WriteFile(path, data, 0600); err != nil {
-					t.Fatal(err)
-				}
+			data, err := json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
 			}
-			write()
-			data, _ := json.Marshal(document)
 			var metadata map[string]any
 			if err := json.Unmarshal(data, &metadata); err != nil {
 				t.Fatal(err)
 			}
 			manager := coreauth.NewManager(nil, nil, nil)
-			auth := &coreauth.Auth{ID: "same.json", FileName: "same.json", Provider: "codex", Metadata: metadata, Attributes: map[string]string{coreauth.AttributePath: path, coreauth.AttributeSourceBackend: coreauth.AuthSourceFile}}
+			auth := &coreauth.Auth{ID: "same.json", FileName: "same.json", Provider: "codex", Metadata: metadata}
 			if _, err := manager.Register(ctx, auth); err != nil {
 				t.Fatal(err)
 			}
-			source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager }, nil)
-			if len(source.QuotaBindings(true)) != 1 {
-				t.Fatal("genuine credential/selector aliases or canonical precedence disagreed with core")
+			source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager })
+			bindings := source.QuotaBindings()
+			if len(bindings) != 1 || bindings[0].Account != "same@example.invalid" || bindings[0].AccountKind != "email" {
+				t.Fatalf("genuine credential aliases changed identity: %+v", bindings)
 			}
 			switch changed {
 			case "api-key":
@@ -136,14 +127,36 @@ func TestUsageQuotaIdentityCredentialAliasPrecedenceAndSelectors(t *testing.T) {
 				document["unknown_account_selector"] = "B"
 			case "custom-headers":
 				document["headers"] = map[string]any{"Chatgpt-Account-Id": "B"}
+			case "account-selector":
+				// An operation selector is not the account property.
+				document["account_id"] = "B"
 			}
-			write()
-			if len(source.QuotaBindings(true)) != 0 {
-				t.Fatal("changed selector/credential or unknown metadata accepted")
+			if err := json.Unmarshal(mustJSON(t, document), &metadata); err != nil {
+				t.Fatal(err)
 			}
-			if _, ok := source.(usagepersist.TargetedQuotaIdentitySource).QuotaBinding("codex", auth.Index, true); ok {
-				t.Fatal("targeted locked check accepted changed disk identity")
+			auth.Metadata = metadata
+			if _, err := manager.Update(ctx, auth); err != nil {
+				t.Fatal(err)
+			}
+			after := source.QuotaBindings()
+			if refused {
+				if len(after) != 0 {
+					t.Fatalf("unaudited metadata was trusted as a credential: %+v", after)
+				}
+				return
+			}
+			if len(after) != 1 || after[0].Account != "same@example.invalid" || after[0].AccountKind != "email" {
+				t.Fatalf("non-account field re-keyed or broke the credential: %+v", after)
 			}
 		})
 	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

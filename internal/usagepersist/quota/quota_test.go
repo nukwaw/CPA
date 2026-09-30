@@ -14,10 +14,28 @@ import (
 
 var observed = time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
 
-// Parser fixtures carry opaque source identity; Store tests separately acquire
-// and validate these fields against the real credential manager.
-func parserIdentity(provider, index string) Identity {
-	return Identity{Provider: provider, AuthIndex: index, CredentialGeneration: "parser-generation", Revision: "parser-revision"}
+// parserIdentity supplies the account facts a credential publishes: the
+// provider and its account property (device_id for kimi, email otherwise).
+// An account-less credential carries neither an account nor an account kind.
+func parserIdentity(provider, account string) Identity {
+	kind := ""
+	if account != "" {
+		kind = "email"
+		if strings.EqualFold(strings.TrimSpace(provider), "kimi") {
+			kind = "device_id"
+		}
+	}
+	return Identity{Provider: provider, Account: account, AccountKind: kind}
+}
+
+// assertAccountFacts checks that a parser stamped the caller's account facts
+// instead of any opaque credential identity.
+func assertAccountFacts(t *testing.T, snapshot Snapshot, identity Identity) {
+	t.Helper()
+	wantProvider := strings.ToLower(strings.TrimSpace(identity.Provider))
+	if snapshot.Provider != wantProvider || snapshot.Account != strings.TrimSpace(identity.Account) || snapshot.AccountKind != identity.AccountKind {
+		t.Fatalf("parser lost account facts: %+v from %+v", snapshot, identity)
+	}
 }
 
 func TestParseCodexHeadersMeasuredWindows(t *testing.T) {
@@ -37,14 +55,12 @@ func TestParseCodexHeadersMeasuredWindows(t *testing.T) {
 		"X-Request-Id":                          {"secret-request"},
 		"X-Codex-Credits-Private":               {"secret-private"},
 	}
-	identity := parserIdentity(" CODEX ", "credential-1")
+	identity := parserIdentity(" CODEX ", "user@example.invalid")
 	snapshot, ok := ParseHeaders(identity, headers, observed)
-	if snapshot.CredentialGeneration != identity.CredentialGeneration || snapshot.Revision != identity.Revision {
-		t.Fatal("header parser lost source identity")
-	}
 	if !ok || snapshot.Plan != "pro" || len(snapshot.Windows) != 2 {
 		t.Fatalf("unexpected snapshot: %+v, recognized=%v", snapshot, ok)
 	}
+	assertAccountFacts(t, snapshot, identity)
 	primary := getWindow(t, snapshot, "primary")
 	assertNumber(t, primary.UsedPercent, 0)
 	assertNumber(t, primary.RemainingPercent, 100)
@@ -70,8 +86,52 @@ func TestParseCodexHeadersMeasuredWindows(t *testing.T) {
 			t.Fatalf("unexpected secret %q retained: %s", secret, encoded)
 		}
 	}
+	for _, removed := range []string{"auth_index", "credential_generation", "revision"} {
+		if strings.Contains(string(encoded), removed) {
+			t.Fatalf("removed credential identity %q still serialized: %s", removed, encoded)
+		}
+	}
 	if headers["x-codex-primary-used-percent"][0] != "50" || len(headers["x-codex-primary-used-percent"]) != 2 {
 		t.Fatal("parser mutated its input headers")
+	}
+}
+
+// TestAccountFactsContract pins the persisted fact contract other packages
+// decode: the exact JSON keys, their order, and the fact that account is an
+// optional credential property rather than part of a credential identity.
+func TestAccountFactsContract(t *testing.T) {
+	encodedIdentity, errJSON := json.Marshal(parserIdentity("codex", "user@example.invalid"))
+	if errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	if want := `{"provider":"codex","account":"user@example.invalid","account_kind":"email"}`; string(encodedIdentity) != want {
+		t.Fatalf("identity contract changed: got %s, want %s", encodedIdentity, want)
+	}
+	identity := parserIdentity("codex", "user@example.invalid")
+	snapshot, ok := ParseAPICall(identity, "https://chatgpt.com/backend-api/wham/usage", 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":10}}}`), observed)
+	if !ok {
+		t.Fatal("fixture not recognized")
+	}
+	assertAccountFacts(t, snapshot, identity)
+	encoded, errJSON := json.Marshal(snapshot)
+	if errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	prefix := `{"provider":"codex","account":"user@example.invalid","account_kind":"email","source":"management_api","observed_at":"2026-09-29T12:00:00Z","windows":[`
+	if !strings.HasPrefix(string(encoded), prefix) {
+		t.Fatalf("snapshot contract changed: %s", encoded)
+	}
+
+	// A credential with no account property is still recorded: it is grouped by
+	// provider alone and claims no account kind.
+	accountless := parserIdentity("codex", "")
+	snapshot, ok = ParseHeaders(accountless, http.Header{"X-Codex-Primary-Used-Percent": {"10"}}, observed)
+	if !ok || snapshot.Account != "" || snapshot.AccountKind != "" {
+		t.Fatalf("account-less credential was hidden: %+v, parsed=%v", snapshot, ok)
+	}
+	assertAccountFacts(t, snapshot, accountless)
+	if account, exists := accountFact("   "); !exists || account != "" {
+		t.Fatalf("blank account property not treated as absent: %q, %v", account, exists)
 	}
 }
 
@@ -116,7 +176,7 @@ func TestClaudeHeadersFractionAndProviderIsolation(t *testing.T) {
 	if weekly.Allowed == nil || *weekly.Allowed || weekly.LimitReached == nil || !*weekly.LimitReached {
 		t.Fatal("Claude window state lost")
 	}
-	for _, provider := range []string{"kimi", "xai", "grok", "gemini", "gemini-cli", "antigravity", "devin", "openai"} {
+	for _, provider := range []string{"kimi", "xai", "grok", "gemini", "gemini-cli", "antigravity", "devin", "openai", "unknown-provider"} {
 		if _, parsed := ParseHeaders(parserIdentity(provider, "a"), headers, observed); parsed {
 			t.Fatalf("misattributed headers to %s", provider)
 		}
@@ -129,10 +189,25 @@ func TestHeadersRejectMalformedAndNonQuotaSignals(t *testing.T) {
 			t.Fatalf("accepted invalid percentage %q", value)
 		}
 	}
-	for _, identity := range []Identity{parserIdentity("", "a"), parserIdentity("codex", ""), parserIdentity("codex", "a\nsecret")} {
-		if _, ok := ParseHeaders(identity, http.Header{"X-Codex-Primary-Used-Percent": {"0"}}, observed); ok {
-			t.Fatalf("accepted invalid identity %+v", identity)
+	// Replaces the removed auth-index/generation validation: the provider must
+	// be present and the optional account property must be well formed.
+	for _, identity := range []Identity{
+		{},
+		parserIdentity("", "a"),
+		parserIdentity("codex", "a\nsecret"),
+		parserIdentity("codex", "a\x00secret"),
+		parserIdentity("codex", strings.Repeat("a", maxText+1)),
+		{Provider: "co\ndex", Account: "a"},
+	} {
+		accepted, ok := ParseHeaders(identity, http.Header{"X-Codex-Primary-Used-Percent": {"0"}}, observed)
+		if ok {
+			t.Fatalf("accepted invalid account facts %+v: %+v", identity, accepted)
 		}
+	}
+	// The size bound itself is inclusive.
+	bounded, ok := ParseHeaders(parserIdentity("codex", strings.Repeat("a", maxText)), http.Header{"X-Codex-Primary-Used-Percent": {"0"}}, observed)
+	if !ok || len(bounded.Account) != maxText {
+		t.Fatalf("rejected an account at the size bound: %+v, parsed=%v", bounded, ok)
 	}
 	if _, ok := ParseHeaders(parserIdentity("codex", "a"), http.Header{"X-Codex-Primary-Used-Percent": {"0"}}, time.Time{}); ok {
 		t.Fatal("accepted missing observation time")
@@ -176,14 +251,12 @@ func TestAPICallKnownProviderPayloads(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.provider+"/"+test.id, func(t *testing.T) {
-			identity := parserIdentity(test.provider, "a")
+			identity := parserIdentity(test.provider, "a@example.invalid")
 			snapshot, ok := ParseAPICall(identity, test.endpoint, 200, nil, []byte(test.body), observed)
-			if snapshot.CredentialGeneration != identity.CredentialGeneration || snapshot.Revision != identity.Revision {
-				t.Fatal("API-call parser lost source identity")
-			}
 			if !ok {
 				t.Fatalf("known quota body unrecognized: %s", test.body)
 			}
+			assertAccountFacts(t, snapshot, identity)
 			window := getWindow(t, snapshot, test.id)
 			assertNumber(t, window.UsedPercent, test.wantUsed)
 			if window.Source != SourceAPICall || !window.ObservedAt.Equal(observed) {
@@ -226,6 +299,12 @@ func TestAPICallRejectsUnknownErrorAndMalformedResponses(t *testing.T) {
 	if _, ok := ParseAPICall(parserIdentity("claude", "a"), endpoint, 200, nil, body, observed); ok {
 		t.Fatal("accepted provider-mismatched endpoint")
 	}
+	// Unknown providers own no quota endpoint; the account facts cannot widen it.
+	for _, provider := range []string{"unknown-provider", "", "co\ndex"} {
+		if _, ok := ParseAPICall(parserIdentity(provider, "a"), endpoint, 200, nil, body, observed); ok {
+			t.Fatalf("accepted unknown provider %q", provider)
+		}
+	}
 	snapshot, ok := ParseAPICall(parserIdentity("codex", "a"), endpoint, 429, http.Header{"X-Codex-Primary-Used-Percent": {"100"}}, []byte(`{"secret":"error-body"}`), observed)
 	if !ok || getWindow(t, snapshot, "primary").Source != SourceHeaders {
 		t.Fatal("measured error-response header lost")
@@ -250,7 +329,7 @@ func TestAPICallAliasesNullAndIndependentWindows(t *testing.T) {
 }
 
 func TestMergeOrdersWindowsAndDoesNotAlias(t *testing.T) {
-	identity := parserIdentity("codex", "a")
+	identity := parserIdentity("codex", "a@example.invalid")
 	initial, _ := ParseAPICall(identity, "https://chatgpt.com/backend-api/wham/usage", 200, nil,
 		[]byte(`{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10},"secondary_window":{"used_percent":20}}}`), observed)
 	newer, _ := ParseHeaders(identity, http.Header{"X-Codex-Primary-Used-Percent": {"30"}}, observed.Add(time.Minute))
@@ -271,25 +350,34 @@ func TestMergeOrdersWindowsAndDoesNotAlias(t *testing.T) {
 	assertNumber(t, getWindow(t, initial, "primary").UsedPercent, 10)
 	assertNumber(t, getWindow(t, newer, "primary").UsedPercent, 30)
 	other := newer
-	other.AuthIndex = "b"
+	other.Account = "other@example.invalid"
 	isolated := Merge(initial, other)
-	if isolated.AuthIndex != "b" || len(isolated.Windows) != 1 {
-		t.Fatal("different credential quota was merged")
+	if isolated.Account != "other@example.invalid" || len(isolated.Windows) != 1 {
+		t.Fatal("different account quota was merged")
 	}
-	// Reusing a filename/index for a different credential starts an entirely
-	// new snapshot, even when the replacement has an older observation time.
-	replacementIdentity := identity
-	replacementIdentity.CredentialGeneration = "replacement-generation"
-	replacementIdentity.Revision = "replacement-revision"
-	replacement, ok := ParseHeaders(replacementIdentity, http.Header{"X-Codex-Primary-Used-Percent": {"5"}}, observed.Add(-time.Minute))
+	// A different account is a different credential: it starts an entirely new
+	// snapshot, even when its observation is older than the retained state.
+	replacement, ok := ParseHeaders(parserIdentity("codex", "replacement@example.invalid"), http.Header{"X-Codex-Primary-Used-Percent": {"5"}}, observed.Add(-time.Minute))
 	if !ok {
 		t.Fatal("invalid replacement fixture")
 	}
 	isolated = Merge(initial, replacement)
-	if isolated.CredentialGeneration != replacement.CredentialGeneration || isolated.Revision != replacement.Revision || len(isolated.Windows) != 1 || isolated.Plan != "" || !isolated.ObservedAt.Equal(replacement.ObservedAt) {
-		t.Fatal("credential generation rollover retained old state")
+	if isolated.Account != "replacement@example.invalid" || isolated.AccountKind != "email" || isolated.Provider != "codex" || len(isolated.Windows) != 1 || isolated.Plan != "" || !isolated.ObservedAt.Equal(replacement.ObservedAt) {
+		t.Fatal("account change retained the previous account's state")
 	}
 	assertNumber(t, getWindow(t, isolated, "primary").UsedPercent, 5)
+	// The same account with a different recorded kind is still one account, and
+	// the previous snapshot's facts are preserved by the merge.
+	sameAccount := newer
+	sameAccount.AccountKind = "device_id"
+	merged = Merge(initial, sameAccount)
+	if len(merged.Windows) != 2 || merged.AccountKind != "email" || !merged.ObservedAt.Equal(newer.ObservedAt) {
+		t.Fatalf("same-account merge changed: %+v", merged)
+	}
+	// A previous snapshot without an observation time cannot seed a merge.
+	if zeroed := Merge(Snapshot{Provider: "codex", Account: "a@example.invalid"}, replacement); zeroed.Account != "replacement@example.invalid" || len(zeroed.Windows) != 1 {
+		t.Fatalf("zero-time previous snapshot was merged: %+v", zeroed)
+	}
 }
 
 func TestMergeRetainsStableMetadataButNotExpiredResetOrFlags(t *testing.T) {
@@ -339,14 +427,14 @@ func TestFetchKnownFields(t *testing.T) {
 		}}},
 		Summary: []pluginapi.QuotaMetric{{Key: "balance", Label: "Balance", Value: 0, Unit: "credits", Format: "number"}, {Key: "bad", Value: math.Inf(1)}},
 	}
+	// Declarative plugins name their own provider; any non-empty provider is a
+	// valid account fact.
 	identity := parserIdentity("custom", "a")
 	snapshot, ok := ParseFetch(identity, response, observed)
-	if snapshot.CredentialGeneration != identity.CredentialGeneration || snapshot.Revision != identity.Revision {
-		t.Fatal("fetch parser lost source identity")
-	}
 	if !ok || len(snapshot.Windows) != 1 || len(snapshot.Summary) != 1 {
 		t.Fatalf("unexpected plugin snapshot: %+v", snapshot)
 	}
+	assertAccountFacts(t, snapshot, identity)
 	window := getWindow(t, snapshot, "fetch:custom:monthly")
 	assertNumber(t, window.RemainingPercent, 0)
 	assertNumber(t, window.UsedPercent, 100)
@@ -360,8 +448,25 @@ func TestFetchKnownFields(t *testing.T) {
 	if errJSON != nil || strings.Contains(string(encoded), "not-retained") {
 		t.Fatalf("unexpected serialized snapshot: %s, %v", encoded, errJSON)
 	}
+	// kimi credentials publish device_id instead of email.
+	if kimi, ok := ParseFetch(parserIdentity("kimi", "device-1"), response, observed); !ok || kimi.Account != "device-1" || kimi.AccountKind != "device_id" {
+		t.Fatalf("kimi device_id account fact lost: %+v, parsed=%v", kimi, ok)
+	}
+	// The fetch parser validates account facts exactly like the other parsers.
+	for _, identity := range []Identity{parserIdentity("", "a"), parserIdentity("custom", "a\nsecret"), parserIdentity("custom", strings.Repeat("a", maxText+1))} {
+		if _, ok := ParseFetch(identity, response, observed); ok {
+			t.Fatalf("fetch accepted invalid account facts %+v", identity)
+		}
+	}
+	pluginSnapshot, ok := ParseFetch(parserIdentity("custom", ""), response, observed)
+	if !ok || pluginSnapshot.Account != "" {
+		t.Fatalf("account-less plugin credential was hidden: %+v, parsed=%v", pluginSnapshot, ok)
+	}
 	if _, ok := ParseFetch(parserIdentity("custom", "a"), pluginapi.QuotaFetchResponse{}, observed); ok {
 		t.Fatal("empty fetch fabricated quota")
+	}
+	if _, ok := ParseFetch(parserIdentity("custom", "a"), response, time.Time{}); ok {
+		t.Fatal("fetch accepted a missing observation time")
 	}
 }
 

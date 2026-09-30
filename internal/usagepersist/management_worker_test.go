@@ -34,7 +34,14 @@ type managementBlockingStore struct {
 	inserts atomic.Int64
 }
 
+// MutateCache gates the durable quota-state backend. The bounded quota history
+// row is separate best-effort diagnostic state written after the state merge, so
+// it passes through without consuming a stepped release or a write count: gating
+// it here would require two releases per observation.
 func (backend *managementBlockingStore) MutateCache(ctx context.Context, namespace, key string, update func(json.RawMessage) (json.RawMessage, error)) error {
+	if namespace == quotaHistoryNamespace {
+		return backend.store.MutateCache(ctx, namespace, key, update)
+	}
 	backend.entered <- ctx
 	select {
 	case <-ctx.Done():
@@ -101,7 +108,7 @@ func TestManagementWorkerBlockedBackendPreservesOriginalResponses(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			s := middlewareTestStore(t)
 			if test.reset {
-				s.fixtureObserveQuotaFetch(context.Background(), "codex", "account", managementFetchFixture(t))
+				wpObserveQuotaFetch(s, context.Background(), "codex", "account", managementFetchFixture(t))
 				flushFixture(t, s)
 			}
 			backend := blockManagementStore(t, s)
@@ -156,16 +163,16 @@ func TestManagementWorkerSharesBoundedQueueAndReportsOverflow(t *testing.T) {
 	backend := blockManagementStore(t, s)
 	ctx := context.Background()
 	fetch := managementFetchFixture(t)
-	s.fixtureObserveQuotaFetch(ctx, "codex", "account", fetch)
+	wpObserveQuotaFetch(s, ctx, "codex", "account", fetch)
 	awaitManagementMutation(t, backend)
 	admit := func(index int) {
 		switch index % 4 {
 		case 0:
-			s.fixtureObserveAPICall(ctx, "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
+			wpObserveAPICall(s, ctx, "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
 		case 1:
-			s.fixtureObserveQuotaFetch(ctx, "codex", "account", fetch)
+			wpObserveQuotaFetch(s, ctx, "codex", "account", fetch)
 		case 2:
-			s.fixtureObserveQuotaReset(ctx, "codex", "account")
+			wpObserveQuotaReset(s, ctx, "codex", "account")
 		case 3:
 			s.Consume(ctx, fixturePayload(fixtureRecord(fmt.Sprintf("mixed-%d", index), time.Now())))
 		}
@@ -204,17 +211,17 @@ func TestManagementWorkerSharesBoundedQueueAndReportsOverflow(t *testing.T) {
 func TestManagementWorkerQueuesOnlyNormalizedDataAndReceiptTimes(t *testing.T) {
 	// No worker: inspect exactly what is retained, including confirmed resets.
 	s := &Store{queue: make(chan queuedUsage, usageQueueCapacity), workerCtx: context.Background()}
-	bindManagementFixtures(t, s)
+	wpBindManagementFixtures(t, s)
 	type privateKey struct{}
 	ctx := context.WithValue(context.Background(), privateKey{}, "private-context")
 	headers := http.Header{"Authorization": {"private-header"}, "Set-Cookie": {"private-cookie"}}
 	body := []byte(`{"rate_limit":{"primary_window":{"used_percent":25}},"token":"private-body"}`)
 	fetch := managementFetchFixture(t)
 	before := time.Now().UTC()
-	s.fixtureObserveAPICall(ctx, "codex", "account", middlewareQuotaURL+"?token=private-query", 200, headers, body)
-	s.fixtureObserveQuotaFetch(ctx, "codex", "account", fetch)
-	s.fixtureObserveQuotaReset(ctx, " CODEX ", " account ")
-	s.fixtureObserveAPICall(ctx, "codex", "account", managementResetURL+"?token=private-query", 200, headers, []byte(`{"code":"reset","windows_reset":1,"token":"private-reset-body"}`))
+	wpObserveAPICall(s, ctx, "codex", "account", middlewareQuotaURL+"?token=private-query", 200, headers, body)
+	wpObserveQuotaFetch(s, ctx, "codex", "account", fetch)
+	wpObserveQuotaReset(s, ctx, " CODEX ", " account ")
+	wpObserveAPICall(s, ctx, "codex", "account", managementResetURL+"?token=private-query", 200, headers, []byte(`{"code":"reset","windows_reset":1,"token":"private-reset-body"}`))
 	after := time.Now().UTC()
 	for i := range body {
 		body[i] = '!'
@@ -226,12 +233,14 @@ func TestManagementWorkerQueuesOnlyNormalizedDataAndReceiptTimes(t *testing.T) {
 		t.Fatalf("normalization did not admit expected observations: %d", len(s.queue))
 	}
 	typ := reflect.TypeOf(queuedUsage{})
-	if typ.NumField() != 5 || typ.Field(4).Type.Kind() != reflect.String || typ.Field(0).Type != reflect.TypeOf(Event{}) || typ.Field(1).Type != reflect.TypeOf((*quota.Snapshot)(nil)) || typ.Field(2).Type != reflect.TypeOf(queuedWorkKind(0)) || typ.Field(3).Type != reflect.TypeOf((*queuedQuotaReset)(nil)) {
+	if typ.NumField() != 4 || typ.Field(0).Type != reflect.TypeOf(Event{}) || typ.Field(1).Type != reflect.TypeOf((*quota.Snapshot)(nil)) || typ.Field(2).Type != reflect.TypeOf(queuedWorkKind(0)) || typ.Field(3).Type != reflect.TypeOf((*queuedQuotaReset)(nil)) {
 		t.Fatalf("queue gained an unsanitized field: %v", typ)
 	}
+	// A queued reset now carries only the account it applies to and the receipt
+	// time: provider, account, observed-at. There is no credential fence left.
 	resetType := reflect.TypeOf(queuedQuotaReset{})
-	if resetType.NumField() != 8 || resetType.Field(0).Type.Kind() != reflect.String || resetType.Field(1).Type.Kind() != reflect.String || resetType.Field(2).Type != reflect.TypeOf(time.Time{}) || resetType.Field(3).Type.Kind() != reflect.String || resetType.Field(4).Type.Kind() != reflect.String || resetType.Field(5).Type.Kind() != reflect.String || resetType.Field(6).Type.Kind() != reflect.Uint64 || resetType.Field(7).Type.Kind() != reflect.Bool {
-		t.Fatalf("reset retained more than identity and receipt time: %v", resetType)
+	if resetType.NumField() != 3 || resetType.Field(0).Type.Kind() != reflect.String || resetType.Field(1).Type.Kind() != reflect.String || resetType.Field(2).Type != reflect.TypeOf(time.Time{}) {
+		t.Fatalf("reset retained more than account and receipt time: %v", resetType)
 	}
 	for i := range 4 {
 		item := <-s.queue
@@ -248,7 +257,7 @@ func TestManagementWorkerQueuesOnlyNormalizedDataAndReceiptTimes(t *testing.T) {
 				t.Fatal("queued quota aliased caller-owned plugin response")
 			}
 		} else {
-			if item.Kind != queuedQuotaResetBarrier || item.Reset == nil || item.Quota != nil || item.Reset.Provider != "codex" || item.Reset.AuthIndex != "account" {
+			if item.Kind != queuedQuotaResetBarrier || item.Reset == nil || item.Quota != nil || item.Reset.Provider != "codex" || item.Reset.Account != fixtureAccount {
 				t.Fatalf("reset was not sanitized before admission: %+v", item)
 			}
 			observedAt = item.Reset.ObservedAt
@@ -286,9 +295,9 @@ func TestManagementWorkerFlushIncludesNewKindsButNotLaterAdmissions(t *testing.T
 			s := middlewareTestStore(t)
 			backend := blockManagementStore(t, s)
 			if reset {
-				s.fixtureObserveQuotaReset(context.Background(), "codex", "account")
+				wpObserveQuotaReset(s, context.Background(), "codex", "account")
 			} else {
-				s.fixtureObserveQuotaFetch(context.Background(), "codex", "account", managementFetchFixture(t))
+				wpObserveQuotaFetch(s, context.Background(), "codex", "account", managementFetchFixture(t))
 			}
 			awaitManagementMutation(t, backend)
 			canceled, cancel := context.WithCancel(context.Background())
@@ -305,7 +314,7 @@ func TestManagementWorkerFlushIncludesNewKindsButNotLaterAdmissions(t *testing.T
 				}
 			}()
 			awaitSignal(t, ctx.sampled)
-			s.fixtureObserveQuotaFetch(context.Background(), "codex", "later", managementFetchFixture(t))
+			wpObserveQuotaFetch(s, context.Background(), "codex", "later", managementFetchFixture(t))
 			backend.release <- struct{}{}
 			awaitManagementMutation(t, backend)
 			awaitSignal(t, done)
@@ -325,14 +334,14 @@ func TestManagementWorkerShutdownCancellationDropsQueuedKinds(t *testing.T) {
 			backend := blockManagementStore(t, s)
 			fetch := managementFetchFixture(t)
 			if reset {
-				s.fixtureObserveQuotaReset(context.Background(), "codex", "account")
+				wpObserveQuotaReset(s, context.Background(), "codex", "account")
 			} else {
-				s.fixtureObserveQuotaFetch(context.Background(), "codex", "account", fetch)
+				wpObserveQuotaFetch(s, context.Background(), "codex", "account", fetch)
 			}
 			awaitManagementMutation(t, backend)
-			s.fixtureObserveQuotaReset(context.Background(), "codex", "account")
-			s.fixtureObserveQuotaFetch(context.Background(), "codex", "account", fetch)
-			s.fixtureObserveAPICall(context.Background(), "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
+			wpObserveQuotaReset(s, context.Background(), "codex", "account")
+			wpObserveQuotaFetch(s, context.Background(), "codex", "account", fetch)
+			wpObserveAPICall(s, context.Background(), "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			if err := s.Close(ctx); !errors.Is(err, context.Canceled) {
@@ -345,7 +354,7 @@ func TestManagementWorkerShutdownCancellationDropsQueuedKinds(t *testing.T) {
 			if err := s.Flush(context.Background()); !errors.Is(err, ErrClosed) {
 				t.Fatalf("Flush concealed abandoned management work: %v", err)
 			}
-			if len(s.quotaBindings(false)) != 0 {
+			if len(s.publishedQuotaBindings()) != 0 {
 				t.Fatal("shutdown retained an eligible observation publication")
 			}
 			// Already normalized late work is still counted by admission. New
@@ -362,11 +371,13 @@ func TestManagementWorkerShutdownCancellationDropsQueuedKinds(t *testing.T) {
 
 func managementSnapshotAt(t *testing.T, s *Store, observedAt time.Time, used int) quota.Snapshot {
 	t.Helper()
-	snapshot, ok := quota.ParseAPICall(quota.Identity{Provider: "codex", AuthIndex: "account"}, middlewareQuotaURL, 200, nil, []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":%d}}}`, used)), observedAt)
+	// Account facts are supplied by the observation itself now; the transient
+	// index only located the live credential that produced it.
+	snapshot, ok := quota.ParseAPICall(quota.Identity{Provider: "codex", Account: fixtureAccount, AccountKind: "email"}, middlewareQuotaURL, 200, nil, []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":%d}}}`, used)), observedAt)
 	if !ok {
 		t.Fatal("invalid timestamped quota fixture")
 	}
-	return bindSnapshotFixture(s, snapshot)
+	return snapshot
 }
 
 func managementState(t *testing.T, s *Store) quotaState {
@@ -376,7 +387,7 @@ func managementState(t *testing.T, s *Store) quotaState {
 		t.Fatal(err)
 	}
 	var state quotaState
-	if err = json.Unmarshal(values[quotaKey("codex", "account")], &state); err != nil {
+	if err = json.Unmarshal(values[quotaStoreKey("codex", fixtureAccount)], &state); err != nil {
 		t.Fatal(err)
 	}
 	return state
@@ -384,19 +395,19 @@ func managementState(t *testing.T, s *Store) quotaState {
 
 func testManagementResetOrdering(t *testing.T, s *Store) {
 	t.Helper()
-	bindManagementFixtures(t, s)
+	wpBindManagementFixtures(t, s)
 	ctx := context.Background()
 	cutoff := time.Now().UTC().Add(-time.Minute)
 	old := managementSnapshotAt(t, s, cutoff.Add(-time.Second), 25)
 	fresh := managementSnapshotAt(t, s, cutoff.Add(time.Second), 60)
-	entry := bindCacheFixture(s, QuotaCacheEntry{Provider: "codex", AuthIndex: "account", ObservedAt: old.ObservedAt, State: json.RawMessage(`{"status":"success","windows":[]}`)})
+	entry := wpBindCacheFixture(s, QuotaCacheEntry{Provider: "codex", Key: "account", ObservedAt: old.ObservedAt, State: json.RawMessage(`{"status":"success","windows":[]}`)})
 	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{entry}); err != nil {
 		t.Fatal(err)
 	}
 	backend := blockManagementStore(t, s)
 	s.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &old})
 	awaitManagementMutation(t, backend)
-	s.observeQuotaResetAt("codex", "account", cutoff)
+	wpObserveResetAt(s, "codex", "account", cutoff)
 	// A pre-reset sample admitted after the reset still must be rejected by
 	// the durable cutoff, not resurrected based on worker execution order.
 	s.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &old})
@@ -416,7 +427,7 @@ func testManagementResetOrdering(t *testing.T, s *Store) {
 	}
 	// Older resets cannot lower the cutoff, and snapshots exactly at it are
 	// stale as well. Keep the post-reset state while rejecting both cases.
-	s.observeQuotaResetAt("codex", "account", cutoff.Add(-time.Second))
+	wpObserveResetAt(s, "codex", "account", cutoff.Add(-time.Second))
 	atCutoff := managementSnapshotAt(t, s, cutoff, 90)
 	s.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &atCutoff})
 	flushFixture(t, s)
@@ -430,8 +441,8 @@ func testManagementResetOrdering(t *testing.T, s *Store) {
 	// A newer reset removes the old snapshot, then even a lower-timestamped
 	// delayed reset must not permit its resurrection after the next drain.
 	newCutoff := cutoff.Add(2 * time.Second)
-	s.observeQuotaResetAt("codex", "account", newCutoff)
-	s.observeQuotaResetAt("codex", "account", cutoff)
+	wpObserveResetAt(s, "codex", "account", newCutoff)
+	wpObserveResetAt(s, "codex", "account", cutoff)
 	s.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &fresh})
 	flushFixture(t, s)
 	state = managementState(t, s)
@@ -440,6 +451,9 @@ func testManagementResetOrdering(t *testing.T, s *Store) {
 	}
 }
 
+// The durable protection the old generation fence provided survives here: an
+// older observation time can never overwrite newer stored state, neither on the
+// local backend nor across a replica.
 func TestManagementWorkerResetOrderingAndDurableCutoff(t *testing.T) {
 	t.Run("file", func(t *testing.T) {
 		directory := t.TempDir()
@@ -458,7 +472,7 @@ func TestManagementWorkerResetOrderingAndDurableCutoff(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = reopened.Close(context.Background()) })
-		bindManagementFixtures(t, reopened)
+		wpBindManagementFixtures(t, reopened)
 		old := managementSnapshotAt(t, reopened, cutoff.Add(-time.Second), 99)
 		reopened.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &old})
 		flushFixture(t, reopened)
@@ -482,8 +496,8 @@ func TestManagementWorkerResetOrderingAndDurableCutoff(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = other.Close(context.Background()) })
-		bindManagementFixtures(t, other)
-		other.observeQuotaResetAt("codex", "account", cutoff.Add(-time.Second))
+		wpBindManagementFixtures(t, other)
+		wpObserveResetAt(other, "codex", "account", cutoff.Add(-time.Second))
 		old := managementSnapshotAt(t, other, cutoff.Add(-time.Second), 99)
 		other.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &old})
 		flushFixture(t, other)
@@ -507,24 +521,26 @@ func TestManagementWorkerDelayedResetPreservesNewerWindowsAndUICache(t *testing.
 	if err := s.mergeQuota(ctx, fresh); err != nil {
 		t.Fatal(err)
 	}
+	// Both entries address the same transient credential index; the binding
+	// supplies the durable display key. Only the newer observation may survive.
 	entries := []QuotaCacheEntry{
-		{Provider: "codex", Key: "old.json", AuthIndex: "account", ObservedAt: old.ObservedAt, State: json.RawMessage(`{"status":"success","windows":[]}`)},
-		{Provider: "codex", Key: "new.json", AuthIndex: "account", ObservedAt: fresh.ObservedAt, State: json.RawMessage(`{"status":"success","windows":[]}`)},
+		{Provider: "codex", Key: "account", ObservedAt: old.ObservedAt, State: json.RawMessage(`{"status":"success","windows":[]}`)},
+		{Provider: "codex", Key: "account", ObservedAt: fresh.ObservedAt, State: json.RawMessage(`{"status":"success","windows":[]}`)},
 	}
 	for i := range entries {
-		entries[i] = bindCacheFixture(s, entries[i])
+		entries[i] = wpBindCacheFixture(s, entries[i])
 	}
 	if err := s.SaveQuotaCache(ctx, entries); err != nil {
 		t.Fatal(err)
 	}
-	s.observeQuotaResetAt("codex", "account", cutoff)
+	wpObserveResetAt(s, "codex", "account", cutoff)
 	flushFixture(t, s)
 	state := managementState(t, s)
 	if !state.ResetAt.Equal(cutoff) || state.Snapshot == nil || len(state.Snapshot.Windows) != 1 || state.Snapshot.Windows[0].ID != "newer-window" || len(state.UIEntries) != 1 {
 		t.Fatalf("delayed reset retained old windows or discarded newer state: %+v", state)
 	}
 	cached, err := s.QuotaCache(ctx)
-	if err != nil || len(cached) != 1 || cached[0].Key != fixtureBinding(s, "codex", "account").Key {
+	if err != nil || len(cached) != 1 || cached[0].Key != wpReadBinding(s, "codex", "account").Key {
 		t.Fatalf("delayed reset did not preserve only newer UI cache: %+v %v", cached, err)
 	}
 }

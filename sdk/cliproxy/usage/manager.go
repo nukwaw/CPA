@@ -38,6 +38,14 @@ type Record struct {
 	ParentSessionID string
 	AuthID          string
 	AuthIndex       string
+	// Account holds the account fact used to group usage by (provider, account):
+	// the credential's email, or its device_id for the kimi provider. It is an
+	// account identifier, never a credential, and stays empty when the credential
+	// has no such property.
+	Account string
+	// AccountKind names the credential property Account was read from: "email" or
+	// "device_id". It stays empty whenever Account is empty.
+	AccountKind string
 	// AccessTokenSHA256 identifies the OAuth token version without exposing the token.
 	AccessTokenSHA256 string
 	AuthType          string

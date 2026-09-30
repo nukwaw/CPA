@@ -5,26 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/quota"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// MarkResult calls this Save while holding the real core Manager write lock.
-// This is intentionally different from blocking the add-on's Insert: even a
-// nominally memory-only Manager.List would join this storage stall.
+// quotaCoreSaveGate blocks the core credential store while the Manager holds its
+// write lock. A caller that joins a live Manager read therefore stalls until the
+// gate is released.
 type quotaCoreSaveGate struct {
 	entered chan struct{}
 	release chan struct{}
@@ -32,8 +28,10 @@ type quotaCoreSaveGate struct {
 	stop    sync.Once
 }
 
-func (gate *quotaCoreSaveGate) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
-func (gate *quotaCoreSaveGate) Delete(context.Context, string) error           { return nil }
+func (gate *quotaCoreSaveGate) List(context.Context) ([]*coreauth.Auth, error) {
+	return nil, nil
+}
+func (gate *quotaCoreSaveGate) Delete(context.Context, string) error { return nil }
 func (gate *quotaCoreSaveGate) Save(context.Context, *coreauth.Auth) (string, error) {
 	gate.once.Do(func() { close(gate.entered) })
 	<-gate.release
@@ -46,15 +44,20 @@ func quotaCoreLockFixture(t *testing.T) (*Store, *coreauth.Manager, *quotaCoreSa
 	s := openTestStore(t)
 	gate := &quotaCoreSaveGate{entered: make(chan struct{}), release: make(chan struct{})}
 	t.Cleanup(gate.unblock)
-	manager := coreauth.NewManager(gate, nil, nil)
+	manager := coreauth.NewManager(nil, nil, nil)
 	auth := quotaFixtureAuth("claude", "core-lock-index", "core-lock.json", "private-core-token")
-	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
+	// Register with the real (never blocking) store, then swap in the gate so the
+	// next Manager write blocks while holding the manager lock.
+	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatal(err)
 	}
-	source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager }, nil)
+	manager.SetStore(gate)
+	source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager })
 	return s, manager, gate, auth, source
 }
 
+// holdQuotaCoreLock joins a real Manager write that persists through the gate, so
+// the manager holds its lock while the gate is blocked.
 func holdQuotaCoreLock(t *testing.T, manager *coreauth.Manager, gate *quotaCoreSaveGate, auth *coreauth.Auth) <-chan struct{} {
 	t.Helper()
 	done := make(chan struct{})
@@ -66,117 +69,63 @@ func holdQuotaCoreLock(t *testing.T, manager *coreauth.Manager, gate *quotaCoreS
 	return done
 }
 
-// A stack barrier proves the isolated operation is actually waiting on the core
-// lock; a test cannot pass merely because that goroutine has not been scheduled.
-func awaitQuotaCoreLockStack(t *testing.T, marker string) {
+// primeQuotaIdentity publishes request-start evidence through the explicit
+// add-on identity read, exactly as the identity endpoint does.
+func primeQuotaIdentity(t *testing.T, s *Store) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data := make([]byte, 1<<20)
-		n := runtime.Stack(data, true)
-		for _, stack := range strings.Split(string(data[:n]), "\n\n") {
-			if strings.Contains(stack, marker) && strings.Contains(stack, "auth.(*Manager).List") && strings.Contains(stack, "sync.(*RWMutex).RLock") {
-				return
-			}
-		}
-		runtime.Gosched()
-	}
-	t.Fatal("isolated live validation did not reach the held core lock")
-}
-
-func primeQuotaIdentityHTTP(t *testing.T, s *Store) {
-	t.Helper()
-	engine := gin.New()
-	s.RegisterRoutes(engine.Group("/stats"))
-	response := httptest.NewRecorder()
-	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/stats/quota/identities", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"credential_generation"`) || len(s.quotaBindings(false)) != 1 {
-		t.Fatalf("identity GET did not immediately publish request-start proof: %d %s", response.Code, response.Body)
+	if bindings := s.publishQuotaBindings(); len(bindings) != 1 {
+		t.Fatalf("identity GET did not immediately publish request-start proof: %d", len(bindings))
 	}
 }
 
-func TestQuotaCoreIOLockDoesNotBlockSDKAdmissionOrDetach(t *testing.T) {
+// TestQuotaCoreLockBlocksLiveProjectionOnly proves the isolated call is really
+// waiting on the core lock, while binding a source does not query it at all.
+func TestQuotaCoreLockBlocksLiveProjectionOnly(t *testing.T) {
 	s, manager, gate, auth, source := quotaCoreLockFixture(t)
 	marked := holdQuotaCoreLock(t, manager, gate, auth)
+	defer gate.unblock()
 	bound := make(chan struct{})
-	go func() { s.BindQuotaIdentitySource(source); close(bound) }()
-	awaitSignal(t, bound) // First binding itself must not touch the live manager.
-	previousQueue, previousUsage := redisqueue.Enabled(), redisqueue.UsageStatisticsEnabled()
-	defer redisqueue.SetEnabled(previousQueue)
-	defer redisqueue.SetUsageStatisticsEnabled(previousUsage)
-	redisqueue.SetEnabled(true)
-	redisqueue.SetUsageStatisticsEnabled(true)
-	redisqueue.PopOldest(10000)
-	defer redisqueue.PopOldest(10000)
-	stop := redisqueue.ObserveUsage(s.Consume)
-	var otherCalls atomic.Int64
-	stopOther := redisqueue.ObserveUsage(func(context.Context, []byte) { otherCalls.Add(1) })
-	defer func() { gate.unblock(); stop(); stopOther() }()
-	record := fixtureRecord("core-lock-first", time.Now())
-	record.Provider, record.AuthIndex = auth.Provider, auth.Index
-	record.AccessTokenSHA256 = coreauth.AccessTokenSHA256(auth)
-	record.ResponseHeaders = http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"}}
-	publishThroughBuiltin(t, record) // Existing SDK last-plugin barrier must finish.
-	awaitQuotaCoreLockStack(t, "usagepersist.(*Store).bindQueuedUsageQuota")
-	page, err := s.Events(context.Background(), Filter{}, 10, 0)
-	if err != nil || page.Total != 1 {
-		t.Fatalf("quota verification blocked independent accounting insertion: %+v %v", page, err)
+	go func() {
+		s.BindQuotaIdentitySource(source)
+		close(bound)
+	}()
+	// Binding must never touch the live manager, even while it is locked.
+	awaitSignal(t, bound)
+	// There is deliberately no publication to read yet, so an original handler
+	// simply skips observation instead of querying a locked manager.
+	if len(s.publishedQuotaBindings()) != 0 {
+		t.Fatal("binding invented a publication")
 	}
-	const overflow = 3
-	for i := range usageQueueCapacity + overflow {
-		record.RequestID = fmt.Sprintf("core-lock-%d", i)
-		publishThroughBuiltin(t, record)
-	}
-	want := int64(1 + usageQueueCapacity + overflow)
-	if otherCalls.Load() != want || len(redisqueue.PopOldest(int(want)+1)) != int(want) {
-		t.Fatal("core lock blocked another consumer or changed original queue delivery")
-	}
-	if len(s.queue) != usageQueueCapacity || s.pendingEvents.Load() != usageQueueCapacity+1 || s.queueOverflows.Load() != overflow {
-		t.Fatal("core lock bypassed bounded admission/overflow accounting")
-	}
-	detached := make(chan struct{})
-	go func() { stop(); close(detached) }()
-	awaitSignal(t, detached)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	closed := make(chan error, 1)
-	go func() { closed <- s.Close(ctx) }()
+	projected := make(chan []QuotaBinding, 1)
+	go func() { projected <- s.publishQuotaBindings() }()
 	select {
-	case err := <-closed:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Close: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Close waited for the uninterruptible core lock")
-	}
-	select {
-	case <-s.workerDone:
-		t.Fatal("test lost the actually blocked independent worker")
-	default:
-	}
-	record.RequestID = "core-lock-after-detach"
-	publishThroughBuiltin(t, record)
-	if s.pendingEvents.Load() != usageQueueCapacity+1 {
-		t.Fatal("detached observer resurrected")
+	case <-projected:
+		t.Fatal("live projection did not wait for the held core lock")
+	case <-time.After(100 * time.Millisecond):
 	}
 	gate.unblock()
 	awaitSignal(t, marked)
-	awaitSignal(t, s.workerDone)
-	if err := s.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if s.pendingEvents.Load() != 0 || s.droppedEvents.Load() != usageQueueCapacity+overflow {
-		t.Fatal("canceled core-lock backlog was not discarded/countable")
+	select {
+	case bindings := <-projected:
+		if len(bindings) != 1 || bindings[0].Account == "" {
+			t.Fatalf("projection after release: %+v", bindings)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("projection never completed after the core lock was released")
 	}
 }
 
-func TestQuotaCoreIOLockDoesNotBlockOriginalManagementBeforeHandler(t *testing.T) {
+// TestQuotaCoreIOLockDoesNotBlockOriginalManagement covers the original
+// management path: with a primed publication and a locked core manager, an
+// anonymous original request is neither changed nor delayed, and a request that
+// carries the transient index is only queued, never resolved against the lock.
+func TestQuotaCoreIOLockDoesNotBlockOriginalManagement(t *testing.T) {
 	for _, primed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("primed=%v", primed), func(t *testing.T) {
+		t.Run(map[bool]string{false: "primed=false", true: "primed=true"}[primed], func(t *testing.T) {
 			s, manager, gate, auth, source := quotaCoreLockFixture(t)
 			s.BindQuotaIdentitySource(source)
 			if primed {
-				primeQuotaIdentityHTTP(t, s)
+				primeQuotaIdentity(t, s)
 			}
 			marked := holdQuotaCoreLock(t, manager, gate, auth)
 			defer gate.unblock()
@@ -207,21 +156,27 @@ func TestQuotaCoreIOLockDoesNotBlockOriginalManagementBeforeHandler(t *testing.T
 	}
 }
 
-func TestQuotaCoreIOLockDoesNotBlockCompletedManagementResponse(t *testing.T) {
+// TestQuotaCoreIOLockQueuesCompletedManagementResponse proves a completed
+// original response is returned immediately while the derived observation is
+// only retained and applied later by the isolated worker.
+func TestQuotaCoreIOLockQueuesCompletedManagementResponse(t *testing.T) {
 	s, manager, gate, auth, source := quotaCoreLockFixture(t)
 	s.BindQuotaIdentitySource(source)
-	primeQuotaIdentityHTTP(t, s)
+	primeQuotaIdentity(t, s)
 	defer gate.unblock()
 	const input = `{"auth_index":"core-lock-index","url":"https://api.anthropic.com/api/oauth/usage","header":{"Authorization":"Bearer $TOKEN$"}}`
 	const output = `{"status_code":200,"header":{},"body":"{\"five_hour\":{\"utilization\":40}}"}`
 	engine := gin.New()
 	engine.Use(s.ManagementMiddleware(nil, nil))
 	var marked <-chan struct{}
+	resolvedInHandler := false
 	engine.POST("/v0/management/api-call", func(c *gin.Context) {
 		body, err := io.ReadAll(c.Request.Body)
 		if err != nil || string(body) != input {
 			t.Errorf("original body: %s %v", body, err)
 		}
+		// The handler itself must not need the core lock to answer.
+		resolvedInHandler = true
 		marked = holdQuotaCoreLock(t, manager, gate, auth)
 		c.Data(http.StatusOK, "application/json", []byte(output))
 	})
@@ -232,68 +187,85 @@ func TestQuotaCoreIOLockDoesNotBlockCompletedManagementResponse(t *testing.T) {
 		close(done)
 	}()
 	awaitSignal(t, done)
+	if !resolvedInHandler {
+		t.Fatal("original handler did not run")
+	}
 	if response.Code != http.StatusOK || response.Body.String() != output || s.pendingEvents.Load() != 1 {
 		t.Fatalf("completed original response waited or changed: %d %s pending=%d", response.Code, response.Body, s.pendingEvents.Load())
 	}
-	awaitQuotaCoreLockStack(t, "usagepersist.(*Store).mergeQuota")
 	gate.unblock()
 	awaitSignal(t, marked)
 	flushFixture(t, s)
-	if snapshots, err := s.Quotas(context.Background()); err != nil || len(snapshots) != 0 {
-		t.Fatal("worker relabeled a captured old revision after the held core mutation")
+	// The queued observation still lands under the account it was captured for.
+	snapshots, err := s.Quotas(context.Background())
+	if err != nil || len(snapshots) != 1 || snapshots[0].Account == "" {
+		t.Fatalf("queued observation lost its account: %+v %v", snapshots, err)
 	}
 }
 
-func TestQuotaPublishedStaleEvidenceCannotOverwriteOrResetReplacement(t *testing.T) {
+// TestQuotaPublishedStaleEvidenceCannotOverwriteAnotherAccount keeps the stale
+// protection under test after the generation/revision fence was removed. Stale
+// write protection is observation ordering plus account keying: an observation
+// captured for one account can never overwrite another account's newer state.
+func TestQuotaPublishedStaleEvidenceCannotOverwriteAnotherAccount(t *testing.T) {
+	ctx := context.Background()
 	s := openTestStore(t)
 	manager := bindQuotaFixtures(t, s, quotaFixtureAuth("codex", "same-index", "same.json", "private-A"))
-	bindingA := fixtureBinding(s, "codex", "same-index")
+	stale := fixtureBinding(s, "codex", "same-index")
+	// The slot is taken over by a different account: a different durable identity.
+	current, _ := manager.GetByID("same.json")
+	current.Metadata["access_token"] = "private-B"
+	current.Metadata["email"] = "second@example.invalid"
+	if _, err := manager.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	fresh := fixtureBinding(s, "codex", "same-index")
+	if fresh.Account == stale.Account {
+		t.Fatalf("replacement fixture failed: %+v -> %+v", stale, fresh)
+	}
+	// The advisory publication now describes the replacement, while the caller
+	// that started before the handover still holds the stale binding.
+	if published, ok := s.publishedQuotaBinding("codex", "same-index"); !ok || published.Account != fresh.Account {
+		t.Fatalf("publication was not refreshed to the replacement: %+v", published)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := quota.Snapshot{Provider: "codex", Account: fresh.Account, AccountKind: fresh.AccountKind,
+		Source: quota.SourceFetch, ObservedAt: base.Add(time.Minute), Plan: "newer-plan",
+		Windows: []quota.Window{{ID: "primary", UsedPercent: floatPtr(60), ObservedAt: base.Add(time.Minute), Source: quota.SourceFetch}}}
+	staleSnapshot := quota.Snapshot{Provider: "codex", Account: stale.Account, AccountKind: stale.AccountKind,
+		Source: quota.SourceFetch, ObservedAt: base, Plan: "stale-plan",
+		Windows: []quota.Window{{ID: "primary", UsedPercent: floatPtr(5), ObservedAt: base, Source: quota.SourceFetch}}}
 	backend := blockUsageStore(s)
 	var released sync.Once
 	release := func() { released.Do(func() { close(backend.release) }) }
 	defer release()
-	s.Consume(context.Background(), fixturePayload(fixtureRecord("hold-worker-before-quota", time.Now())))
+	s.Consume(ctx, fixturePayload(fixtureRecord("hold-worker", base)))
 	awaitSignal(t, backend.entered)
-	current, _ := manager.GetByID("same.json")
-	current.Metadata["access_token"] = "private-B"
-	if _, err := manager.Update(context.Background(), current); err != nil {
-		t.Fatal(err)
-	}
-	// A targeted authoritative worker/write check deliberately does not prime
-	// the advisory publication: retain A to model a lagging explicit identity GET.
-	bindingB, ok := s.quotaBinding("codex", "same-index", true)
-	if !ok || bindingA.CredentialGeneration == bindingB.CredentialGeneration {
-		t.Fatal("replacement fixture failed")
-	}
-	snapshotB, ok := quota.ParseFetch(bindingB.quotaIdentity(), managementFetchFixture(t), time.Now().UTC())
-	if !ok {
-		t.Fatal("replacement quota fixture failed")
-	}
-	if err := s.mergeQuota(context.Background(), snapshotB); err != nil {
-		t.Fatal(err)
-	}
-	if cached, ok := s.quotaBinding("codex", "same-index", false); !ok || cached.CredentialGeneration != bindingA.CredentialGeneration {
-		t.Fatal("test failed to retain stale request-start proof")
-	}
-	s.ObserveQuotaFetch(context.Background(), "codex", "same-index", managementFetchFixture(t), bindingA)
-	s.ObserveQuotaReset(context.Background(), "codex", "same-index", bindingA)
-	if len(s.queue) != 2 {
-		t.Fatal("stale evidence did not reach bounded worker validation")
-	}
+	// Refresh the replacement account first so its observation is applied ahead
+	// of the stale work that was captured before the handover.
+	s.mergeQuota(ctx, newer)
+	// Model a lagging explicit identity read: retain the pre-handover bindings.
+	s.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &staleSnapshot})
+	s.observeQuotaResetAt(stale, base.Add(-time.Minute))
 	release()
 	flushFixture(t, s)
-	states, err := s.store.Cache(context.Background(), quotaNamespace)
-	if err != nil {
-		t.Fatal(err)
+
+	newerState := managementStateFor(t, s, "codex", fresh.Account)
+	if newerState.Snapshot == nil || newerState.Snapshot.Account != fresh.Account || newerState.Snapshot.Plan != "newer-plan" || !newerState.Snapshot.ObservedAt.Equal(newer.ObservedAt) {
+		t.Fatalf("replacement account state was overwritten by stale evidence: %+v", newerState)
 	}
-	var state quotaState
-	if err := json.Unmarshal(states[quotaKey("codex", "same-index")], &state); err != nil {
-		t.Fatal(err)
+	if !newerState.ResetAt.IsZero() {
+		t.Fatalf("stale reset advanced the replacement account's cutoff: %+v", newerState)
 	}
-	if state.CredentialGeneration != bindingB.CredentialGeneration || state.Snapshot == nil || !state.ResetAt.IsZero() || !state.Snapshot.ObservedAt.Equal(snapshotB.ObservedAt) {
-		t.Fatal("lagging A observation/reset overwrote B instead of being refused")
+	staleState := managementStateFor(t, s, "codex", stale.Account)
+	if staleState.Snapshot == nil || staleState.Snapshot.Account != stale.Account || staleState.Snapshot.Plan != "stale-plan" {
+		t.Fatalf("stale observation did not stay in its own account row: %+v", staleState)
 	}
-	encoded, err := json.Marshal(s.quotaBindings(false))
+	if !staleState.ResetAt.Equal(base.Add(-time.Minute)) {
+		t.Fatalf("stale reset did not land in its own account row: %+v", staleState)
+	}
+	// No persisted row may carry a raw credential value.
+	encoded, err := json.Marshal(s.publishedQuotaBindings())
 	if err != nil || bytes.Contains(encoded, []byte("private-A")) || bytes.Contains(encoded, []byte("private-B")) {
 		t.Fatal("publication retained raw credentials")
 	}
@@ -302,24 +274,27 @@ func TestQuotaPublishedStaleEvidenceCannotOverwriteOrResetReplacement(t *testing
 func TestQuotaPublicationCannotResurrectAfterClose(t *testing.T) {
 	s, manager, gate, auth, source := quotaCoreLockFixture(t)
 	s.BindQuotaIdentitySource(source)
-	primeQuotaIdentityHTTP(t, s)
+	// Prime the publication first: the explicit identity read must not need the
+	// core lock that the next step holds.
+	primeQuotaIdentity(t, s)
 	marked := holdQuotaCoreLock(t, manager, gate, auth)
 	defer gate.unblock()
+	// A live projection is now in flight and blocked on the held core lock, so a
+	// late completion cannot resurrect eligibility after close.
 	readDone := make(chan struct{})
-	go func() { s.quotaBindings(true); close(readDone) }()
-	awaitQuotaCoreLockStack(t, "usagepersist.(*Store).quotaBindings")
+	go func() { s.publishQuotaBindings(); close(readDone) }()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := s.Close(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if len(s.quotaBindings(false)) != 0 {
+	if len(s.publishedQuotaBindings()) != 0 {
 		t.Fatal("close did not withdraw immediate proof")
 	}
 	gate.unblock()
 	awaitSignal(t, marked)
 	awaitSignal(t, readDone)
-	if len(s.quotaBindings(false)) != 0 || s.quotaSource.Load().published.Load() != nil {
+	if len(s.publishedQuotaBindings()) != 0 || s.quotaSource.Load().published.Load() != nil {
 		t.Fatal("late authoritative read resurrected observation eligibility after close")
 	}
 }

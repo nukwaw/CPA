@@ -12,30 +12,31 @@ const (
 	maxText       = 256
 )
 
-// Identity identifies a credential without retaining its tokens or auth metadata.
+// Identity carries the account facts of a credential without retaining its
+// tokens or auth metadata. Account is the credential's account property
+// (email or device_id) and may be empty when the credential has none;
+// AccountKind names the property the value came from.
 type Identity struct {
-	Provider             string `json:"provider"`
-	AuthIndex            string `json:"auth_index"`
-	CredentialGeneration string `json:"credential_generation"`
-	Revision             string `json:"-"`
+	Provider    string `json:"provider"`
+	Account     string `json:"account"`
+	AccountKind string `json:"account_kind"`
 }
 
 // Snapshot is safe to persist. Missing numeric values stay absent, not zero.
 // Windows carry their own observation times because headers can update only a
 // subset of the windows returned by a management quota refresh.
 type Snapshot struct {
-	Provider             string    `json:"provider"`
-	AuthIndex            string    `json:"auth_index"`
-	CredentialGeneration string    `json:"credential_generation"`
-	Revision             string    `json:"-"`
-	Source               string    `json:"source"`
-	ObservedAt           time.Time `json:"observed_at"`
-	Plan                 string    `json:"plan,omitempty"`
-	TierName             string    `json:"tier_name,omitempty"`
-	TierID               string    `json:"tier_id,omitempty"`
-	Windows              []Window  `json:"windows"`
-	Credits              *Credits  `json:"credits,omitempty"`
-	Summary              []Metric  `json:"summary,omitempty"`
+	Provider    string    `json:"provider"`
+	Account     string    `json:"account"`
+	AccountKind string    `json:"account_kind"`
+	Source      string    `json:"source"`
+	ObservedAt  time.Time `json:"observed_at"`
+	Plan        string    `json:"plan,omitempty"`
+	TierName    string    `json:"tier_name,omitempty"`
+	TierID      string    `json:"tier_id,omitempty"`
+	Windows     []Window  `json:"windows"`
+	Credits     *Credits  `json:"credits,omitempty"`
+	Summary     []Metric  `json:"summary,omitempty"`
 }
 
 // Window represents a measured quota bucket. Percentages are 0..100 units;
@@ -77,10 +78,12 @@ type Credits struct {
 }
 
 // Merge preserves unobserved windows and ignores out-of-order observations for
-// the same window. Callers must serialize read/merge/write for each identity.
+// the same window. Snapshots are merged only when they describe the same
+// account; a different account is a different credential and starts fresh.
+// Callers must serialize read/merge/write for each account.
 // Reset operations should delete the snapshot rather than merge an empty one.
 func Merge(previous, incoming Snapshot) Snapshot {
-	if previous.Provider != incoming.Provider || previous.AuthIndex != incoming.AuthIndex || previous.CredentialGeneration != incoming.CredentialGeneration || previous.ObservedAt.IsZero() {
+	if previous.Provider != incoming.Provider || previous.Account != incoming.Account || previous.ObservedAt.IsZero() {
 		return cloneSnapshot(incoming)
 	}
 	result := cloneSnapshot(previous)

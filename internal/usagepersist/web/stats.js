@@ -16,8 +16,17 @@
     const capacity = status?.local_capacity;
     const capacityReached = !!capacity && (C.number(capacity.rejected_writes) > 0 || C.number(capacity.journal_byte_limit) > 0 && C.number(capacity.journal_bytes) >= C.number(capacity.journal_byte_limit) || C.number(capacity.retained_event_limit) > 0 && C.number(capacity.retained_events) >= C.number(capacity.retained_event_limit));
     if (capacityReached) notices.push(`Warning: local persistence reached a supported capacity boundary (${C.integer(capacity.retained_events)} / ${C.integer(capacity.retained_event_limit)} events; ${C.integer(capacity.journal_bytes)} / ${C.integer(capacity.journal_byte_limit)} journal bytes). Existing history remains readable; records that do not fit are rejected, never silently pruned. Plan a backed-up move to CPA's existing PostgreSQL storage for larger history.`);
-    if (C.number(status?.skipped_quota_headers) > 0) notices.push(`${C.integer(status.skipped_quota_headers)} quota-header observations were not attributed because credential/account continuity could not be proven. Usage accounting is independent; verified manual quota refreshes remain available.`);
     return {text: notices.join('\n\n'), error: failed || dropped || unavailable || capacityReached};
+  }
+  // A management handler usually explains its own failure. Prefer that explanation
+  // (for example "no quota provider available for credential") to a bare status.
+  async function serverError(response) {
+    try {
+      const body = await response.json();
+      const detail = typeof body?.error === 'string' ? body.error.trim() : typeof body?.message === 'string' ? body.message.trim() : '';
+      if (detail && detail.length <= 300) return detail;
+    } catch { /* Non-JSON error bodies fall back to the status text. */ }
+    return httpErrorMessage(response.status);
   }
   function httpErrorMessage(status) {
     return status === 503 ? unavailableNotice : status === 404 ? 'Statistics API is unavailable. Check the server version and management route; usage collection uses the existing usage-statistics-enabled setting.' : status === 429 ? 'Too many requests. Wait a moment, then retry.' : `The server could not complete this request (HTTP ${status}). Try again or inspect the server logs.`;
@@ -26,7 +35,7 @@
   const $ = id => document.getElementById(id);
   const sessionKey = 'cpa-stats-management-key';
   const apiBase = new URL('./v0/management/stats/', location.href);
-  const state = {key: '', tab: 'overview', chart: 'requests', paused: false, offset: 0, limit: 50, total: 0, data: null, prices: [], connected: false, stopped: false, busy: false, epoch: 0, requests: new Set(), timer: 0, failures: 0};
+  const state = {key: '', tab: 'overview', chart: 'requests', paused: false, offset: 0, limit: 50, total: 0, data: null, prices: [], quota: null, credentials: [], dialog: null, dialogPaused: false, dialogTimer: 0, connected: false, stopped: false, busy: false, epoch: 0, requests: new Set(), timer: 0, failures: 0};
   const storage = {get(store, key) {try {return store.getItem(key);} catch {return null;}}, set(store, key, value) {try {if (value == null) store.removeItem(key); else store.setItem(key, value);} catch { /* Storage is optional. */ }}};
   state.key = storage.get(sessionStorage, sessionKey) || '';
   $('remember-key').checked = Boolean(state.key);
@@ -36,7 +45,7 @@
   function message(id, text, error = false) {const target = $(id); target.textContent = text; target.hidden = !text; target.classList.toggle('error', error);}
   function connection(text, status = 'ready') {$('connection').dataset.status = status; $('connection').lastElementChild.textContent = text;}
   function invalidate() {state.epoch++; for (const controller of state.requests) controller.abort(); state.requests.clear(); state.busy = false; clearTimeout(state.timer);}
-  function clearData() {state.data = null; state.prices = []; state.total = 0; state.offset = 0; message('persistence-warning', ''); renderSummary(null); renderOverview({}); renderAnalysis({}); renderEvents({events: [], total: 0}); renderPrices(); $('updated').textContent = 'No authenticated snapshot';}
+  function clearData() {state.data = null; state.prices = []; state.quota = null; state.credentials = []; state.total = 0; state.offset = 0; message('persistence-warning', ''); closeQuotaDialog(); renderTotals(null); renderOverview({}); renderTables({}); renderEvents({events: [], total: 0}); renderQuota(); renderPrices(); $('updated').textContent = 'No authenticated snapshot';}
   function authRequired() {state.connected = false; state.stopped = true; state.key = ''; storage.set(sessionStorage, sessionKey, null); invalidate(); clearData(); $('refresh').disabled = false; connection('Authentication required', 'error'); message('banner', 'Connect with a valid management key to view statistics.', true); openAuth();}
   async function api(path, options = {}) {
     const controller = new AbortController(); state.requests.add(controller);
@@ -45,9 +54,11 @@
     if (options.body !== undefined) headers.set('Content-Type', 'application/json');
     let response;
     try {
-      response = await fetch(new URL(path, apiBase), {method: options.method || 'GET', headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer', signal: controller.signal, ...(options.body !== undefined ? {body: JSON.stringify(options.body)} : {})});
+      // `root` addresses an existing management endpoint outside the statistics
+      // group, e.g. the original credential quota refresh. Same origin, same key.
+      response = await fetch(options.root ? new URL(path, location.href) : new URL(path, apiBase), {method: options.method || 'GET', headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer', signal: controller.signal, ...(options.body !== undefined ? {body: JSON.stringify(options.body)} : {})});
       if (response.status === 401 || response.status === 403) {authRequired(); throw new Error('Management authentication failed. Check your key and remote-management permissions.');}
-      if (!response.ok) throw new Error(httpErrorMessage(response.status));
+      if (!response.ok) throw new Error(await serverError(response));
       if (response.status === 204) return {};
       const type = response.headers.get('content-type') || '';
       if (!type.includes('json')) throw new Error('The server returned an unexpected response. Check the proxy route and server version.');
@@ -61,21 +72,16 @@
       throw error;
     } finally {state.requests.delete(controller);}
   }
-  function filters() {return {range: $('range').value, from: $('from').value, to: $('to').value, model: $('model').value, provider: $('provider').value, auth_index: $('auth-index').value, key_id: $('key-id').value, status: $('status').value};}
+  function filters() {return {range: $('range').value, from: $('from').value, to: $('to').value, model: $('model').value, provider: $('provider').value, status: $('status').value};}
   function empty(target, title, description) {target.replaceChildren(); const box = node('div', null, 'empty'); box.append(node('strong', title), node('span', description)); target.append(box);}
   function emptyTable(id, columns, description) {const row = node('tr'); const cell = node('td', description, 'empty'); cell.colSpan = columns; row.append(cell); $(id).replaceChildren(row);}
-  function renderSummary(summary) {
+  // The summary is one compact line inside the overview tab; the request stream
+  // keeps its own space and no longer shares a header statistics strip.
+  function renderTotals(summary) {
     const s = summary;
-    $('metric-requests').textContent = s ? C.compact(s.requests) : '—';
-    $('metric-results').textContent = s ? `${C.integer(s.successes)} successful · ${C.integer(s.failures)} failed` : 'No snapshot yet';
-    $('metric-tokens').textContent = s ? C.compact(s.total_tokens) : '—';
-    $('metric-token-detail').textContent = s ? `${C.compact(s.input_tokens)} input · ${C.compact(s.output_tokens)} output` : 'Input + output + reported extras';
-    $('metric-success').textContent = s ? C.percent(s.successes, s.requests) : '—';
-    $('metric-cost').textContent = s && C.number(s.priced_requests) ? C.money(s.cost_usd) : '—';
-    $('metric-priced').textContent = s ? `${C.integer(s.priced_requests)} priced · ${C.integer(s.unpriced_requests)} unpriced` : 'Pricing coverage unavailable';
-    $('metric-latency').textContent = s && C.number(s.requests) ? C.duration(s.average_latency_ms) : '—';
-    $('metric-cache').textContent = s ? C.compact(s.cache_read_tokens) : '—';
-    $('metric-cache-detail').textContent = s ? `${C.compact(s.cache_write_tokens)} cache write · ${C.compact(s.reasoning_tokens)} reasoning` : 'Reported by upstream providers';
+    if (!s) { $('overview-totals').textContent = 'Waiting for your first snapshot'; return; }
+    const cost = C.number(s.priced_requests) ? C.money(s.cost_usd) : 'unpriced';
+    $('overview-totals').textContent = `${C.integer(s.requests)} requests · ${C.percent(s.successes, s.requests)} success · ${C.compact(s.total_tokens)} tokens (${C.compact(s.input_tokens)} in / ${C.compact(s.output_tokens)} out) · ${cost} · ${C.compact(s.cache_read_tokens)} cache read · avg ${s.requests ? C.duration(s.average_latency_ms) : '—'}${C.number(s.unpriced_requests) ? ` · ${C.integer(s.unpriced_requests)} unpriced` : ''}`;
   }
   function renderChart(data) {
     const target = $('traffic-chart'), rows = C.arrays(data, 'series');
@@ -110,7 +116,7 @@
   function renderOverview(data) {renderChart(data); shareList('provider-mix', C.arrays(data, 'providers'), 6); shareList('model-leaders', C.arrays(data, 'models'), 5); renderComposition(data.summary);}
   function cells(row, values) {for (const value of values) {const cell = node('td'); if (value instanceof Node) cell.append(value); else cell.textContent = String(value ?? '—'); row.append(cell);}}
   function cost(row) {return C.number(row.priced_requests) ? `${C.money(row.cost_usd)}${C.number(row.unpriced_requests) ? ' *' : ''}` : 'Unpriced';}
-  function renderAnalysis(data) {
+  function renderTables(data) {
     const models = C.arrays(data, 'models').sort((a, b) => C.number(b.requests) - C.number(a.requests));
     $('models-table').replaceChildren();
     if (!models.length) emptyTable('models-table', 9, 'No model usage matches these filters.');
@@ -120,16 +126,233 @@
     if (!providers.length) emptyTable('providers-table', 6, 'No provider usage matches these filters.');
     for (const provider of providers) {const row = node('tr'); cells(row, [provider.name, C.integer(provider.requests), C.integer(provider.failures), C.compact(provider.total_tokens), C.duration(provider.average_latency_ms), cost(provider)]); $('providers-table').append(row);}
   }
+  // The result cell carries the sanitized provider message on hover; the model cell
+  // flags a response model that differs from the requested one.
+  function resultBadge(event) {
+    const label = event.failed ? `Failed${event.status_code ? ` · ${event.status_code}` : ''}` : 'Success';
+    const badge = node('span', label, `badge${event.failed ? ' error' : ''}`);
+    if (event.error_text) { badge.title = event.error_text; badge.classList.add('has-detail'); badge.tabIndex = 0; badge.setAttribute('aria-label', `${label}. ${event.error_text}`); }
+    return badge;
+  }
+  function modelCell(event) {
+    const cell = node('div', null, 'model-cell');
+    const model = node('span', event.model || 'Unknown');
+    model.append(node('small', `${event.provider || 'Unknown'}${event.stream ? ' · stream' : ''}`));
+    cell.append(model);
+    if (C.responseModelMismatch(event)) {
+      const warning = node('span', `Resp: ${event.response_model}`, 'badge warn');
+      warning.title = `The upstream response reported ${event.response_model} while ${event.model} was requested. Model aliases and provider routing can explain this.`;
+      cell.append(warning);
+    }
+    return cell;
+  }
+  function tierCell(event) {
+    const requested = String(event.service_tier || '').trim(), actual = String(event.response_service_tier || '').trim();
+    if (!requested && !actual) return '—';
+    const tier = actual || requested;
+    const cell = node('div', null, 'tier-cell');
+    const badge = node('span', tier, `badge${actual && requested && actual !== requested ? ' warn' : ' neutral'}`);
+    if (actual && requested && actual !== requested) badge.title = `Requested ${requested}, upstream reported ${actual}.`;
+    cell.append(badge);
+    if (actual && requested && actual !== requested) cell.append(node('small', `req. ${requested}`));
+    return cell;
+  }
+  function cacheRateCell(event) {
+    const text = C.cacheRateText(event.cache_read_tokens, event.input_tokens);
+    const cell = node('div', null, 'cache-cell');
+    cell.append(node('span', text));
+    cell.append(node('small', `${C.compact(event.cache_read_tokens)} read / ${C.compact(event.input_tokens)} in`));
+    return cell;
+  }
   function renderEvents(data) {
     const events = C.arrays(data, 'events'); state.total = C.number(data.total); $('events-table').replaceChildren();
-    if (!events.length) emptyTable('events-table', 8, 'No completed requests match these filters. Live updates will appear automatically.');
-    for (const event of events) {const row = node('tr'), model = node('span', event.model || 'Unknown'); model.append(node('small', `${event.provider || 'Unknown'}${event.stream ? ' · stream' : ''}`)); const badge = node('span', event.failed ? `Failed${event.status_code ? ` · ${event.status_code}` : ''}` : 'Success', `badge${event.failed ? ' error' : ''}`); cells(row, [C.date(event.requested_at), model, badge, C.compact(event.total_tokens), C.duration(event.latency_ms), event.ttft_ms > 0 ? C.duration(event.ttft_ms) : '—', event.priced ? C.money(event.cost_usd) : 'Unpriced', event.auth_index || '—']); $('events-table').append(row);}
+    if (!events.length) emptyTable('events-table', 10, 'No completed requests match these filters. Live updates will appear automatically.');
+    for (const event of events) {const row = node('tr'); if (C.responseModelMismatch(event)) row.classList.add('mismatch-row'); cells(row, [C.date(event.requested_at), modelCell(event), resultBadge(event), tierCell(event), C.compact(event.total_tokens), C.speedText(event.output_tokens, event.latency_ms), cacheRateCell(event), C.duration(event.latency_ms), event.ttft_ms > 0 ? C.duration(event.ttft_ms) : '—', event.priced ? C.money(event.cost_usd) : 'Unpriced']); $('events-table').append(row);}
     $('events-count').textContent = events.length ? `${C.integer(state.offset + 1)}–${C.integer(state.offset + events.length)} of ${C.integer(state.total)} requests${state.offset ? ' · older-page updates paused' : ''}` : '0 requests';
     $('events-prev').disabled = state.offset === 0; $('events-next').disabled = state.offset + state.limit >= state.total;
   }
-  function schedule() {clearTimeout(state.timer); if (!state.stopped) state.timer = setTimeout(() => {if (!document.hidden && navigator.onLine !== false && !(state.tab === 'realtime' && (state.paused || state.offset > 0))) void refresh(false); else schedule();}, Math.min(60000, (state.tab === 'realtime' ? 5000 : 15000) * Math.pow(2, Math.min(3, state.failures))));}
+  // Saved provider state is provider-specific. The pure shaping helpers live in
+  // stats-core.js; this view only turns their output into DOM.
+  function renderQuota() {
+    const grid = $('quota-grid'); grid.replaceChildren();
+    const credentials = state.credentials;
+    if (!credentials.length) {empty(grid, 'No provider quota state yet', 'Quota appears after a manual refresh, a verified provider response, or an automatic header observation. Open Management › Quota to refresh a credential.'); return;}
+    for (const credential of credentials) {
+      const card = node('article', null, 'card quota-card');
+      const heading = node('div', null, 'card-heading');
+      const title = node('div');
+      title.append(node('h2', C.credentialName(credential)));
+      title.append(node('p', C.describeCredential(credential)));      heading.append(title);
+      if (credential.indices.length) {const refresh = node('button', 'Refresh', 'text-button'); refresh.type = 'button'; refresh.setAttribute('aria-label', `Refresh ${C.credentialName(credential)} from the provider`); refresh.addEventListener('click', () => void refreshFromProvider(credential, refresh)); heading.append(refresh);}
+      if (credential.lines.length) {const open = node('button', 'Window history →', 'text-button'); open.type = 'button'; open.setAttribute('aria-label', `Open window history for ${C.credentialName(credential)}`); open.addEventListener('click', () => openQuotaDialog(credential)); heading.append(open);}
+      card.append(heading);
+      const lines = node('div', null, 'quota-lines');
+      if (!credential.lines.length) {lines.append(node('p', credential.state ? 'Saved state has no readable window values.' : 'No saved windows yet. Refresh this credential in Management › Quota to populate it; verified provider responses and header observations fill it automatically.', 'muted'));}
+      for (const line of credential.lines) {
+        const wrapper = node('div', null, 'quota-line');
+        const head = node('div', null, 'quota-line-head');
+        head.append(node('span', line.label), node('strong', line.percent == null ? '—' : `${line.percent.toFixed(0)}%`));
+        const track = node('div', null, 'quota-track'), fill = node('i');
+        fill.style.width = `${line.percent == null ? 0 : line.percent}%`;
+        fill.classList.toggle('high', line.percent != null && line.percent >= 80);
+        fill.classList.toggle('medium', line.percent != null && line.percent >= 50 && line.percent < 80);
+        track.append(fill);
+        wrapper.append(head, track);
+        if (line.hint) wrapper.append(node('small', line.hint));
+        lines.append(wrapper);
+      }
+      card.append(lines);
+      grid.append(card);
+    }
+  }
+  // Ask the original credential-quota handler to refresh one card's credentials from
+  // the provider. This add-on performs no provider traffic itself: the existing
+  // handler owns that call, and the passive middleware records the response under
+  // the (provider, account) facts. A card can hold several credentials, and one may
+  // legitimately fail (no quota plugin covers it), so every attempt is reported
+  // without discarding the ones that succeeded.
+  async function refreshFromProvider(credentials, button) {
+    const targets = (Array.isArray(credentials) ? credentials : [credentials]).filter(credential => credential && credential.indices.length);
+    if (!targets.length) {message('quota-message', 'No credential here can be refreshed: the add-on publishes no live credential for this group.', true); return;}
+    if (button) button.disabled = true;
+    message('quota-message', `Refreshing ${targets.length === 1 ? C.credentialName(targets[0]) : `${targets.length} credentials`} from the provider…`);
+    const failures = [];
+    let requested = 0;
+    try {
+      for (const credential of targets) {
+        for (const index of credential.indices) {
+          try {
+            await api('./v0/management/quota/fetch', {root: true, method: 'POST', body: {auth_index: index}});
+            requested++;
+          } catch (error) {
+            if (error.name === 'AbortError') return;
+            failures.push(`${C.credentialName(credential)}: ${error.message}`);
+          }
+        }
+      }
+      // The observation is recorded by an isolated worker after the handler returns,
+      // so give it a moment before re-reading the saved state it just produced.
+      if (requested) await new Promise(resolve => setTimeout(resolve, 900));
+      await refresh(false);
+      if (failures.length) message('quota-message', `Some credentials could not be refreshed — ${failures.join(' · ')}`, true);
+      else if (requested) message('quota-message', `Requested a provider refresh for ${requested} credential${requested === 1 ? '' : 's'}. Refreshed values appear as they are recorded.`);
+      else message('quota-message', 'The provider refresh could not be requested.', true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function loadQuota(epoch) {
+    try {
+      const [cache, snapshots, identities] = await Promise.all([api('quota/cache'), api('quota'), api('quota/identities')]);
+      if (epoch !== state.epoch) return;
+      state.quota = {entries: C.arrays(cache, 'entries'), snapshots: C.arrays(snapshots, 'snapshots')};
+      state.credentials = C.summarizeCredentials(state.quota.entries, state.quota.snapshots, C.arrays(identities, 'bindings'));
+      // Display state and normalized snapshots use different window ids. History is
+      // recorded under the normalized id, so the side window prefers those.
+      for (const credential of state.credentials) {
+        const snapshot = state.quota.snapshots.find(item => item.provider === credential.provider && String(item.account || '') === credential.account);
+        credential.windows = C.arrays(snapshot, 'windows').filter(window => window && window.id).map(window => ({id: String(window.id), label: String(window.label || window.id)}));
+      }
+      renderQuota();
+      message('quota-message', '');
+    } catch (error) {
+      if (error.name === 'AbortError' || epoch !== state.epoch) return;
+      state.credentials = [];
+      renderQuota();
+      message('quota-message', `${error.message} Saved quota state needs a reachable statistics API and a management route that is not write-blocked.`, true);
+    }
+  }
+  function renderQuotaHistory(summary) {
+    const target = $('quota-history'), points = C.arrays(summary, 'observations');
+    const note = $('quota-history-note');
+    if (!points.length) {note.textContent = summary?.window ? `No history recorded for ${summary.window}` : 'Recorded observations of this window'; empty(target, 'No recorded observations', 'History starts with the first verified quota observation and is capped per credential; nothing is backfilled.'); return;}
+    note.textContent = `${summary.window || 'window'} · ${C.integer(points.length)} observations · ${C.date(points[0].observed_at)} → ${C.date(points.at(-1).observed_at)}`;
+    const width = 520, height = 160, values = points.map(point => ({time: Date.parse(point.observed_at), percent: C.number(point.used_percent)}));
+    const first = values[0].time, span = (values.at(-1).time - first) || 1, svgNS = 'http://www.w3.org/2000/svg';
+    function shape(tag, attrs, text) {const element = document.createElementNS(svgNS, tag); for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, String(value)); if (text != null) element.textContent = text; return element;}
+    const svg = shape('svg', {viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': 'Recorded used percentage of the selected quota window'});
+    svg.append(shape('title', {}, 'Window history'), shape('desc', {}, 'Each point is one recorded observation of how much of the window was used.'));
+    for (let i = 0; i <= 2; i++) {const y = 12 + (height - 34) * i / 2; svg.append(shape('line', {x1: 34, x2: width - 8, y1: y, y2: y, class: 'chart-grid'}), shape('text', {x: 28, y: y + 4, 'text-anchor': 'end', class: 'chart-axis'}, `${100 - i * 50}%`));}
+    const x = point => 34 + (point.time - first) / span * (width - 42), y = point => height - 22 - Math.min(100, point.percent) / 100 * (height - 34);
+    svg.append(shape('path', {d: values.map((point, i) => `${i ? 'L' : 'M'}${x(point).toFixed(2)} ${y(point).toFixed(2)}`).join(' '), class: 'chart-line'}));
+    for (const point of values) {const dot = shape('circle', {cx: x(point), cy: y(point), r: values.length > 120 ? 1.5 : 3, class: 'chart-point'}); dot.append(shape('title', {}, `${C.date(point.time)} · ${point.percent.toFixed(1)}% used`)); svg.append(dot);}
+    target.replaceChildren(svg, node('small', `Oldest ${C.date(values[0].time)} · newest ${C.date(values.at(-1).time)} · local time`));
+  }
+  function renderQuotaValue(summary) {
+    const target = $('quota-value'), usage = summary?.usage || {}, estimate = summary?.estimate || null;
+    const rows = [
+      ['Recorded requests', C.integer(usage.requests)],
+      ['Tokens', `${C.compact(usage.total_tokens)} (${C.compact(usage.input_tokens)} in / ${C.compact(usage.output_tokens)} out)`],
+      ['Estimated spend', C.number(usage.priced_requests) ? `${C.money(usage.cost_usd)}${C.number(usage.unpriced_requests) ? ` · ${C.integer(usage.unpriced_requests)} unpriced` : ''}` : 'Unpriced'],
+      ['Window used', estimate ? `${C.number(estimate.used_percent).toFixed(1)}%${summary?.window ? ` of ${summary.window}` : ''} at the latest observation` : '—'],
+      ['Full-window estimate', estimate && C.number(estimate.full_usd) ? C.money(estimate.full_usd) : 'Not derivable'],
+      ['Estimated unused', estimate && C.number(estimate.unused_usd) ? C.money(estimate.unused_usd) : 'Not derivable'],
+    ];
+    const list = node('div', null, 'quota-value-list');
+    for (const [label, value] of rows) {const row = node('div', null, 'quota-value-row'); row.append(node('span', label), node('strong', value)); list.append(row);}
+    target.replaceChildren(list, node('small', 'The estimate applies your stored rates to the requests attributed to this credential inside the selected range, then scales that spend to a fully used window. It is not a provider invoice and is unavailable while spend or window usage is unknown.', 'muted'));
+  }
+  function renderQuotaRequests(page) {
+    const events = C.arrays(page, 'events'), table = $('quota-requests');
+    table.replaceChildren();
+    if (!events.length) emptyTable('quota-requests', 8, 'No requests from this credential in the selected range.');
+    for (const event of events) {const row = node('tr'); if (C.responseModelMismatch(event)) row.classList.add('mismatch-row'); cells(row, [C.date(event.requested_at), modelCell(event), resultBadge(event), tierCell(event), C.compact(event.total_tokens), C.speedText(event.output_tokens, event.latency_ms), C.duration(event.latency_ms), event.priced ? C.money(event.cost_usd) : 'Unpriced']); table.append(row);}
+    $('quota-requests-count').textContent = events.length ? `${C.integer(events.length)} of ${C.integer(C.number(page.total) || events.length)} requests in range · newest first${state.dialogPaused ? ' · updates paused' : ' · refreshes every 5 seconds'}` : 'No requests in range';
+  }
+  async function refreshQuotaDialog(force = true) {
+    const credential = state.dialog;
+    if (!credential) return;
+    const epoch = state.epoch, window = $('quota-window').value;
+    const range = C.rangeWindow($('quota-range').value);
+    // The credential-scoped stream is filtered by the recorded facts: the events API
+    // no longer accepts a credential index, only `provider` and `account`.
+    const params = new URLSearchParams({provider: credential.provider, from: range.from, to: range.to});
+    if (credential.account) params.set('account', credential.account);
+    if (window) params.set('window', window);
+    try {
+      const [summary, page] = await Promise.all([api(`quota/summary?${params}`), api(`events?${params}&limit=25`)]);
+      if (epoch !== state.epoch || state.dialog !== credential) return;
+      renderQuotaHistory(summary);
+      renderQuotaValue(summary);
+      renderQuotaRequests(page);
+      message('quota-dialog-message', '');
+      message('quota-requests-error', '');
+    } catch (error) {
+      if (error.name === 'AbortError' || epoch !== state.epoch) return;
+      message('quota-dialog-message', error.message, true);
+    } finally {
+      if (epoch === state.epoch && state.dialog === credential) scheduleQuotaDialog(force);
+    }
+  }
+  function scheduleQuotaDialog(force = false) {clearTimeout(state.dialogTimer); if (!state.dialog || state.dialogPaused || state.stopped) return; state.dialogTimer = setTimeout(() => {if (!document.hidden && navigator.onLine !== false) void refreshQuotaDialog(); else scheduleQuotaDialog();}, 5000);}
+  function openQuotaDialog(credential) {
+    state.dialog = credential; state.dialogPaused = false;
+    $('quota-pause').setAttribute('aria-pressed', 'false'); $('quota-pause').textContent = 'Pause stream';
+    $('quota-dialog-title').textContent = C.credentialName(credential);
+    $('quota-dialog-subtitle').textContent = C.describeCredential(credential).replace('observed', 'last saved');
+    const select = $('quota-window'), previous = select.value;
+    select.replaceChildren();
+    // Automatic selection is the default because the recorded window ids come from the
+    // normalized provider snapshot, which need not match the display-state ids.
+    const options = [['', 'Automatic · most recorded']];
+    const seen = new Set();
+    for (const window of [...(credential.windows || []), ...credential.lines.map(line => ({id: line.id, label: line.label}))]) {
+      if (!window.id || seen.has(window.id)) continue;
+      seen.add(window.id);
+      options.push([window.id, window.label || window.id]);
+    }
+    for (const [value, label] of options) select.add(new Option(label, value));
+    if (options.some(([value]) => value === previous)) select.value = previous;
+    renderQuotaHistory(null); renderQuotaValue(null); renderQuotaRequests({events: [], total: 0});
+    message('quota-dialog-message', '');
+    if (!$('quota-dialog').open) $('quota-dialog').showModal();
+    void refreshQuotaDialog();
+  }
+  function closeQuotaDialog() {state.dialog = null; clearTimeout(state.dialogTimer); if ($('quota-dialog').open) $('quota-dialog').close();}
+  function schedule() {clearTimeout(state.timer); if (!state.stopped) state.timer = setTimeout(() => {const live = state.tab === 'requests' && !state.paused && state.offset === 0; const quota = state.tab === 'quota'; if (!document.hidden && navigator.onLine !== false && (live || quota || (state.tab !== 'requests' && state.tab !== 'quota'))) void refresh(false); else schedule();}, Math.min(60000, (state.tab === 'requests' ? 5000 : state.tab === 'quota' ? 15000 : 15000) * Math.pow(2, Math.min(3, state.failures))));}
   async function loadFilters(epoch) {
-    try {const params = C.query(filters()); for (const key of ['model', 'provider', 'auth_index', 'key_id', 'status', 'bucket']) params.delete(key); const result = await api(`filters?${params}`); if (epoch !== state.epoch) return; for (const [id, key, label] of [['model', 'models', 'All models'], ['provider', 'providers', 'All providers'], ['auth-index', 'auth_indexes', 'All credentials'], ['key-id', 'key_ids', 'All key IDs']]) {const select = $(id), selected = select.value; const values = [...new Set((Array.isArray(result[key]) ? result[key] : []).map(String))].sort(); select.replaceChildren(new Option(label, '')); if (selected && !values.includes(selected)) values.unshift(selected); for (const value of values) select.add(new Option(value, value)); select.value = selected;}} catch (error) {if (error.name !== 'AbortError' && epoch === state.epoch && state.connected) message('banner', 'Statistics loaded, but filter options could not refresh. Your current filters are retained.', true);}
+    try {const params = C.query(filters()); for (const key of ['model', 'provider', 'account', 'key_id', 'status', 'bucket']) params.delete(key); const result = await api(`filters?${params}`); if (epoch !== state.epoch) return; for (const [id, key, label] of [['model', 'models', 'All models'], ['provider', 'providers', 'All providers']]) {const select = $(id), selected = select.value; const values = [...new Set((Array.isArray(result[key]) ? result[key] : []).map(String))].sort(); select.replaceChildren(new Option(label, '')); if (selected && !values.includes(selected)) values.unshift(selected); for (const value of values) select.add(new Option(value, value)); select.value = selected;}} catch (error) {if (error.name !== 'AbortError' && epoch === state.epoch && state.connected) message('banner', 'Statistics loaded, but filter options could not refresh. Your current filters are retained.', true);}
   }
   async function refresh(force = true) {
     if (state.mutating) return;
@@ -140,8 +363,9 @@
     state.busy = true; $('refresh').disabled = true; connection('Refreshing', 'loading');
     try {
       if (tab === 'pricing') {const response = await api('pricing'); if (epoch !== state.epoch) return; state.prices = C.arrays(response, 'prices'); renderPrices();}
-      else {const response = await api(`${tab === 'analysis' ? 'analysis' : 'overview'}?${params}`); if (epoch !== state.epoch) return; state.data = response; renderSummary(response.summary); renderOverview(response); renderAnalysis(response);
-        if (tab === 'realtime') {params.set('limit', state.limit); params.set('offset', state.offset); try {const events = await api(`events?${params}`); if (epoch !== state.epoch) return; renderEvents(events); message('live-error', '');} catch (error) {if (error.name === 'AbortError' || epoch !== state.epoch) return; message('live-error', error.message, true); throw error;}}
+      else if (tab === 'quota') {await loadQuota(epoch); if (epoch !== state.epoch) return;}
+      else {const response = await api(`overview?${params}`); if (epoch !== state.epoch) return; state.data = response; renderTotals(response.summary); renderOverview(response); renderTables(response);
+        if (tab === 'requests') {params.set('limit', state.limit); params.set('offset', state.offset); try {const events = await api(`events?${params}`); if (epoch !== state.epoch) return; renderEvents(events); message('live-error', '');} catch (error) {if (error.name === 'AbortError' || epoch !== state.epoch) return; message('live-error', error.message, true); throw error;}}
       }
       if (epoch !== state.epoch) return;
       const firstConnection = !state.connected; state.connected = true; state.failures = 0; connection('Connected'); $('updated').textContent = `Updated ${new Date().toLocaleTimeString()}`; message('banner', ''); message('auth-error', ''); if ($('auth-dialog').open) $('auth-dialog').close(); $('management-key').value = ''; if (firstConnection || force) void loadFilters(epoch);
@@ -149,12 +373,12 @@
     } catch (error) {if (error.name !== 'AbortError' && epoch === state.epoch) {state.failures++; connection(navigator.onLine === false ? 'Offline' : 'Update failed', 'error'); message('banner', `${error.message}${state.data ? ' Showing the last successful snapshot.' : ''}`, true); if ($('auth-dialog').open) message('auth-error', error.message, true);}}
     finally {if (epoch === state.epoch) {state.busy = false; $('refresh').disabled = false; schedule();}}
   }
-  function selectTab(tab) {if (!['overview', 'analysis', 'realtime', 'pricing'].includes(tab)) return; invalidate(); state.tab = tab; state.offset = 0; for (const button of document.querySelectorAll('[data-tab]')) {if (button.dataset.tab === tab) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');} for (const name of ['overview', 'analysis', 'realtime', 'pricing']) $(`panel-${name}`).hidden = tab !== name; $('statistics-content').hidden = tab === 'pricing'; $('filters').hidden = tab === 'pricing'; history.replaceState(null, '', `#${tab}`); void refresh();}
+  function selectTab(tab) {if (!['overview', 'requests', 'quota', 'pricing'].includes(tab)) return; invalidate(); closeQuotaDialog(); state.tab = tab; state.offset = 0; for (const button of document.querySelectorAll('[data-tab]')) {if (button.dataset.tab === tab) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');} for (const name of ['overview', 'requests', 'quota']) $(`panel-${name}`).hidden = tab !== name; $('panel-pricing').hidden = tab !== 'pricing'; $('statistics-content').hidden = tab === 'pricing'; $('filters').hidden = tab === 'pricing' || tab === 'quota'; history.replaceState(null, '', `#${tab}`); void refresh();}
   function renderPrices() {
     const query = $('price-search').value.trim().toLowerCase(), rows = state.prices.filter(price => String(price.model || '').toLowerCase().includes(query)).sort((a, b) => String(a.model).localeCompare(String(b.model)));
     $('prices-table').replaceChildren(); if (!rows.length) emptyTable('prices-table', 7, query ? 'No rates match your search.' : 'No rates yet. Sync the catalog or add a manual override.');
     for (const price of rows.slice(0, 200)) {const row = node('tr'), badge = node('span', price.manual ? 'Manual override' : price.source || 'Catalog', `badge${price.manual ? '' : ' neutral'}`), actions = node('div', null, 'row-actions'); const edit = node('button', 'Edit', 'text-button'); edit.type = 'button'; edit.addEventListener('click', () => editPrice(price)); actions.append(edit); if (price.manual) {const reset = node('button', 'Remove override', 'text-button'); reset.type = 'button'; reset.addEventListener('click', () => void removePrice(price.model, reset)); actions.append(reset);} cells(row, [price.model, C.money(price.input_per_million), C.money(price.output_per_million), price.cache_read_available === false ? 'Unknown' : C.money(price.cache_read_per_million), price.cache_write_available === false ? 'Unknown' : C.money(price.cache_write_per_million), badge, actions]); $('prices-table').append(row);}
-    $('prices-count').textContent = `${rows.length > 200 ? `Showing first 200 of ${C.integer(rows.length)} matches — narrow your search. ` : `${C.integer(rows.length)} matches. `}${C.integer(state.prices.length)} total model rates · USD per million tokens · * partial pricing coverage in analysis`;
+    $('prices-count').textContent = `${rows.length > 200 ? `Showing first 200 of ${C.integer(rows.length)} matches — narrow your search. ` : `${C.integer(rows.length)} matches. `}${C.integer(state.prices.length)} total model rates · USD per million tokens · * partial pricing coverage in the overview`;
   }
   const priceFields = [['price-model', 'model'], ['price-input', 'input_per_million'], ['price-output', 'output_per_million'], ['price-cache-read', 'cache_read_per_million'], ['price-cache-write', 'cache_write_per_million']];
   function editPrice(price) {for (const [id, key] of priceFields) $(id).value = price[key] ?? ''; $('price-model').focus(); $('price-editor').scrollIntoView({block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'});}
@@ -165,7 +389,6 @@
   $('refresh').addEventListener('click', () => void refresh());
   for (const button of document.querySelectorAll('[data-tab]')) button.addEventListener('click', () => selectTab(button.dataset.tab));
   for (const button of document.querySelectorAll('[data-chart]')) button.addEventListener('click', () => {state.chart = button.dataset.chart; for (const other of document.querySelectorAll('[data-chart]')) other.setAttribute('aria-pressed', String(other === button)); renderChart(state.data || {});});
-  $('see-analysis').addEventListener('click', () => selectTab('analysis'));
   $('filters').addEventListener('submit', event => event.preventDefault());
   $('filters').addEventListener('change', () => {const custom = $('range').value === 'custom'; $('from-label').hidden = !custom; $('to-label').hidden = !custom; state.offset = 0; invalidate(); void refresh();});
   $('reset-filters').addEventListener('click', () => {$('filters').reset(); $('from-label').hidden = true; $('to-label').hidden = true; state.offset = 0; invalidate(); void refresh();});
@@ -182,10 +405,17 @@
   $('export-models').addEventListener('click', () => {const columns = ['name', 'requests', 'successes', 'failures', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'total_tokens', 'average_latency_ms', 'cost_usd', 'priced_requests', 'unpriced_requests']; const lines = [columns, ...C.arrays(state.data, 'models').map(row => columns.map(key => row[key]))]; const blob = new Blob(['\uFEFF', lines.map(row => row.map(C.csvCell).join(',')).join('\r\n')], {type: 'text/csv;charset=utf-8'}), url = URL.createObjectURL(blob), anchor = node('a'); anchor.href = url; anchor.download = 'cpa-model-statistics.csv'; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);});
   let resizeFrame = 0;
   window.addEventListener('resize', () => {cancelAnimationFrame(resizeFrame); resizeFrame = requestAnimationFrame(() => {if (state.tab === 'overview') renderChart(state.data || {});});});
+  $('quota-refresh').addEventListener('click', () => void refresh());
+  $('quota-provider-refresh').addEventListener('click', () => void refreshFromProvider(state.credentials, $('quota-provider-refresh')));
+  $('quota-dialog-close').addEventListener('click', closeQuotaDialog);
+  $('quota-dialog').addEventListener('close', () => {state.dialog = null; clearTimeout(state.dialogTimer);});
+  $('quota-window').addEventListener('change', () => void refreshQuotaDialog());
+  $('quota-range').addEventListener('change', () => void refreshQuotaDialog());
+  $('quota-pause').addEventListener('click', () => {state.dialogPaused = !state.dialogPaused; $('quota-pause').setAttribute('aria-pressed', String(state.dialogPaused)); $('quota-pause').textContent = state.dialogPaused ? 'Resume stream' : 'Pause stream'; if (!state.dialogPaused) void refreshQuotaDialog();});
   window.addEventListener('offline', () => {connection('Offline', 'error'); message('banner', 'You are offline. The last successful snapshot remains visible.', true);});
   window.addEventListener('online', () => {if (!state.stopped) void refresh();});
-  document.addEventListener('visibilitychange', () => {if (!document.hidden && !state.stopped && !(state.tab === 'realtime' && (state.paused || state.offset))) void refresh(false);});
+  document.addEventListener('visibilitychange', () => {if (!document.hidden && !state.stopped && !(state.tab === 'requests' && (state.paused || state.offset))) {void refresh(false); if (state.dialog) void refreshQuotaDialog();}});
   window.addEventListener('pagehide', () => {state.stopped = true; invalidate();});
   window.addEventListener('pageshow', event => {if (event.persisted) {state.stopped = false; void refresh();}});
-  const initialTab = location.hash.slice(1); if (['overview', 'analysis', 'realtime', 'pricing'].includes(initialTab)) selectTab(initialTab); else void refresh();
+  const initialTab = location.hash.slice(1); if (['overview', 'requests', 'quota', 'pricing'].includes(initialTab)) selectTab(initialTab); else void refresh();
 })();

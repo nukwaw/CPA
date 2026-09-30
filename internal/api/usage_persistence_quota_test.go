@@ -54,7 +54,9 @@ func TestUsagePersistenceObservesUnmodifiedQuotaHandlers(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshots, err := store.Quotas(context.Background())
-	if err != nil || len(snapshots) != 1 || snapshots[0].AuthIndex != index || len(snapshots[0].Windows) != 1 || snapshots[0].Windows[0].RemainingPercent == nil || *snapshots[0].Windows[0].RemainingPercent != 75 {
+	// This credential exposes no account property, so it is grouped by provider
+	// alone and still recorded: an empty account fact is valid, not an error.
+	if err != nil || len(snapshots) != 1 || snapshots[0].Provider != "codex" || snapshots[0].Account != "" || snapshots[0].AccountKind != "" || len(snapshots[0].Windows) != 1 || snapshots[0].Windows[0].RemainingPercent == nil || *snapshots[0].Windows[0].RemainingPercent != 75 {
 		t.Fatalf("middleware did not persist original handler output: %#v %v", snapshots, err)
 	}
 	request("reset-quota")

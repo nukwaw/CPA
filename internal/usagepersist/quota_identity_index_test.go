@@ -3,25 +3,32 @@ package usagepersist
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/quota"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
-// Keep the counting tests independent of filesystem throughput. Mutation hooks
-// execute inside the same lock as the update, not before acquiring it.
+func identityIndexEntry(binding QuotaBinding) QuotaCacheEntry {
+	return QuotaCacheEntry{Provider: binding.Provider, Key: binding.Key, Account: binding.Account, AccountKind: binding.AccountKind, ObservedAt: time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC), State: json.RawMessage(`{"status":"success","windows":[]}`)}
+}
+
+// quotaIdentityIndexStore counts cache mutations per namespace without touching
+// the filesystem.
 type quotaIdentityIndexStore struct {
 	store
-	mu     sync.Mutex
-	rows   map[string]json.RawMessage
-	locked func(string)
-	after  func(string)
+	mu      sync.Mutex
+	rows    map[string]json.RawMessage
+	state   atomic.Int64
+	history atomic.Int64
 }
 
 func (backend *quotaIdentityIndexStore) Cache(context.Context, string) (map[string]json.RawMessage, error) {
@@ -34,26 +41,29 @@ func (backend *quotaIdentityIndexStore) Cache(context.Context, string) (map[stri
 	return out, nil
 }
 
-func (backend *quotaIdentityIndexStore) MutateCache(_ context.Context, _, key string, update func(json.RawMessage) (json.RawMessage, error)) error {
+func (backend *quotaIdentityIndexStore) MutateCache(_ context.Context, namespace, key string, update func(json.RawMessage) (json.RawMessage, error)) error {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
-	if backend.locked != nil {
-		backend.locked(key)
-	}
 	raw, err := update(backend.rows[key])
-	if backend.after != nil {
-		backend.after(key)
-	}
 	if err == nil && len(raw) > 0 {
 		backend.rows[key] = append(json.RawMessage(nil), raw...)
+		if namespace == quotaHistoryNamespace {
+			backend.history.Add(1)
+		} else {
+			backend.state.Add(1)
+		}
 	}
 	return err
 }
 
-func identityIndexEntry(binding QuotaBinding) QuotaCacheEntry {
-	return QuotaCacheEntry{Provider: binding.Provider, Key: binding.Key, AuthIndex: binding.AuthIndex, CredentialGeneration: binding.CredentialGeneration, Revision: binding.Revision, ObservedAt: time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC), State: json.RawMessage(`{"status":"success","windows":[]}`)}
+func (backend *quotaIdentityIndexStore) writes() int64 {
+	return backend.state.Load() + backend.history.Load()
 }
 
+// TestQuotaIdentityIndexLinearValidationCounts replaces the deleted generation
+// fence. Identity is now a fact on the binding, so the projection, the encoded
+// account row and the persisted display cache must all name the same account and
+// stay linear in the number of credentials.
 func TestQuotaIdentityIndexLinearValidationCounts(t *testing.T) {
 	for _, count := range []int{1, 32, 1000} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
@@ -68,72 +78,75 @@ func TestQuotaIdentityIndexLinearValidationCounts(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			var validations atomic.Int64
-			var lockedKey string
-			source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager }, func(auth *coreauth.Auth) bool {
-				validations.Add(1)
-				if lockedKey != "" && quotaKey(auth.Provider, auth.Index) != lockedKey {
-					t.Errorf("locked mutation for %s validated unrelated %s", lockedKey, auth.Index)
-				}
-				return true
-			})
+			source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager })
 			s.BindQuotaIdentitySource(source)
+			bindings := s.publishQuotaBindings()
+			if len(bindings) != count {
+				t.Fatalf("projected %d of %d bindings", len(bindings), count)
+			}
+			if backend.writes() != 0 {
+				t.Fatal("projection performed storage writes")
+			}
 			entries := make([]QuotaCacheEntry, 0, count)
-			for _, binding := range source.QuotaBindings(false) {
+			for _, binding := range bindings {
+				if binding.Account == "" || binding.AccountKind != "email" {
+					t.Fatalf("binding lost its account facts: %+v", binding)
+				}
 				entry := identityIndexEntry(binding)
 				entries = append(entries, entry)
-				snapshot := &quota.Snapshot{Provider: binding.Provider, AuthIndex: binding.AuthIndex, CredentialGeneration: binding.CredentialGeneration, ObservedAt: entry.ObservedAt, Windows: []quota.Window{}}
-				raw, err := json.Marshal(quotaState{CredentialGeneration: binding.CredentialGeneration, Snapshot: snapshot})
+				snapshot := &quota.Snapshot{Provider: binding.Provider, Account: binding.Account, AccountKind: binding.AccountKind, ObservedAt: entry.ObservedAt, Windows: []quota.Window{}}
+				raw, err := json.Marshal(quotaState{Snapshot: snapshot})
 				if err != nil {
 					t.Fatal(err)
 				}
-				backend.rows[quotaKey(binding.Provider, binding.AuthIndex)] = raw
+				backend.rows[quotaStoreKey(binding.Provider, binding.Account)] = raw
 			}
-			if len(entries) != count || validations.Load() != 0 {
-				t.Fatal("memory-only snapshot performed validation or lost identities")
-			}
-			var before int64
-			backend.locked = func(key string) { lockedKey, before = key, validations.Load() }
-			backend.after = func(string) {
-				if got := validations.Load() - before; got != 1 {
-					t.Errorf("locked recheck validated %d files, want exactly 1", got)
-				}
-				lockedKey = ""
-			}
+			// One display-cache row per credential, and nothing else.
 			if err := s.SaveQuotaCache(ctx, entries); err != nil {
 				t.Fatal(err)
 			}
-			if got := validations.Swap(0); got != int64(2*count) {
-				t.Fatalf("batch validated %d files, want N snapshot + N locked = %d", got, 2*count)
+			if got := backend.state.Load(); got != int64(count) {
+				t.Fatalf("batch wrote %d state rows, want one per credential = %d", got, count)
 			}
-			if cached, err := s.QuotaCache(ctx); err != nil || len(cached) != count {
+			cached, err := s.QuotaCache(ctx)
+			if err != nil || len(cached) != count {
 				t.Fatalf("cache count = %d, err = %v", len(cached), err)
 			}
-			if got := validations.Swap(0); got != int64(count) {
-				t.Fatalf("cache GET validated %d files, want N = %d", got, count)
+			for _, entry := range cached {
+				if entry.Account == "" || !strings.HasSuffix(entry.Account, "@example.invalid") {
+					t.Fatalf("cached entry lost its account fact: %+v", entry)
+				}
 			}
 			if snapshots, err := s.Quotas(ctx); err != nil || len(snapshots) != count {
 				t.Fatalf("quota count = %d, err = %v", len(snapshots), err)
 			}
-			if got := validations.Swap(0); got != int64(count) {
-				t.Fatalf("quotas GET validated %d files, want N = %d", got, count)
-			}
-			if got := source.QuotaBindings(true); len(got) != count || validations.Swap(0) != int64(count) {
-				t.Fatal("identity GET did not validate exactly once per credential")
-			}
-			// Single-observation writes also validate only the target before and
-			// after acquiring the lock, never all N files.
+			// A single merge writes one account row and one history row, and must
+			// never touch any other account's row.
+			beforeState, beforeHistory := backend.state.Load(), backend.history.Load()
 			entry := entries[0]
-			if err := s.mergeQuota(ctx, quota.Snapshot{Provider: entry.Provider, AuthIndex: entry.AuthIndex, CredentialGeneration: entry.CredentialGeneration, Revision: entry.Revision, ObservedAt: entry.ObservedAt}); err != nil {
+			at := entry.ObservedAt.Add(time.Minute)
+			if err := s.mergeQuota(ctx, quota.Snapshot{Provider: entry.Provider, Account: entry.Account, AccountKind: entry.AccountKind,
+				Source: quota.SourceFetch, ObservedAt: at,
+				Windows: []quota.Window{{ID: "primary", UsedPercent: floatPtr(40), ObservedAt: at, Source: quota.SourceFetch}}}); err != nil {
 				t.Fatal(err)
 			}
-			if got := validations.Swap(0); got != 2 {
-				t.Fatalf("single merge validated %d files, want 2", got)
+			if got := backend.state.Load() - beforeState; got != 1 {
+				t.Fatalf("single merge wrote %d state rows, want 1", got)
+			}
+			if got := backend.history.Load() - beforeHistory; got != 1 {
+				t.Fatalf("single merge wrote %d history rows, want 1", got)
+			}
+			history, err := s.quotaHistory(ctx, entry.Provider, entry.Account)
+			if err != nil || len(history.Observations) != 1 || history.Observations[0].Windows["primary"] != 40 {
+				t.Fatalf("history for the merged account: %+v %v", history, err)
 			}
 		})
 	}
 }
 
+// TestQuotaIdentityIndexAmbiguityIsNotResolvedByInvalidCompetitor keeps the
+// ambiguity rules: a shared transient index or display key must not bind, and
+// removing the competitor must make the remaining credential bindable again.
 func TestQuotaIdentityIndexAmbiguityIsNotResolvedByInvalidCompetitor(t *testing.T) {
 	for _, duplicate := range []string{"index", "key"} {
 		for _, invalid := range []string{"metadata", "disk", "other-provider"} {
@@ -160,211 +173,72 @@ func TestQuotaIdentityIndexAmbiguityIsNotResolvedByInvalidCompetitor(t *testing.
 						t.Fatal(err)
 					}
 				}
-				source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager }, func(auth *coreauth.Auth) bool { return auth.ID != second.ID })
-				for _, disk := range []bool{false, true} {
-					if bindings := source.QuotaBindings(disk); len(bindings) != 0 {
-						t.Fatalf("ambiguous read escaped: %+v", bindings)
-					}
-					if _, ok := source.(TargetedQuotaIdentitySource).QuotaBinding("codex", first.Index, disk); ok {
-						t.Fatal("targeted lookup accepted ambiguity")
-					}
+				source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager })
+				if bindings := source.QuotaBindings(); len(bindings) != 0 {
+					t.Fatalf("ambiguous read escaped: %+v", bindings)
 				}
 				manager.Remove(ctx, second.ID)
-				if bindings := source.QuotaBindings(true); len(bindings) != 1 {
-					t.Fatal("removed ambiguity remained cached")
+				if bindings := source.QuotaBindings(); len(bindings) != 1 {
+					t.Fatalf("removed ambiguity remained: %+v", bindings)
 				}
 			})
 		}
 	}
 }
 
-func TestQuotaIdentityIndexLockedMutationRechecksCurrent(t *testing.T) {
-	// Display-cache writes are bound to durable credential identity. A credential
-	// that returns to the same token, or is removed and re-created from it, keeps its
-	// generation, so only a different credential must refuse the locked mutation.
-	for _, change := range []string{"replacement", "A-B-A", "delete-recreate", "deletion", "duplicate-index", "duplicate-key", "disk-replacement", "manager-replacement"} {
-		t.Run(change, func(t *testing.T) {
-			ctx := context.Background()
-			s := openTestStore(t)
-			manager := coreauth.NewManager(nil, nil, nil)
-			auth := quotaFixtureAuth("codex", "index", "same.json", "A")
-			if _, err := manager.Register(ctx, auth); err != nil {
-				t.Fatal(err)
-			}
-			var active atomic.Pointer[coreauth.Manager]
-			active.Store(manager)
-			var diskValid atomic.Bool
-			diskValid.Store(true)
-			var validations atomic.Int64
-			s.BindQuotaIdentitySource(NewQuotaIdentitySource(active.Load, func(*coreauth.Auth) bool { validations.Add(1); return diskValid.Load() }))
-			entry := identityIndexEntry(fixtureBinding(s, "codex", "index"))
-			validations.Store(0) // Request-start identity acquisition is outside the measured batch.
-			entered, release := make(chan struct{}), make(chan struct{})
-			backend := &quotaIdentityIndexStore{store: s.store, rows: map[string]json.RawMessage{}, locked: func(string) { close(entered); <-release }}
-			s.store = backend
-			done := make(chan error, 1)
-			go func() { done <- s.SaveQuotaCache(ctx, []QuotaCacheEntry{entry}) }()
-			<-entered
-			if got := validations.Load(); got != 1 {
-				t.Errorf("pre-lock batch validations = %d, want 1", got)
-			}
-			update := func(token string) {
-				current, _ := manager.GetByID(auth.ID)
-				current.Metadata["access_token"] = token
-				if _, err := manager.Update(ctx, current); err != nil {
-					t.Error(err)
-				}
-			}
-			sameCredential := false
-			switch change {
-			case "replacement":
-				update("B")
-			case "A-B-A":
-				update("B")
-				update("A")
-				sameCredential = true
-			case "delete-recreate":
-				manager.Remove(ctx, auth.ID)
-				if _, err := manager.Register(ctx, quotaFixtureAuth("codex", "index", "same.json", "A")); err != nil {
-					t.Error(err)
-				}
-				sameCredential = true
-			case "deletion":
-				manager.Remove(ctx, auth.ID)
-			case "duplicate-index", "duplicate-key":
-				duplicate := quotaFixtureAuth("codex", "other-index", "other.json", "B")
-				if change == "duplicate-index" {
-					duplicate.Index = auth.Index
-				} else {
-					duplicate.FileName = auth.FileName
-				}
-				if _, err := manager.Register(ctx, duplicate); err != nil {
-					t.Error(err)
-				}
-			case "disk-replacement":
-				diskValid.Store(false)
-			case "manager-replacement":
-				active.Store(coreauth.NewManager(nil, nil, nil))
-			}
-			close(release)
-			err := <-done
-			if sameCredential {
-				if err != nil {
-					t.Fatalf("same-credential locked mutation refused: %v", err)
-				}
-				if len(backend.rows) != 1 {
-					t.Fatal("same-credential locked mutation persisted no row")
-				}
-				return
-			}
-			if !errors.Is(err, ErrQuotaIdentity) {
-				t.Fatalf("stale locked mutation returned %v", err)
-			}
-			if len(backend.rows) != 0 {
-				t.Fatal("stale mutation persisted a row")
-			}
-		})
+// TestQuotaIdentityIndexRowsAreAccountScoped proves the durable rows are
+// account-scoped: a saved display row for one account can never appear as
+// another account's row, and a later account takes over its own row only.
+func TestQuotaIdentityIndexRowsAreAccountScoped(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	bindQuotaFixtures(t, s,
+		quotaFixtureAuth("codex", "first", "first.json", "A"),
+		quotaFixtureAuth("codex", "second", "second.json", "B"))
+	first := fixtureBinding(s, "codex", "first")
+	second := fixtureBinding(s, "codex", "second")
+	if first.Account == "" || first.Account == second.Account {
+		t.Fatalf("fixture accounts: %+v %+v", first, second)
 	}
-}
-
-func TestQuotaIdentityIndexReplacementDuringValidation(t *testing.T) {
-	for _, targeted := range []bool{false, true} {
-		for _, change := range []string{"replacement", "deletion", "duplicate-index", "duplicate-key"} {
-			t.Run(fmt.Sprintf("targeted=%t/%s", targeted, change), func(t *testing.T) {
-				ctx := context.Background()
-				manager := coreauth.NewManager(nil, nil, nil)
-				auth := quotaFixtureAuth("codex", "index", "same.json", "A")
-				if _, err := manager.Register(ctx, auth); err != nil {
-					t.Fatal(err)
-				}
-				entered, release := make(chan struct{}), make(chan struct{})
-				source := NewQuotaIdentitySource(func() *coreauth.Manager { return manager }, func(*coreauth.Auth) bool { close(entered); <-release; return true })
-				done := make(chan bool, 1)
-				go func() {
-					if targeted {
-						_, ok := source.(TargetedQuotaIdentitySource).QuotaBinding("codex", "index", true)
-						done <- ok
-					} else {
-						done <- len(source.QuotaBindings(true)) != 0
-					}
-				}()
-				<-entered
-				switch change {
-				case "replacement":
-					current, _ := manager.GetByID(auth.ID)
-					current.Metadata["access_token"] = "B"
-					if _, err := manager.Update(ctx, current); err != nil {
-						t.Error(err)
-					}
-				case "deletion":
-					manager.Remove(ctx, auth.ID)
-				default:
-					other := quotaFixtureAuth("codex", "other", "other.json", "B")
-					if change == "duplicate-index" {
-						other.Index = auth.Index
-					} else {
-						other.FileName = auth.FileName
-					}
-					if _, err := manager.Register(ctx, other); err != nil {
-						t.Error(err)
-					}
-				}
-				close(release)
-				if <-done {
-					t.Fatal("binding invalidated during disk validation escaped")
-				}
-			})
-		}
-	}
-}
-
-func TestQuotaIdentityIndexPublishedAdmissionDoesNotValidateStorage(t *testing.T) {
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := quotaFixtureAuth("claude", "index", "same.json", "A")
-	if _, err := manager.Register(context.Background(), auth); err != nil {
+	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{identityIndexEntry(first)}); err != nil {
 		t.Fatal(err)
 	}
-	var calls atomic.Int64
-	var allowed atomic.Bool
-	allowed.Store(true)
-	s := &Store{queue: make(chan queuedUsage, usageQueueCapacity), workerCtx: context.Background()}
-	s.BindQuotaIdentitySource(NewQuotaIdentitySource(func() *coreauth.Manager { return manager }, func(*coreauth.Auth) bool { calls.Add(1); return allowed.Load() }))
-	if calls.Load() != 0 || len(s.quotaBindings(false)) != 0 {
-		t.Fatal("first source binding queried live state or invented a publication")
+	values, err := s.ListCache(ctx, quotaNamespace)
+	if err != nil {
+		t.Fatal(err)
 	}
-	binding := fixtureBinding(s, "claude", "index") // Explicit identity read primes proof.
-	calls.Store(0)
-	allowed.Store(false)
-	if _, ok := s.observationBinding("claude", "index", []QuotaBinding{binding}); !ok {
-		t.Fatal("published original observer proof refused")
+	if len(values[quotaStoreKey("codex", first.Account)]) == 0 {
+		t.Fatal("row was not keyed by the account fact")
 	}
-	if !s.validQuotaReset(&queuedQuotaReset{Provider: binding.Provider, AuthIndex: binding.AuthIndex, CredentialGeneration: binding.CredentialGeneration, Revision: binding.Revision}, false) {
-		t.Fatal("published reset admission refused")
+	if len(values[quotaStoreKey("codex", second.Account)]) != 0 {
+		t.Fatal("an unrelated account inherited the row")
 	}
-	record := fixtureRecord("published-only", time.Now())
-	record.Provider, record.AuthIndex = "claude", auth.Index
-	record.AccessTokenSHA256 = coreauth.AccessTokenSHA256(auth)
-	record.ResponseHeaders = map[string][]string{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"}}
-	s.Consume(context.Background(), fixturePayload(record))
-	item := <-s.queue
-	if item.Quota == nil || item.Quota.Revision != "" || len(s.quotaBindings(false)) != 1 || calls.Load() != 0 {
-		t.Fatal("admission performed live validation or stamped a current revision")
-	}
-	s.bindQueuedUsageQuota(context.Background(), &item)
-	if item.Quota != nil || calls.Load() != 1 {
-		t.Fatal("isolated worker did not refuse failed authoritative validation")
+	if cached, err := s.QuotaCache(ctx); err != nil || len(cached) != 1 || cached[0].Account != first.Account {
+		t.Fatalf("display cache: %+v %v", cached, err)
 	}
 }
 
+// TestQuotaIdentityIndexBoundsAndFallbackAmbiguity keeps the source bounds: an
+// oversized binding list and an oversized credential catalog are refused whole,
+// and a duplicate transient index stays ambiguous.
 func TestQuotaIdentityIndexBoundsAndFallbackAmbiguity(t *testing.T) {
-	binding := QuotaBinding{Provider: "codex", AuthIndex: "index", Key: "same.json", CredentialGeneration: "generation", Revision: "revision"}
+	binding := QuotaBinding{Provider: "codex", AuthIndex: "index", Key: "same.json", Account: "same@example.invalid", AccountKind: "email"}
 	if _, ok := indexQuotaBindings([]QuotaBinding{binding, binding, binding}).binding("codex", "index"); ok {
 		t.Fatal("third duplicate resurrected an ambiguous index")
 	}
 	other := binding
 	other.AuthIndex = "other"
-	if _, ok := indexQuotaBindings([]QuotaBinding{binding, other}).binding("codex", "index"); ok {
-		t.Fatal("duplicate display key accepted")
+	index := indexQuotaBindings([]QuotaBinding{binding, other})
+	if _, ok := index.binding("codex", "index"); !ok {
+		t.Fatal("distinct transient indexes did not bind")
+	}
+	for _, candidate := range []struct{ provider, index string }{
+		{"claude", "index"},
+		{"codex", "unknown"},
+	} {
+		if _, ok := index.binding(candidate.provider, candidate.index); ok {
+			t.Fatal("indexed lookup accepted a mismatched provider or unknown index")
+		}
 	}
 	if got := indexQuotaBindings(make([]QuotaBinding, maxQuotaIdentities+1)); got != nil {
 		t.Fatal("unbounded source accepted")
@@ -372,16 +246,69 @@ func TestQuotaIdentityIndexBoundsAndFallbackAmbiguity(t *testing.T) {
 	if got := newQuotaAuthCatalog(make([]*coreauth.Auth, maxQuotaIdentities+1)); got.byIndex != nil || got.keys != nil {
 		t.Fatal("unbounded catalog accepted")
 	}
-	index := indexQuotaBindings([]QuotaBinding{binding})
-	for _, candidate := range []struct{ provider, index, generation, revision string }{
-		{"claude", "index", "generation", "revision"},
-		{"codex", "unknown", "generation", "revision"},
-		{"codex", "index", "", "revision"},
-		{"codex", "index", "stale", "revision"},
-		{"codex", "index", "generation", "stale"},
-	} {
-		if index.valid(candidate.provider, candidate.index, candidate.generation, candidate.revision) {
-			t.Fatal("indexed lookup weakened an identity fence")
+}
+
+// TestQuotaIdentitiesHTTPPublishesAccountFacts covers the dashboard-facing
+// identity document: it publishes the account facts and the transient
+// correlation index, and never the removed generation/revision material.
+func TestQuotaIdentitiesHTTPPublishesAccountFacts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := openTestStore(t)
+	auth := quotaFixtureAuth("codex", "index", "same.json", "private-token")
+	auth.Metadata["account_id"] = "account-A"
+	bindQuotaFixtures(t, s, auth)
+	binding := fixtureBinding(s, "codex", "index")
+	if len(s.publishedQuotaBindings()) != 1 {
+		t.Fatal("identity publication missing")
+	}
+	engine := gin.New()
+	s.RegisterRoutes(engine.Group("/stats"))
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/stats/quota/identities", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("identity GET status %d", response.Code)
+	}
+	body := response.Body.String()
+	for _, field := range []string{`"provider":"codex"`, `"account":"` + binding.Account + `"`, `"account_kind":"email"`, `"auth_index":"index"`} {
+		if !strings.Contains(body, field) {
+			t.Fatalf("identity response lacks %s: %s", field, body)
 		}
+	}
+	for _, removed := range []string{"credential_generation", "revision", "lifetime", "private-token", "access_token"} {
+		if strings.Contains(body, removed) {
+			t.Fatalf("identity response published removed material %q: %s", removed, body)
+		}
+	}
+	// Codex has operation selectors, so it publishes a proof of their digests.
+	// The raw selector value is an account id the request must supply itself and
+	// must never be echoed back.
+	if !strings.Contains(body, `"selector_hashes":{"account_id":`) {
+		t.Fatalf("codex proof is missing its selector digests: %s", body)
+	}
+	if strings.Contains(body, "account-A") {
+		t.Fatalf("identity response echoed a raw selector value: %s", body)
+	}
+}
+
+// TestQuotaIdentityObserverSurvivesCredentialTokenRotation keeps the availability
+// contract: a credential token rotation does not withdraw the observation
+// publication, so a later original-handler request still observes quota.
+func TestQuotaIdentityObserverSurvivesCredentialTokenRotation(t *testing.T) {
+	s := openTestStore(t)
+	auth := quotaFixtureAuth("codex", "index", "same.json", "A")
+	manager := bindQuotaFixtures(t, s, auth)
+	original := fixtureBinding(s, "codex", "index")
+	auth.Metadata["access_token"] = "B"
+	if _, err := manager.Update(context.Background(), auth); err != nil {
+		t.Fatal(err)
+	}
+	rotated := fixtureBinding(s, "codex", "index")
+	if rotated.Account != original.Account || rotated.Key != original.Key {
+		t.Fatal("token rotation changed the published identity")
+	}
+	s.ObserveQuotaFetch(context.Background(), rotated, managementFetchFixture(t))
+	flushFixture(t, s)
+	if got := middlewareQuotaCount(t, s); got != 1 {
+		t.Fatalf("observation after rotation = %d, want 1", got)
 	}
 }

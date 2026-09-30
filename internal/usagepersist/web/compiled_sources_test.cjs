@@ -13,7 +13,7 @@ const digest = value => createHash('sha256').update(value).digest('hex');
 const proof = (selector, value) => ({v: 1, selector_hashes: {[selector]: digest(value)}});
 const providers = ['antigravity','claude','codex','devin','kimi','meta','xai'];
 const states = {codex:{status:'success',windows:[]},claude:{status:'success',windows:[]},devin:{status:'success',windows:[]},kimi:{status:'success',rows:[]},antigravity:{status:'success',groups:[]},xai:{status:'success',billing:{usagePercent:10}}};
-const who = (provider='codex', name=provider+'.json', extra={}) => ({provider,key:provider==='devin'?name+'\0i':name,auth_index:'i',credential_generation:'gB',revision:'rB',...(provider==='codex'?{manual_source_proof:proof('account_id','B')}:provider==='antigravity'?{manual_source_proof:proof('project_id','B')}:provider==='xai'?{manual_source_proof:proof('user_id','B')}:{ }),...extra});
+const who = (provider='codex', name=provider+'.json', extra={}) => ({provider,key:provider==='devin'?name+'\0i':name,account:'acct-'+provider,account_kind:'email',auth_index:'i',...(provider==='codex'?{manual_source_proof:proof('account_id','B')}:provider==='antigravity'?{manual_source_proof:proof('project_id','B')}:provider==='xai'?{manual_source_proof:proof('user_id','B')}:{ }),...extra});
 const file = (provider='codex', extra={}) => ({name:provider+'.json',auth_index:'i',id_token:{chatgpt_account_id:'B'},project_id:'B',sub:'B',...extra});
 function store(initial) {let state=initial;const listeners=[];return {getState:()=>state,subscribe(fn){listeners.push(fn);},setState(patch){const previous=state;patch=typeof patch==='function'?patch(state):patch;if(patch===state)return;state={...state,...patch};for(const fn of listeners)fn(state,previous);}};}
 function setup() {
@@ -64,7 +64,7 @@ async function codexCases() {
   await h.run('codex',fresh);h.success(capture);await h.flush();assert.equal(h.puts().length,0,'later B must not restamp old capture');
   await h.refresh();h.success(capture);await h.flush();assert.equal(h.puts().length,0,'ordinary refresh must not reset source fences');
   const latest=h.capture('codex.json');await h.run('codex',fresh);h.success(latest);await h.flush();assert.equal(h.puts().length,1);
-  const entry=JSON.parse(h.puts()[0].options.body).entries[0];assert.deepEqual(Object.keys(entry).sort(),['provider','key','auth_index','credential_generation','revision','observed_at','state'].sort());assert.equal(entry.credential_generation,'gB');assert.ok(!h.puts()[0].options.body.includes('selector_hashes'));
+  const entry=JSON.parse(h.puts()[0].options.body).entries[0];assert.deepEqual(Object.keys(entry).sort(),['provider','key','account','account_kind','observed_at','state'].sort());assert.equal(entry.account,'acct-codex');assert.equal(entry.account_kind,'email');assert.ok(!h.puts()[0].options.body.includes('auth_index'));assert.ok(!h.puts()[0].options.body.includes('selector_hashes'));
   // Exact actual resolver precedence: account_id is NOT a selector alias.
   for(const variant of [{account_id:'B',id_token:{chatgpt_account_id:'A'}},{chatgpt_account_id:'A',id_token:{chatgpt_account_id:'B'}},{id_token:'head.'+Buffer.from(JSON.stringify({chatgpt_account_id:'A'})).toString('base64url')+'.sig'},{metadata:{chatgptAccountId:'A'},id_token:null}]) {
     const c=h.capture('codex.json');await h.run('codex',file('codex',variant));h.success(c);await h.flush();assert.equal(h.puts().length,1);
@@ -75,7 +75,7 @@ async function codexCases() {
   for(const item of [stale,fresh]){const c=h.capture('codex.json'),before=h.providerCalls.length;await h.run('codex',item,'resetQuota');assert.deepEqual(h.providerCalls.slice(before).map(x=>x.url),['consume','usage']);h.success(c);await h.flush();}
   assert.equal(h.puts().length,2);
   for(const variant of [{auth_index:'wrong',authIndex:'i'},{auth_index:'',authIndex:'i'},{auth_index:null,authIndex:'wrong'}]){const c=h.capture('codex.json');try{await h.run('codex',file('codex',variant));}catch{}h.success(c);await h.flush();assert.equal(h.puts().length,2);}
-  const numeric=h.capture('codex.json');h.bindings=h.bindings.map(x=>x.provider==='codex'?{...x,auth_index:'7'}:x);await h.refresh();const n=h.capture('codex.json');await h.run('codex',file('codex',{auth_index:7,authIndex:'wrong'}));h.success(n);await h.flush();assert.equal(h.puts().length,3);assert.equal(h.success(numeric),false);
+  const numeric=h.capture('codex.json');h.bindings=h.bindings.map(x=>x.provider==='codex'?{...x,account:'numeric-account',auth_index:'7'}:x);await h.refresh();const n=h.capture('codex.json');await h.run('codex',file('codex',{auth_index:7,authIndex:'wrong'}));h.success(n);await h.flush();assert.equal(h.puts().length,3);assert.equal(h.success(numeric),false);
 }
 async function unknownCases() {
   const invalid=[undefined,null,{v:2,selector_hashes:{account_id:digest('B')}},{v:1,selector_hashes:{account_id:'bad'}},{v:1,selector_hashes:{project_id:digest('B')}},{v:1,selector_hashes:{account_id:digest('B'),future:digest('B')}},{v:1,selector_hashes:{account_id:digest('B')},future:true}];

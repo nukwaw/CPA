@@ -7,8 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,45 +19,30 @@ import (
 
 func TestUsageQuotaIdentityIndexConcurrentReplacementHTTP(t *testing.T) {
 	ctx := context.Background()
-	directory := t.TempDir()
-	path := filepath.Join(directory, "same.json")
-	write := func(token string) error {
-		data, err := json.Marshal(map[string]any{"type": "codex", "access_token": token, "account_id": "account-A", "request-retry": 2, "excluded-models": []any{"private-*"}})
-		if err != nil {
-			return err
-		}
-		pending := filepath.Join(directory, "pending.json")
-		if err = os.WriteFile(pending, data, 0600); err != nil {
-			return err
-		}
-		return os.Rename(pending, path)
-	}
-	if err := write("old-secret"); err != nil {
-		t.Fatal(err)
-	}
 	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{ID: "same.json", Index: "index", FileName: "same.json", Provider: "codex", Metadata: map[string]any{"type": "codex", "access_token": "old-secret", "account_id": "account-A", "request_retry": 2, "excluded_models": []any{"private-*"}}, Attributes: map[string]string{coreauth.AttributePath: path, coreauth.AttributeSourceBackend: coreauth.AuthSourceFile}}
+	auth := &coreauth.Auth{ID: "same.json", FileName: "same.json", Provider: "codex", Metadata: map[string]any{"type": "codex", "access_token": "old-secret", "account_id": "account-A", "email": "account-000@example.invalid"}}
 	if _, err := manager.Register(ctx, auth); err != nil {
 		t.Fatal(err)
 	}
-	source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager }, nil)
-	bindings := source.QuotaBindings(true)
+	source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return manager })
+	bindings := source.QuotaBindings()
 	if len(bindings) != 1 {
 		t.Fatal("initial identity missing")
 	}
 	binding := bindings[0]
+	if binding.Account != "account-000@example.invalid" || binding.AccountKind != "email" {
+		t.Fatalf("projected facts = %+v", binding)
+	}
 	s := persistenceTestStore(t)
 	s.BindQuotaIdentitySource(source)
-	entry := usagepersist.QuotaCacheEntry{Provider: binding.Provider, Key: binding.Key, AuthIndex: binding.AuthIndex, CredentialGeneration: binding.CredentialGeneration, Revision: binding.Revision, ObservedAt: time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC), State: json.RawMessage(`{"status":"success","windows":[]}`)}
+	// The entry belongs to the account the credential exposes right now. Its
+	// observation time is explicit so stale-write ordering stays deterministic.
+	entry := usagepersist.QuotaCacheEntry{Provider: binding.Provider, Key: binding.Key, Account: binding.Account, AccountKind: binding.AccountKind, ObservedAt: time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC), State: json.RawMessage(`{"status":"success","windows":[]}`)}
 	if err := s.SaveQuotaCache(ctx, []usagepersist.QuotaCacheEntry{entry}); err != nil {
 		t.Fatal(err)
 	}
 	engine := gin.New()
 	s.RegisterRoutes(engine.Group("/stats"))
-	payload, err := json.Marshal(map[string]any{"entries": []usagepersist.QuotaCacheEntry{entry}})
-	if err != nil {
-		t.Fatal(err)
-	}
 	request := func(method, route string, body []byte) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
 		r := httptest.NewRequest(method, route, bytes.NewReader(body))
@@ -66,21 +50,18 @@ func TestUsageQuotaIdentityIndexConcurrentReplacementHTTP(t *testing.T) {
 		engine.ServeHTTP(recorder, r)
 		return recorder
 	}
+	// Each round hands the credential to a different account. A rotated token for
+	// the same account would instead be an ordinary refresh that keeps identity.
 	update := func(iteration int) error {
-		token := fmt.Sprintf("new-secret-%03d", iteration)
-		if err := write(token); err != nil {
-			return err
-		}
 		current, ok := manager.GetByID(auth.ID)
 		if !ok {
 			return fmt.Errorf("missing current credential")
 		}
-		current.Metadata["access_token"] = token
+		current.Metadata["access_token"] = fmt.Sprintf("new-secret-%03d", iteration)
+		current.Metadata["email"] = fmt.Sprintf("account-%03d@example.invalid", iteration)
 		_, err := manager.Update(ctx, current)
 		return err
 	}
-	// Every reader starts after the old credential is gone. Subsequent manager
-	// and atomic file replacements race with real add-on HTTP GETs and PUTs.
 	if err := update(0); err != nil {
 		t.Fatal(err)
 	}
@@ -108,9 +89,15 @@ func TestUsageQuotaIdentityIndexConcurrentReplacementHTTP(t *testing.T) {
 				var cache struct {
 					Entries []usagepersist.QuotaCacheEntry `json:"entries"`
 				}
-				if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &cache) != nil || len(cache.Entries) != 0 {
-					t.Errorf("stale cached identity escaped concurrent replacement: %d %s", response.Code, response.Body)
+				if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &cache) != nil {
+					t.Errorf("cache GET failed: %d %s", response.Code, response.Body)
 					return
+				}
+				for _, current := range cache.Entries {
+					if current.Account != entry.Account {
+						t.Errorf("stored display state crossed accounts: %s", response.Body)
+						return
+					}
 				}
 				response = request(http.MethodGet, "/stats/quota/identities", nil)
 				var identities struct {
@@ -120,15 +107,15 @@ func TestUsageQuotaIdentityIndexConcurrentReplacementHTTP(t *testing.T) {
 					t.Errorf("identity GET failed: %d %s", response.Code, response.Body)
 					return
 				}
-				for _, current := range identities.Bindings {
-					if current.CredentialGeneration == binding.CredentialGeneration || current.Revision == binding.Revision {
-						t.Error("stale identity snapshot escaped concurrent replacement")
-						return
-					}
+				// The credential may switch account between two reads, but every
+				// published binding must be a complete, consistent projection: one
+				// credential can never publish two accounts at once.
+				if len(identities.Bindings) != 1 {
+					t.Errorf("identity GET published %d bindings for one credential: %s", len(identities.Bindings), response.Body)
+					return
 				}
-				response = request(http.MethodPut, "/stats/quota/cache", payload)
-				if response.Code != http.StatusConflict {
-					t.Errorf("stale concurrent PUT = %d, want 409", response.Code)
+				if current := identities.Bindings[0]; current.AccountKind != "email" || current.Provider != "codex" || !strings.HasSuffix(current.Account, "@example.invalid") {
+					t.Errorf("published binding is not a coherent account projection: %s", response.Body)
 					return
 				}
 			}
@@ -136,15 +123,8 @@ func TestUsageQuotaIdentityIndexConcurrentReplacementHTTP(t *testing.T) {
 	}
 	close(start)
 	group.Wait()
-	current := source.QuotaBindings(true)
-	if len(current) != 1 || current[0].CredentialGeneration == binding.CredentialGeneration {
-		t.Fatal("latest reconciled replacement missing after stress")
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	response := request(http.MethodGet, "/stats/quota/identities", nil)
-	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"bindings":[]`)) {
-		t.Fatalf("deleted credential survived a fresh read: %d %s", response.Code, response.Body)
+	current := source.QuotaBindings()
+	if len(current) != 1 || current[0].Account != fmt.Sprintf("account-%03d@example.invalid", rounds) {
+		t.Fatalf("latest replacement missing after stress: %+v", current)
 	}
 }

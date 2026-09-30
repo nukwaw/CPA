@@ -128,7 +128,7 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 	}
 	t.Setenv("MANAGEMENT_STATIC_PATH", assetPath)
 	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{ID: "dynamic-quota-fixture", FileName: "fixture.json", Provider: "codex", Metadata: map[string]any{"access_token": "fixture-token"}}
+	auth := &coreauth.Auth{ID: "dynamic-quota-fixture", FileName: "fixture.json", Provider: "codex", Metadata: map[string]any{"access_token": "fixture-token", "email": "observed@example.invalid"}}
 	index := auth.EnsureIndex()
 	if _, err := manager.Register(context.Background(), auth); err != nil {
 		t.Fatal(err)
@@ -178,8 +178,34 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 	if err := store.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if snapshots, err := store.Quotas(context.Background()); err != nil || len(snapshots) != 1 || snapshots[0].AuthIndex != index {
-		t.Fatalf("ready store did not activate quota observation: %#v %v", snapshots, err)
+	// The credential's account fact, not its transient index, groups the stored
+	// observation: the projection publishes the email the credential carries, and
+	// the observation is keyed by (provider, account).
+	snapshots, err := store.Quotas(context.Background())
+	if err != nil || len(snapshots) != 1 || snapshots[0].Provider != "codex" || snapshots[0].Account != "observed@example.invalid" || snapshots[0].AccountKind != "email" {
+		t.Fatalf("ready store did not activate account-scoped quota observation: %#v %v", snapshots, err)
+	}
+	if len(snapshots[0].Windows) != 1 || snapshots[0].Windows[0].RemainingPercent == nil || *snapshots[0].Windows[0].RemainingPercent != 75 {
+		t.Fatalf("observed quota windows = %#v", snapshots[0].Windows)
+	}
+	// Rotating the access token is the ordinary refresh core performs during normal
+	// operation. It must not move the account the observation is grouped under:
+	// identity is (provider, account), never a token.
+	auth.Metadata["access_token"] = "rotated-token"
+	if _, err := manager.Update(context.Background(), auth); err != nil {
+		t.Fatal(err)
+	}
+	request(http.MethodGet, "/v0/management/stats/quota/identities", "")
+	request(http.MethodPost, "/v0/management/quota/fetch", body)
+	if err := store.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := store.Quotas(context.Background())
+	if err != nil || len(rotated) != 1 || rotated[0].Provider != "codex" || rotated[0].Account != "observed@example.invalid" || rotated[0].AccountKind != "email" {
+		t.Fatalf("token rotation changed the account the observation is grouped under: %#v %v", rotated, err)
+	}
+	if len(rotated[0].Windows) != 1 || rotated[0].Windows[0].RemainingPercent == nil || *rotated[0].Windows[0].RemainingPercent != 75 {
+		t.Fatalf("rotated observation windows = %#v", rotated[0].Windows)
 	}
 	current.Store(nil)
 	if w := request(http.MethodGet, "/management.html", ""); w.Body.String() != original {

@@ -21,7 +21,11 @@ func TestIsAPICallResetRequiresKnownSuccessfulConsume(t *testing.T) {
 			t.Fatalf("invalid endpoint accepted: %s", invalidURL)
 		}
 	}
-	if IsAPICallReset(parserIdentity("claude", "a"), endpoint, 200, body) || IsAPICallReset(identity, endpoint, 400, body) || IsAPICallReset(parserIdentity("codex", ""), endpoint, 200, body) {
-		t.Fatal("reset accepted for unrelated provider, error status, or missing identity")
+	if IsAPICallReset(parserIdentity("claude", "a"), endpoint, 200, body) || IsAPICallReset(identity, endpoint, 400, body) || IsAPICallReset(parserIdentity("codex", "a\nsecret"), endpoint, 200, body) || IsAPICallReset(parserIdentity("", "a"), endpoint, 200, body) {
+		t.Fatal("reset accepted for unrelated provider, error status, or invalid account facts")
+	}
+	// A credential without an account property is still a valid identity.
+	if !IsAPICallReset(parserIdentity("codex", ""), endpoint, 200, body) {
+		t.Fatal("account-less credential could not reset")
 	}
 }

@@ -119,6 +119,8 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		TTFTMs:           record.TTFT.Milliseconds(),
 		Source:           record.Source,
 		AuthIndex:        record.AuthIndex,
+		Account:          strings.TrimSpace(record.Account),
+		AccountKind:      strings.TrimSpace(record.AccountKind),
 		AccessTokenHash:  record.AccessTokenSHA256,
 		ClientIP:         clientRequestMetadata.ClientIP,
 		ResolvedClientIP: clientRequestMetadata.ResolvedClientIP,
@@ -194,6 +196,8 @@ type requestDetail struct {
 	TTFTMs           int64       `json:"ttft_ms"`
 	Source           string      `json:"source"`
 	AuthIndex        string      `json:"auth_index"`
+	Account          string      `json:"account,omitempty"`
+	AccountKind      string      `json:"account_kind,omitempty"`
 	AccessTokenHash  string      `json:"access_token_sha256,omitempty"`
 	ClientIP         string      `json:"client_ip"`
 	ResolvedClientIP string      `json:"resolved_client_ip"`
