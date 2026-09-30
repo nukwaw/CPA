@@ -266,8 +266,11 @@ sup{font-size:10px;color:var(--amber)}
 .quota-heading p{max-width:78ch}
 .quota-heading-actions{display:flex;flex-wrap:wrap;gap:8px}
 .quota-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px}
-.quota-card{display:flex;flex-direction:column;gap:16px;cursor:pointer;margin-bottom:0;transition:transform .2s var(--ease),border-color .2s var(--ease),box-shadow .2s var(--ease)}
-.quota-card:hover,.quota-card:focus-within{border-color:var(--line-hover);transform:translateY(-2px);box-shadow:var(--shadow-lift)}
+.quota-card{display:flex;flex-direction:column;gap:16px;margin-bottom:0}
+/* Only a card that can actually open the side window advertises itself as a
+   target: the whole card is the control, as in the panel's own quota page. */
+.quota-card.openable{cursor:pointer;transition:transform .2s var(--ease),border-color .2s var(--ease),box-shadow .2s var(--ease)}
+.quota-card.openable:hover,.quota-card.openable:focus-within{border-color:var(--line-hover);transform:translateY(-2px);box-shadow:var(--shadow-lift)}
 .quota-card .card-heading{margin-bottom:0;align-items:flex-start}
 .quota-card h2{font-size:14.5px;margin:0;overflow-wrap:anywhere;font-weight:650;letter-spacing:-.2px}
 .quota-card .card-heading p{color:var(--muted);font-size:12px;margin:4px 0 0}
@@ -298,7 +301,7 @@ sup{font-size:10px;color:var(--amber)}
 .quota-value-list{display:flex;flex-direction:column;gap:0;margin-bottom:12px}
 .quota-value-row{display:flex;justify-content:space-between;gap:14px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
 .quota-value-row:last-child{border-bottom:0}
-.quota-value-row span{color:var(--muted)}
+.quota-value-row span{color:var(--muted);flex-shrink:0}
 .quota-value-row strong{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-weight:650}
 
 /* Pricing */
@@ -320,6 +323,10 @@ footer a:hover{color:var(--text)}
 
 /* Dialogs */
 dialog{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);color:var(--text);width:min(460px,calc(100% - 32px));padding:28px;box-shadow:var(--shadow-lift)}
+/* A modal dialog receives focus when it opens. Its own surface and backdrop already
+   show where focus went, and the browser's default ring draws a bright rectangle
+   around the whole panel, so the container itself does not draw one. */
+dialog:focus,dialog:focus-visible{outline:none}
 dialog::backdrop{background:color-mix(in srgb,#151412 55%,transparent);backdrop-filter:blur(6px)}
 .dialog-heading{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px}
 dialog h2{font-size:24px;letter-spacing:-.7px;margin:0;font-weight:700}

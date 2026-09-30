@@ -190,8 +190,18 @@
       // The two card actions travel together so the heading keeps exactly two
       // columns: the credential on the left, its actions on the right.
       const actions = node('div', null, 'quota-card-actions');
+      const open = credential.lines.length ? () => openQuotaDialog(credential) : null;
+      // The whole card is the target, matching the control panel's own quota cards,
+      // where the card is the control. A click that lands on one of the card's own
+      // buttons belongs to that button and must not also open the window. Keyboard
+      // users keep using the labelled button inside the card, which stays the
+      // accessible control for this action.
+      if (open) {
+        card.classList.add('openable');
+        card.addEventListener('click', event => {if (event.target.closest('button')) return; open();});
+      }
       if (credential.indices.length) {const refresh = node('button', 'Refresh', 'text-button'); refresh.type = 'button'; refresh.setAttribute('aria-label', `Refresh ${C.credentialName(credential)} from the provider`); refresh.addEventListener('click', () => void refreshFromProvider(credential, refresh)); actions.append(refresh);}
-      if (credential.lines.length) {const open = node('button', 'Window history →', 'text-button'); open.type = 'button'; open.setAttribute('aria-label', `Open window history for ${C.credentialName(credential)}`); open.addEventListener('click', () => openQuotaDialog(credential)); actions.append(open);}
+      if (open) {const label = node('button', 'Window history →', 'text-button'); label.type = 'button'; label.setAttribute('aria-label', `Open window history for ${C.credentialName(credential)}`); label.addEventListener('click', open); actions.append(label);}
       if (actions.childElementCount) heading.append(actions);
       card.append(heading);
       const lines = node('div', null, 'quota-lines');
@@ -267,11 +277,14 @@
       if (epoch !== state.epoch) return;
       state.quota = {entries: C.arrays(cache, 'entries'), snapshots: C.arrays(snapshots, 'snapshots')};
       state.credentials = C.summarizeCredentials(state.quota.entries, state.quota.snapshots, C.arrays(identities, 'bindings'));
-      // Display state and normalized snapshots use different window ids. History is
-      // recorded under the normalized id, so the side window prefers those.
+      // Quota history is only recorded under the backend's own window id, so only
+      // windows a line can name a backend id for are offered. A display id that
+      // reached the card from saved state alone has no recorded history and would
+      // chart nothing, so offering it would only produce an empty window.
       for (const credential of state.credentials) {
-        const snapshot = state.quota.snapshots.find(item => item.provider === credential.provider && String(item.account || '') === credential.account);
-        credential.windows = C.arrays(snapshot, 'windows').filter(window => window && window.id).map(window => ({id: String(window.id), label: String(window.label || window.id)}));
+        const windows = new Map();
+        for (const line of credential.lines) if (line.source) windows.set(line.source, line.label || line.source);
+        credential.windows = [...windows].map(([id, label]) => ({id, label}));
       }
       renderQuota();
       message('quota-message', '');
@@ -282,11 +295,19 @@
       message('quota-message', `${error.message} Saved quota state needs a reachable statistics API and a management route that is not write-blocked.`, true);
     }
   }
+  // Quota history is keyed by the backend's window id, which is not the label the
+  // card shows ("five_hour" against "5h limit"). Present the label the reader
+  // already has on the card, and fall back to the id only when nothing maps it.
+  function windowLabel(id) {
+    if (!id) return '';
+    const line = (state.dialog?.lines || []).find(item => item.source === id);
+    return line?.label || String(id);
+  }
   function renderQuotaHistory(summary) {
     const target = $('quota-history'), points = C.arrays(summary, 'observations');
     const note = $('quota-history-note');
-    if (!points.length) {note.textContent = summary?.window ? `No history recorded for ${summary.window}` : 'Recorded observations of this window'; empty(target, 'No recorded observations', 'History starts with the first verified quota observation and is capped per credential; nothing is backfilled.'); return;}
-    note.textContent = `${summary.window || 'window'} · ${C.integer(points.length)} observations · ${C.date(points[0].observed_at)} → ${C.date(points.at(-1).observed_at)}`;
+    if (!points.length) {note.textContent = summary?.window ? `No history recorded for ${windowLabel(summary.window)}` : 'Recorded observations of this window'; empty(target, 'No recorded observations', 'History starts with the first verified quota observation and is capped per credential; nothing is backfilled.'); return;}
+    note.textContent = `${windowLabel(summary.window) || 'Window'} · ${C.integer(points.length)} observations · ${C.date(points[0].observed_at)} → ${C.date(points.at(-1).observed_at)}`;
     const width = 520, height = 160, values = points.map(point => ({time: Date.parse(point.observed_at), percent: C.number(point.used_percent)}));
     const first = values[0].time, span = (values.at(-1).time - first) || 1, svgNS = 'http://www.w3.org/2000/svg';
     function shape(tag, attrs, text) {const element = document.createElementNS(svgNS, tag); for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, String(value)); if (text != null) element.textContent = text; return element;}
@@ -304,7 +325,7 @@
       ['Recorded requests', C.integer(usage.requests)],
       ['Tokens', `${C.compact(usage.total_tokens)} (${C.compact(usage.input_tokens)} in / ${C.compact(usage.output_tokens)} out)`],
       ['Estimated spend', C.number(usage.priced_requests) ? `${C.money(usage.cost_usd)}${C.number(usage.unpriced_requests) ? ` · ${C.integer(usage.unpriced_requests)} unpriced` : ''}` : 'Unpriced'],
-      ['Window used', estimate ? `${C.number(estimate.used_percent).toFixed(1)}%${summary?.window ? ` of ${summary.window}` : ''} at the latest observation` : '—'],
+      ['Window used', estimate ? `${C.number(estimate.used_percent).toFixed(1)}%${summary?.window ? ` of ${windowLabel(summary.window)}` : ''} at the latest observation` : '—'],
       ['Full-window estimate', estimate && C.number(estimate.full_usd) ? C.money(estimate.full_usd) : 'Not derivable'],
       ['Estimated unused', estimate && C.number(estimate.unused_usd) ? C.money(estimate.unused_usd) : 'Not derivable'],
     ];
@@ -352,15 +373,12 @@
     $('quota-dialog-subtitle').textContent = C.describeCredential(credential).replace('observed', 'last saved');
     const select = $('quota-window'), previous = select.value;
     select.replaceChildren();
-    // Automatic selection is the default because the recorded window ids come from the
-    // normalized provider snapshot, which need not match the display-state ids.
+    // Automatic is the default: it charts whichever window has the most recorded
+    // observations, which the card cannot know on its own. The explicit choices are
+    // the backend window ids the card's own lines recorded, each labelled the way
+    // the card labels it, so a choice always has history to chart.
     const options = [['', 'Automatic · most recorded']];
-    const seen = new Set();
-    for (const window of [...(credential.windows || []), ...credential.lines.map(line => ({id: line.id, label: line.label}))]) {
-      if (!window.id || seen.has(window.id)) continue;
-      seen.add(window.id);
-      options.push([window.id, window.label || window.id]);
-    }
+    for (const window of credential.windows || []) options.push([window.id, window.label || window.id]);
     for (const [value, label] of options) select.add(new Option(label, value));
     if (options.some(([value]) => value === previous)) select.value = previous;
     renderQuotaHistory(null); renderQuotaValue(null); renderQuotaRequests({events: [], total: 0});

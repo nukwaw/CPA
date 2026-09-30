@@ -143,7 +143,7 @@ test('the account fact, not a credential index, is what a card describes', () =>
 test('provider quota rows become labelled percentage lines for every supported shape', () => {
   // Claude publishes windows with explicit labels and reset labels.
   const claude = C.quotaLines({state: {status: 'success', windows: [{id: 'five-hour', label: '5-hour limit', usedPercent: 42.5, resetLabel: '12/31, 21:00'}]}});
-  assert.deepEqual(claude, [{id: 'five-hour', label: '5-hour limit', percent: 42.5, hint: '12/31, 21:00'}]);
+  assert.deepEqual(claude, [{id: 'five-hour', label: '5-hour limit', percent: 42.5, hint: '12/31, 21:00', source: ''}]);
   // Kimi publishes rows with an untranslated key, params and used/limit counters.
   const kimi = C.quotaLines({state: {status: 'success', rows: [
     {id: 'limit-0', labelKey: 'kimi_quota.limit_window', labelParams: {duration: '5h'}, used: 42500, limit: 100000},
@@ -216,7 +216,7 @@ test('a normalized snapshot merges into the card carrying the same (provider, ac
   assert.equal(cards.length, 2);
   const matched = cards.find(card => card.account === 'person@example.test');
   assert.equal(matched.observed_at, '2026-01-02T05:00:00Z');
-  assert.deepEqual(matched.lines, [{id: 'primary', label: 'Primary window', percent: 61.5, hint: ''}]);
+  assert.deepEqual(matched.lines, [{id: 'primary', label: 'Primary window', percent: 61.5, hint: '', source: 'primary'}]);
   // The unmatched snapshot still becomes its own card instead of polluting the first.
   assert.deepEqual(cards.find(card => card.account === 'other@example.test').lines.map(line => line.percent), [90]);
 });
@@ -249,6 +249,11 @@ test('codex backend window ids map onto the saved display windows', () => {
   ]};
   const card = C.summarizeCredentials([entry], [snapshot], [])[0];
   assert.deepEqual(card.lines.map(line => [line.id, line.percent]), [['five-hour', 42], ['weekly', 17]]);
+  // History is recorded under the backend id, so each line must carry it; a line
+  // whose value only exists as saved display state has no backend id to query.
+  assert.deepEqual(card.lines.map(line => line.source), ['primary', 'secondary']);
+  const savedOnly = C.summarizeCredentials([{provider: 'codex', key: 'a.json', state: {windows: [{id: 'weekly', usedPercent: 5}]}}], [], [])[0];
+  assert.deepEqual(savedOnly.lines.map(line => [line.id, line.source]), [['weekly', '']]);
 });
 test('lines that legitimately share an id are never collapsed by the snapshot merge', () => {
   // A grouped provider can repeat the same bucket id inside different groups; those
@@ -266,6 +271,29 @@ test('lines that legitimately share an id are never collapsed by the snapshot me
   assert.deepEqual(C.quotaLines(claude, {observed_at: '2026-01-02T00:00:00Z', windows: [{id: 'five_hour', used_percent: 88}]}).map(line => [line.id, line.percent]), [['five_hour', 88]]);
   const durationless = {provider: 'codex', observed_at: '2026-01-01T00:00:00Z', state: {status: 'success', windows: [{id: 'primary', usedPercent: 1}]}};
   assert.deepEqual(C.quotaLines(durationless, {observed_at: '2026-01-02T00:00:00Z', windows: [{id: 'primary', used_percent: 77}]}).map(line => [line.id, line.percent]), [['primary', 77]]);
+});
+test('a card offers only windows it can name a backend id for, once each', () => {
+  // Quota history is recorded under the backend window id, so a window offered in
+  // the side window must carry that id. The card displays the control panel's
+  // display id, so the two namespaces must not both reach the dropdown: doing that
+  // listed every window twice, and the display-id copy charted nothing.
+  const entry = {provider: 'claude', key: 'claude.json', account: '', observed_at: '2026-01-02T03:00:00Z', state: {status: 'success', windows: [
+    {id: 'five-hour', label: '5h limit', usedPercent: 10},
+    {id: 'seven-day', label: 'Weekly limit', usedPercent: 20},
+  ]}};
+  const snapshot = {provider: 'claude', account: '', observed_at: '2026-01-02T05:00:00Z', windows: [
+    {id: 'five_hour', label: '5h', used_percent: 91},
+    {id: 'seven_day', label: 'Weekly', used_percent: 93},
+  ]};
+  const card = C.summarizeCredentials([entry], [snapshot], [])[0];
+  const options = new Map();
+  for (const line of card.lines) if (line.source) options.set(line.source, line.label || line.source);
+  assert.deepEqual([...options], [['five_hour', '5h limit'], ['seven_day', 'Weekly limit']], 'one option per recorded window, labelled as the card labels it');
+  // A window known only from saved display state has no recorded history, so it is
+  // offered nowhere and cannot produce a misleading empty chart.
+  const savedOnly = C.summarizeCredentials([{provider: 'claude', key: 'claude.json', account: '', state: {status: 'success', windows: [{id: 'five-hour', label: '5h limit', usedPercent: 10}]}}], [], [])[0];
+  assert.deepEqual(savedOnly.lines.map(line => line.source), [''], 'saved-state-only lines carry no backend id');
+  assert.equal([...savedOnly.lines].filter(line => line.source).length, 0);
 });
 test('the panel refreshes a settled card from a newer snapshot instead of skipping it', () => {
   const saved = Date.parse('2026-01-02T03:00:00Z'), window = {id: 'five_hour', used_percent: 91};
@@ -288,7 +316,17 @@ test('the dashboard groups by account facts and never reads a removed credential
   // quota page. The account is recorded as a fact on each card, not used as the key.
   assert.match(core, /const credentialKey = \(provider, key\) =>/);
   assert.match(source, /C\.summarizeCredentials\(state\.quota\.entries, state\.quota\.snapshots, C\.arrays\(identities, 'bindings'\)\)/);
-  assert.match(source, /item\.provider === credential\.provider && String\(item\.account \|\| ''\) === credential\.account/);
+  // A snapshot reaches a card through the account facts, matched in the core. The
+  // window choices a card offers come from the backend ids its own lines recorded,
+  // so the dropdown can never offer a window the card does not display.
+  assert.match(core, /const snapshotFor = \(provider, account\) => snapshots\.find\(item => item\.provider === provider && String\(item\.account \|\| ''\) === String\(account \|\| ''\)\)/);
+  assert.match(source, /if \(line\.source\) windows\.set\(line\.source, line\.label \|\| line\.source\)/);
+  assert.doesNotMatch(source, /credential\.windows = C\.arrays\(snapshot/, 'window choices must not come from a separate snapshot lookup');
+  // The consumer must use only that prepared list. Re-merging the rendered line ids
+  // here is what listed every window twice, with the display-id copy charting
+  // nothing, so the dialog must not consult the lines again.
+  assert.match(source, /for \(const window of credential\.windows \|\| \[\]\) options\.push/);
+  assert.doesNotMatch(source, /options\.push\(\[window\.id[^\n]*credential\.lines/, 'the dialog must not derive options from rendered line ids');
   for (const [name, text] of [['stats.js', source], ['stats-core.js', core], ['stats.html', html]]) {
     assert.doesNotMatch(text, /credential_generation/, `${name} must not use a credential generation`);
     assert.doesNotMatch(text, /revision/, `${name} must not use a revision fence`);

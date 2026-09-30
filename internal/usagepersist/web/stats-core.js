@@ -160,9 +160,14 @@
   // manual refresh the backend recorded), so the newer one is authoritative per
   // window. A window the newer observation does not carry keeps its saved value,
   // and an older observation never replaces a newer saved value.
+  //
+  // Each line is `{id, label, percent, hint, source}`. `id` is what the card
+  // renders (the control panel's display id when the window maps to one) and
+  // `source` is the backend window id the value was recorded under, or empty when
+  // the value exists only as saved display state with no recorded observation.
   function quotaLines(entry, snapshot) {
     const lines = [], state = entry?.state || {}, savedIndex = new Map(), rawIndex = new Map();
-    const push = (id, label, ratio, hint) => {if (!id && !label) return null; lines.push({id: String(id || label), label: String(label || id), percent: ratio == null ? null : percentOf(ratio), hint: hint ? String(hint) : ''}); return lines.length - 1;};
+    const push = (id, label, ratio, hint) => {if (!id && !label) return null; lines.push({id: String(id || label), label: String(label || id), percent: ratio == null ? null : percentOf(ratio), hint: hint ? String(hint) : '', source: ''}); return lines.length - 1;};
     const ratio = (used, limit) => number(limit) > 0 ? number(used) / number(limit) * 100 : null;
     const stateWindows = arrays(state, 'windows');
     for (const window of stateWindows) {
@@ -193,12 +198,15 @@
       // place so a cache written with backend ids cannot render twice.
       const raw = String(window.id || window.label || '');
       const index = savedIndex.get(normalizedWindowID(entry?.provider, window, stateWindows)) ?? rawIndex.get(raw);
-      if (index == null) {const at = push(raw, window.label || window.id, null, hint); if (at != null) {lines[at].percent = percent; lines[at].hint = hint; rawIndex.set(raw, at);}}
-      else {if (percent != null) lines[index].percent = percent; lines[index].hint = hint;}
+      // `source` records the backend window id this line's value came from. Quota
+      // history is only ever recorded under that id, so it is the id a history
+      // query must use; the rendered `id` may be the control panel's display id.
+      if (index == null) {const at = push(raw, window.label || window.id, null, hint); if (at != null) {lines[at].percent = percent; lines[at].hint = hint; lines[at].source = raw; rawIndex.set(raw, at);}}
+      else {if (percent != null) lines[index].percent = percent; lines[index].hint = hint; if (window.id) lines[index].source = raw;}
     }
     // A saved state that carries no recognizable window at all still shows the
     // account's last observation rather than an empty card.
-    if (!lines.length) for (const window of arrays(snapshot, 'windows')) push(window.id || window.label, window.label || window.id, percentOf(window.used_percent), window.reset_at);
+    if (!lines.length) for (const window of arrays(snapshot, 'windows')) {const at = push(window.id || window.label, window.label || window.id, percentOf(window.used_percent), window.reset_at); if (at != null) lines[at].source = String(window.id || '');}
     return lines;
   }
   // Join saved display state, normalized snapshots and known credentials into cards.
