@@ -98,7 +98,10 @@
     target.replaceChildren(svg);
     $('chart-caption').replaceChildren(node('span', C.date(rows[0].time)), node('span', `${rows.length} buckets${plot.sampled ? ' · sampled' : ''} · local time`), node('span', C.date(rows.at(-1).time)));
   }
-  const colors = ['var(--accent)', 'var(--blue)', 'var(--amber)', 'var(--purple)', 'var(--muted)'];
+  // Categorical palette, defined in stats.css. The first series is the same green
+  // the control panel uses for its own success marks, so a series colour means the
+  // same thing in both surfaces.
+  const colors = ['var(--series-1)', 'var(--series-2)', 'var(--series-3)', 'var(--series-4)', 'var(--series-5)'];
   function shareList(id, rows, count) {
     const target = $(id); target.replaceChildren();
     const sorted = [...rows].sort((a, b) => C.number(b.requests) - C.number(a.requests));
@@ -182,12 +185,28 @@
       const heading = node('div', null, 'card-heading');
       const title = node('div');
       title.append(node('h2', C.credentialName(credential)));
-      title.append(node('p', C.describeCredential(credential)));      heading.append(title);
-      if (credential.indices.length) {const refresh = node('button', 'Refresh', 'text-button'); refresh.type = 'button'; refresh.setAttribute('aria-label', `Refresh ${C.credentialName(credential)} from the provider`); refresh.addEventListener('click', () => void refreshFromProvider(credential, refresh)); heading.append(refresh);}
-      if (credential.lines.length) {const open = node('button', 'Window history →', 'text-button'); open.type = 'button'; open.setAttribute('aria-label', `Open window history for ${C.credentialName(credential)}`); open.addEventListener('click', () => openQuotaDialog(credential)); heading.append(open);}
+      title.append(node('p', C.describeCredential(credential)));
+      heading.append(title);
+      // The two card actions travel together so the heading keeps exactly two
+      // columns: the credential on the left, its actions on the right.
+      const actions = node('div', null, 'quota-card-actions');
+      if (credential.indices.length) {const refresh = node('button', 'Refresh', 'text-button'); refresh.type = 'button'; refresh.setAttribute('aria-label', `Refresh ${C.credentialName(credential)} from the provider`); refresh.addEventListener('click', () => void refreshFromProvider(credential, refresh)); actions.append(refresh);}
+      if (credential.lines.length) {const open = node('button', 'Window history →', 'text-button'); open.type = 'button'; open.setAttribute('aria-label', `Open window history for ${C.credentialName(credential)}`); open.addEventListener('click', () => openQuotaDialog(credential)); actions.append(open);}
+      if (actions.childElementCount) heading.append(actions);
       card.append(heading);
       const lines = node('div', null, 'quota-lines');
-      if (!credential.lines.length) {lines.append(node('p', credential.state ? 'Saved state has no readable window values.' : 'No saved windows yet. Refresh this credential in Management › Quota to populate it; verified provider responses and header observations fill it automatically.', 'muted'));}
+      if (!credential.lines.length) {
+        // The control panel's own quota page invites a refresh from a dashed
+        // placeholder. Mirroring it keeps the empty card actionable instead of
+        // explaining the feature in prose.
+        const placeholder = node('button', null, 'quota-placeholder');
+        placeholder.type = 'button';
+        placeholder.append(node('span', '↻', 'quota-placeholder-icon'));
+        placeholder.append(node('span', credential.indices.length ? 'Click here to refresh quota' : 'No saved quota yet'));
+        if (credential.indices.length) {placeholder.setAttribute('aria-label', `Refresh ${C.credentialName(credential)} from the provider`); placeholder.addEventListener('click', () => void refreshFromProvider(credential, placeholder));}
+        else {placeholder.disabled = true; placeholder.title = 'Refresh this credential in Management › Quota to populate it; verified provider responses and header observations fill it automatically.';}
+        lines.append(placeholder);
+      }
       for (const line of credential.lines) {
         const wrapper = node('div', null, 'quota-line');
         const head = node('div', null, 'quota-line-head');
