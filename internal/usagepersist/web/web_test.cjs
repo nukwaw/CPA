@@ -295,6 +295,28 @@ test('a card offers only windows it can name a backend id for, once each', () =>
   assert.deepEqual(savedOnly.lines.map(line => line.source), [''], 'saved-state-only lines carry no backend id');
   assert.equal([...savedOnly.lines].filter(line => line.source).length, 0);
 });
+test('the side window splits its two sources across two tabs and reads only the visible one', () => {
+  const html = read('stats.html'), source = read('stats.js');
+  // The markup must carry exactly the two tabs and one panel each, with the stream
+  // tab's panel hidden so the quota tab is what a reader sees first.
+  assert.deepEqual([...html.matchAll(/data-dialog-tab="(\w+)"/g)].map(match => match[1]), ['quota', 'requests']);
+  assert.match(html, /id="dialog-panel-quota" class="dialog-panel"/);
+  assert.match(html, /id="dialog-panel-requests" class="dialog-panel" hidden/);
+  // The pause control belongs to the stream, so it lives on the stream tab.
+  const requestsPanel = html.slice(html.indexOf('id="dialog-panel-requests"'));
+  assert.match(requestsPanel, /id="quota-pause"/, 'the stream pause control must sit on the stream tab');
+  const quotaPanel = html.slice(html.indexOf('id="dialog-panel-quota"'), html.indexOf('id="dialog-panel-requests"'));
+  assert.doesNotMatch(quotaPanel, /id="quota-pause"/, 'the quota tab must not carry the stream control');
+  // Each tab is backed by one endpoint, and only the visible tab is read: the
+  // summary and the event stream must not share a request.
+  assert.match(source, /if \(stream\) \{\n\s*const page = await api\(`events\?\$\{params\}&limit=25`\)/);
+  assert.match(source, /const summary = await api\(`quota\/summary\?\$\{params\}`\)/);
+  assert.doesNotMatch(source, /Promise\.all\(\[api\(`quota\/summary/, 'the two sources must not be fetched together');
+  // Opening always starts on the quota tab, whatever was selected before.
+  assert.match(source, /state\.dialogPaused = false; state\.dialogTab = 'quota'; renderDialogTab\(\)/);
+  // Pausing the stream must not stop the quota tab refreshing.
+  assert.match(source, /if \(state\.dialogPaused && state\.dialogTab === 'requests'\) return;/);
+});
 test('the panel refreshes a settled card from a newer snapshot instead of skipping it', () => {
   const saved = Date.parse('2026-01-02T03:00:00Z'), window = {id: 'five_hour', used_percent: 91};
   const current = {status: 'success', windows: [{id: 'five-hour', label: '5h', usedPercent: 10, resetLabel: 'saved reset'}]};
@@ -352,7 +374,10 @@ test('the dashboard groups by account facts and never reads a removed credential
   // The side window scopes its stream and its value estimate by the recorded facts.
   assert.match(source, /const params = new URLSearchParams\(\{provider: credential\.provider, from: range\.from, to: range\.to\}\)/);
   assert.match(source, /if \(credential\.account\) params\.set\('account', credential\.account\)/);
-  assert.match(source, /api\(`quota\/summary\?\$\{params\}`\), api\(`events\?\$\{params\}&limit=25`\)/);
+  // Both sources read the same scoping parameters, so every tab stays on the one
+  // credential the side window was opened for.
+  assert.match(source, /api\(`events\?\$\{params\}&limit=25`\)/);
+  assert.match(source, /api\(`quota\/summary\?\$\{params\}`\)/);
 });
 test('the credential side window range presets are explicit UTC windows', () => {
   const now = Date.parse('2026-02-10T12:00:00Z');
@@ -371,7 +396,7 @@ test('a response model differing from the requested model is flagged, an absent 
 });
 test('statistics document keeps one overview, a requests tab, a quota tab and no header metric strip', () => {
   const html = read('stats.html');
-  for (const id of ['panel-overview', 'panel-requests', 'panel-quota', 'panel-pricing', 'quota-grid', 'quota-dialog', 'quota-history', 'quota-value', 'quota-requests', 'overview-totals']) assert.match(html, new RegExp(`id="${id}"`));
+  for (const id of ['panel-overview', 'panel-requests', 'panel-quota', 'panel-pricing', 'quota-grid', 'quota-dialog', 'quota-history', 'quota-value', 'quota-requests', 'dialog-panel-quota', 'dialog-panel-requests', 'overview-totals']) assert.match(html, new RegExp(`id="${id}"`));
   for (const gone of ['id="panel-analysis"', 'id="panel-realtime"', 'class="metrics"', 'id="auth-index"', 'id="key-id"', 'see-analysis']) assert.doesNotMatch(html, new RegExp(gone.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   for (const tab of ['overview', 'requests', 'quota', 'pricing']) assert.match(html, new RegExp(`data-tab="${tab}"`));
   // Every tab must have a panel the dashboard can unhide; pricing lives outside the

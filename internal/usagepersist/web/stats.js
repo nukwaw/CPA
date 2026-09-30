@@ -35,7 +35,7 @@
   const $ = id => document.getElementById(id);
   const sessionKey = 'cpa-stats-management-key';
   const apiBase = new URL('./v0/management/stats/', location.href);
-  const state = {key: '', tab: 'overview', chart: 'requests', paused: false, offset: 0, limit: 50, total: 0, data: null, prices: [], quota: null, credentials: [], dialog: null, dialogPaused: false, dialogTimer: 0, connected: false, stopped: false, busy: false, epoch: 0, requests: new Set(), timer: 0, failures: 0};
+  const state = {key: '', tab: 'overview', chart: 'requests', paused: false, offset: 0, limit: 50, total: 0, data: null, prices: [], quota: null, credentials: [], dialog: null, dialogTab: 'quota', dialogPaused: false, dialogTimer: 0, connected: false, stopped: false, busy: false, epoch: 0, requests: new Set(), timer: 0, failures: 0};
   const storage = {get(store, key) {try {return store.getItem(key);} catch {return null;}}, set(store, key, value) {try {if (value == null) store.removeItem(key); else store.setItem(key, value);} catch { /* Storage is optional. */ }}};
   state.key = storage.get(sessionStorage, sessionKey) || '';
   $('remember-key').checked = Boolean(state.key);
@@ -340,6 +340,18 @@
     for (const event of events) {const row = node('tr'); if (C.responseModelMismatch(event)) row.classList.add('mismatch-row'); cells(row, [C.date(event.requested_at), modelCell(event), resultBadge(event), tierCell(event), C.compact(event.total_tokens), C.speedText(event.output_tokens, event.latency_ms), C.duration(event.latency_ms), event.priced ? C.money(event.cost_usd) : 'Unpriced']); table.append(row);}
     $('quota-requests-count').textContent = events.length ? `${C.integer(events.length)} of ${C.integer(C.number(page.total) || events.length)} requests in range · newest first${state.dialogPaused ? ' · updates paused' : ' · refreshes every 5 seconds'}` : 'No requests in range';
   }
+  // The side window shows one credential from two independent sources: the recorded
+  // quota summary and the credential's own request stream. They are separate reads
+  // with separate refresh needs, so they live on separate tabs and only the visible
+  // one is read. The window and range selectors stay shared because both drive them.
+  function renderDialogTab() {
+    for (const button of document.querySelectorAll('[data-dialog-tab]')) {
+      if (button.dataset.dialogTab === state.dialogTab) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
+    }
+    $('dialog-panel-quota').hidden = state.dialogTab !== 'quota';
+    $('dialog-panel-requests').hidden = state.dialogTab !== 'requests';
+  }
+  function selectDialogTab(name) {if (!['quota', 'requests'].includes(name)) return; state.dialogTab = name; renderDialogTab(); void refreshQuotaDialog();}
   async function refreshQuotaDialog(force = true) {
     const credential = state.dialog;
     if (!credential) return;
@@ -350,14 +362,23 @@
     const params = new URLSearchParams({provider: credential.provider, from: range.from, to: range.to});
     if (credential.account) params.set('account', credential.account);
     if (window) params.set('window', window);
+    const stream = state.dialogTab === 'requests';
+    // A paused stream is not read. The poll it owns stops scheduling itself, so
+    // pausing the stream must not also stop the quota tab refreshing.
+    if (stream && state.dialogPaused) return;
     try {
-      const [summary, page] = await Promise.all([api(`quota/summary?${params}`), api(`events?${params}&limit=25`)]);
-      if (epoch !== state.epoch || state.dialog !== credential) return;
-      renderQuotaHistory(summary);
-      renderQuotaValue(summary);
-      renderQuotaRequests(page);
+      if (stream) {
+        const page = await api(`events?${params}&limit=25`);
+        if (epoch !== state.epoch || state.dialog !== credential) return;
+        renderQuotaRequests(page);
+        message('quota-requests-error', '');
+      } else {
+        const summary = await api(`quota/summary?${params}`);
+        if (epoch !== state.epoch || state.dialog !== credential) return;
+        renderQuotaHistory(summary);
+        renderQuotaValue(summary);
+      }
       message('quota-dialog-message', '');
-      message('quota-requests-error', '');
     } catch (error) {
       if (error.name === 'AbortError' || epoch !== state.epoch) return;
       message('quota-dialog-message', error.message, true);
@@ -365,9 +386,9 @@
       if (epoch === state.epoch && state.dialog === credential) scheduleQuotaDialog(force);
     }
   }
-  function scheduleQuotaDialog(force = false) {clearTimeout(state.dialogTimer); if (!state.dialog || state.dialogPaused || state.stopped) return; state.dialogTimer = setTimeout(() => {if (!document.hidden && navigator.onLine !== false) void refreshQuotaDialog(); else scheduleQuotaDialog();}, 5000);}
+  function scheduleQuotaDialog(force = false) {clearTimeout(state.dialogTimer); if (!state.dialog || state.stopped) return; if (state.dialogPaused && state.dialogTab === 'requests') return; state.dialogTimer = setTimeout(() => {if (!document.hidden && navigator.onLine !== false) void refreshQuotaDialog(); else scheduleQuotaDialog();}, 5000);}
   function openQuotaDialog(credential) {
-    state.dialog = credential; state.dialogPaused = false;
+    state.dialog = credential; state.dialogPaused = false; state.dialogTab = 'quota'; renderDialogTab();
     $('quota-pause').setAttribute('aria-pressed', 'false'); $('quota-pause').textContent = 'Pause stream';
     $('quota-dialog-title').textContent = C.credentialName(credential);
     $('quota-dialog-subtitle').textContent = C.describeCredential(credential).replace('observed', 'last saved');
@@ -384,6 +405,10 @@
     renderQuotaHistory(null); renderQuotaValue(null); renderQuotaRequests({events: [], total: 0});
     message('quota-dialog-message', '');
     if (!$('quota-dialog').open) $('quota-dialog').showModal();
+    // A modal focuses its first focusable element, which here is the dismiss button.
+    // Start on the window selector instead: it is the first real control on the
+    // surface, and it keeps the ring off the control that means "leave".
+    $('quota-window').focus();
     void refreshQuotaDialog();
   }
   function closeQuotaDialog() {state.dialog = null; clearTimeout(state.dialogTimer); if ($('quota-dialog').open) $('quota-dialog').close();}
@@ -445,6 +470,7 @@
   $('quota-refresh').addEventListener('click', () => void refresh());
   $('quota-provider-refresh').addEventListener('click', () => void refreshFromProvider(state.credentials, $('quota-provider-refresh')));
   $('quota-dialog-close').addEventListener('click', closeQuotaDialog);
+  for (const button of document.querySelectorAll('[data-dialog-tab]')) button.addEventListener('click', () => selectDialogTab(button.dataset.dialogTab));
   $('quota-dialog').addEventListener('close', () => {state.dialog = null; clearTimeout(state.dialogTimer);});
   $('quota-window').addEventListener('change', () => void refreshQuotaDialog());
   $('quota-range').addEventListener('change', () => void refreshQuotaDialog());
