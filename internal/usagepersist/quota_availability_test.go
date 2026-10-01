@@ -132,7 +132,7 @@ func TestQuotaCoreIOLockDoesNotBlockOriginalManagement(t *testing.T) {
 			const input = `{"url":"https://example.invalid/anonymous","header":{}}`
 			const output = `{"status_code":200,"header":{},"body":"unchanged"}`
 			engine := gin.New()
-			engine.Use(s.ManagementMiddleware(nil, nil))
+			engine.Use(s.ManagementMiddleware())
 			engine.POST("/v0/management/api-call", func(c *gin.Context) {
 				body, err := io.ReadAll(c.Request.Body)
 				if err != nil || string(body) != input {
@@ -167,7 +167,7 @@ func TestQuotaCoreIOLockQueuesCompletedManagementResponse(t *testing.T) {
 	const input = `{"auth_index":"core-lock-index","url":"https://api.anthropic.com/api/oauth/usage","header":{"Authorization":"Bearer $TOKEN$"}}`
 	const output = `{"status_code":200,"header":{},"body":"{\"five_hour\":{\"utilization\":40}}"}`
 	engine := gin.New()
-	engine.Use(s.ManagementMiddleware(nil, nil))
+	engine.Use(s.ManagementMiddleware())
 	var marked <-chan struct{}
 	resolvedInHandler := false
 	engine.POST("/v0/management/api-call", func(c *gin.Context) {

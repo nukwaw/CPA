@@ -2,9 +2,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const vm = require('node:vm');
 const C = require('./stats-core.js');
-const bridge = require('./management-bridge.js');
 const {statusNotice, httpErrorMessage} = require('./stats.js');
 const read = name => fs.readFileSync(require('node:path').join(__dirname, name), 'utf8');
 test('disabled builtin collection is informational and preserves history/pricing/quota access', () => {
@@ -317,23 +315,8 @@ test('the side window splits its two sources across two tabs and reads only the 
   // Pausing the stream must not stop the quota tab refreshing.
   assert.match(source, /if \(state\.dialogPaused && state\.dialogTab === 'requests'\) return;/);
 });
-test('the panel refreshes a settled card from a newer snapshot instead of skipping it', () => {
-  const saved = Date.parse('2026-01-02T03:00:00Z'), window = {id: 'five_hour', used_percent: 91};
-  const current = {status: 'success', windows: [{id: 'five-hour', label: '5h', usedPercent: 10, resetLabel: 'saved reset'}]};
-  // The stored state's own observation time is the floor, so an older snapshot
-  // changes nothing while a newer one updates the window it reports.
-  assert.equal(bridge.overlay('claude', current, {observed_at: '2026-01-02T02:00:00Z', windows: [window]}, saved).changed, false);
-  const result = bridge.overlay('claude', current, {observed_at: '2026-01-02T05:00:00Z', windows: [window]}, saved);
-  assert.equal(result.changed, true);
-  assert.equal(result.state.windows.find(item => item.id === 'five-hour').usedPercent, 91);
-  // A settled card must no longer be skipped outright, and the floor must come
-  // from the stored observation rather than from this session alone.
-  const source = read('management-bridge.js');
-  assert.doesNotMatch(source, /existing\?\.status === 'success' && !observation\.has\(id\)\) continue/);
-  assert.match(source, /storedObservation\.get\(id\)/);
-});
 test('the dashboard groups by account facts and never reads a removed credential identity', () => {
-  const source = read('stats.js'), core = read('stats-core.js'), html = read('stats.html'), bridgeSource = read('management-bridge.js');
+  const source = read('stats.js'), core = read('stats-core.js'), html = read('stats.html');
   // Cards are identified by the credential file, matching the control panel's own
   // quota page. The account is recorded as a fact on each card, not used as the key.
   assert.match(core, /const credentialKey = \(provider, key\) =>/);
@@ -362,12 +345,6 @@ test('the dashboard groups by account facts and never reads a removed credential
   assert.doesNotMatch(core, /ensure\([^)]*index/, 'a credential index must not participate in grouping');
   assert.doesNotMatch(core, /describeCredential = credential => `\$\{credential\?\.[^`]*indices/, 'the index is never rendered');
   assert.match(core, /credential\.indices\.push\(index\)/, 'the index is collected for addressing only');
-  // The bridge may correlate a native request with the transient index, but it must
-  // never persist it, key a map by it, or upload it.
-  assert.doesNotMatch(bridgeSource, /credential_generation|revision/, 'the bridge must not use a removed credential identity');
-  assert.doesNotMatch(bridgeSource, /slot\([^)]*auth_index/, 'the bridge must not key a map by the credential index');
-  assert.match(bridgeSource, /const uploadEntry = entry => \(\{provider: entry\.provider, key: entry\.key, account: entry\.account, account_kind: entry\.account_kind/);
-  assert.match(bridgeSource, /body: \{entries: batch\.map\(\(\[, value\]\) => uploadEntry\(value\.entry\)\)\}/);
   // The account stays a recorded fact and still scopes the side window, so
   // (provider, account) remains usable for grouping without keying the cards.
   assert.match(core, /if \(!credential\.account && account\) credential\.account = account/);
@@ -508,412 +485,6 @@ test('CSV exports neutralize spreadsheet formulas and escape quotes', () => {
   assert.equal(C.csvCell('=HYPERLINK("evil")'), '"\'=HYPERLINK(""evil"")"');
   assert.equal(C.csvCell(' +2'), '"\' +2"'); assert.equal(C.csvCell('ordinary'), '"ordinary"');
 });
-test('quota sanitizer drops all unknown credential-bearing fields recursively', () => {
-  const clean = bridge.sanitize('codex', {status: 'success', access_token: 'SECRET', error: 'secret error', windows: [{id: 'five-hour', usedPercent: 25, token: 'SECRET', labelParams: {name: 'GPT', access_token: 'SECRET'}}]});
-  assert.deepEqual(clean, {status: 'success', windows: [{id: 'five-hour', usedPercent: 25, labelParams: {name: 'GPT'}}]});
-  assert.equal(JSON.stringify(clean).includes('SECRET'), false);
-  assert.equal(bridge.sanitize('codex', {status: 'loading', windows: []}), null);
-  assert.equal(bridge.sanitize('__proto__', {status: 'success'}), null);
-});
-test('provider schemas preserve only the actual quota display fields', () => {
-  const states = {
-    antigravity: {status: 'success', groups: [{id: 'g', buckets: [{id: 'b', remainingFraction: .6}]}]},
-    claude: {status: 'success', windows: [], extraUsage: {is_enabled: true, monthly_limit: 50, used_credits: 2, utilization: null}},
-    devin: {status: 'success', windows: [], observedAtMs: 123, plan: 'pro'},
-    kimi: {status: 'success', rows: [{id: 'summary', used: 1, limit: 5}]},
-    meta: {status: 'success', data: {windows: [{id: 'weekly', usedPercent: 10}], planName: 'pro'}},
-    xai: {status: 'success', billing: {mode: 'billing', periodType: 'weekly', usagePercent: 30, productUsage: []}}
-  };
-  for (const [provider, state] of Object.entries(states)) assert.deepEqual(bridge.sanitize(provider, {...state, refresh_token: 'secret'}), state);
-  const xai = bridge.sanitize('xai', {...states.xai, billing: {...states.xai.billing, userId: 'private', teamId: 'private'}});
-  assert.equal(JSON.stringify(xai).includes('private'), false);
-});
-test('Codex window identity uses observed duration, never primary-order guess', () => {
-  assert.equal(bridge.normalizedWindowID('codex', {id: 'primary'}), null);
-  assert.equal(bridge.normalizedWindowID('codex', {id: 'primary', window_seconds: 604800}), 'weekly');
-  assert.equal(bridge.normalizedWindowID('codex', {id: 'secondary', window_seconds: 18000}), 'five-hour');
-  assert.equal(bridge.normalizedWindowID('claude', {id: 'iguana_necktie'}), 'seven-day-fable');
-});
-test('additional Codex windows match unique observed name/duration, never index', () => {
-  const windows = [{id: 'gpt-five-hour-3', labelParams: {name: 'GPT'}, periodHours: 5}];
-  assert.equal(bridge.normalizedWindowID('codex', {id: 'additional:gpt:primary', window_seconds: 18000}, windows), 'gpt-five-hour-3');
-  assert.equal(bridge.normalizedWindowID('codex', {id: 'additional:gpt:primary', window_seconds: 18000}, windows.concat(windows)), null);
-});
-test('quota overlay only updates newer windows and preserves unknown prior data', () => {
-  const now = Date.now(), old = now - 60000;
-  const current = {status: 'success', planType: 'Pro', windows: [{id: 'five-hour', usedPercent: 5, label: 'Existing', resetLabel: '-', periodHours: 5}, {id: 'weekly', usedPercent: 30, label: 'Weekly', resetLabel: '-', periodHours: 168}]};
-  const times = new Map();
-  const snapshot = {windows: [{id: 'primary', used_percent: 50, window_seconds: 18000, observed_at: new Date(now).toISOString()}, {id: 'secondary', used_percent: 99, window_seconds: 604800, observed_at: new Date(old - 1000).toISOString()}]};
-  const result = bridge.overlay('codex', current, snapshot, old, times);
-  assert.equal(result.changed, true); assert.equal(result.state.planType, 'Pro'); assert.equal(result.state.windows[0].usedPercent, 50); assert.equal(result.state.windows[1].usedPercent, 30); assert.equal(current.windows[0].usedPercent, 5);
-  assert.equal(bridge.overlay('codex', result.state, snapshot, old, times).changed, false);
-  assert.equal(bridge.overlay('codex', {status: 'loading', windows: []}, snapshot, old).changed, false);
-  assert.equal(bridge.overlay('codex', {status: 'error', windows: []}, snapshot, old).changed, false);
-});
-test('newer 10% quota clears an expired reset from old 90% state for every mapped provider', () => {
-  const now = Date.now(), old = now - 120000, expired = now - 60000;
-  const cases = [
-    {provider: 'codex', id: 'five-hour', incoming: {id: 'primary', window_seconds: 18000, used_percent: 10}, oldUsage: {usedPercent: 90}, usage: item => item.usedPercent, expected: 10, resets: {resetAtMs: expired, resetLabel: 'expired reset'}, wrap: windows => ({status: 'success', windows}), items: state => state.windows},
-    {provider: 'claude', id: 'five-hour', incoming: {id: 'five_hour', used_percent: 10}, oldUsage: {usedPercent: 90}, usage: item => item.usedPercent, expected: 10, resets: {resetAtMs: expired, resetLabel: 'expired reset'}, wrap: windows => ({status: 'success', windows}), items: state => state.windows},
-    {provider: 'devin', id: 'monthly', incoming: {id: 'monthly', remaining_percent: 90}, oldUsage: {remainingPercent: 10}, usage: item => item.remainingPercent, expected: 90, resets: {resetAtMs: expired, resetLabel: 'expired reset'}, wrap: windows => ({status: 'success', windows}), items: state => state.windows},
-    {provider: 'antigravity', id: 'model', incoming: {id: 'model', used_percent: 10}, oldUsage: {remainingFraction: .1}, usage: item => item.remainingFraction, expected: .9, resets: {resetAtMs: expired, resetTime: new Date(expired).toISOString()}, wrap: buckets => ({status: 'success', groups: [{id: 'group', buckets}]}), items: state => state.groups[0].buckets},
-    {provider: 'kimi', id: 'weekly', incoming: {id: 'weekly', used: 10, limit: 100}, oldUsage: {used: 90, limit: 100}, usage: item => item.used, expected: 10, resets: {resetAtMs: expired, resetHint: 'expired reset'}, wrap: rows => ({status: 'success', rows}), items: state => state.rows},
-    {provider: 'meta', id: 'weekly', incoming: {id: 'weekly', used_percent: 10}, oldUsage: {usedPercent: 90}, usage: item => item.usedPercent, expected: 10, resets: {resetAt: expired / 1000}, wrap: windows => ({status: 'success', data: {windows}}), items: state => state.data.windows}
-  ];
-  for (const c of cases) {
-    const current = c.wrap([{id: c.id, ...c.oldUsage, ...c.resets}, {id: 'unrelated', ...c.oldUsage, ...c.resets}]);
-    const original = structuredClone(current), times = new Map();
-    const snapshot = {windows: [{...c.incoming, observed_at: new Date(now).toISOString()}]};
-    const result = bridge.overlay(c.provider, current, snapshot, old, times);
-    assert.equal(result.changed, true, c.provider);
-    const [updated, unrelated] = c.items(result.state);
-    assert.equal(c.usage(updated), c.expected, c.provider);
-    for (const field of Object.keys(c.resets)) assert.equal(Object.hasOwn(updated, field), false, `${c.provider}.${field}`);
-    assert.deepEqual(unrelated, c.items(original)[1], `${c.provider} unrelated window`);
-    assert.deepEqual(current, original, `${c.provider} source state must not mutate`);
-    for (const at of [old - 1, old]) {
-      const stale = bridge.overlay(c.provider, current, {windows: [{...c.incoming, observed_at: new Date(at).toISOString()}]}, old);
-      assert.equal(stale.changed, false, `${c.provider} stale reset-less observation`);
-      assert.equal(stale.state, current);
-    }
-    const staleReset = bridge.overlay(c.provider, result.state, {windows: [{...c.incoming, reset_at: new Date(expired).toISOString(), observed_at: new Date(now - 1).toISOString()}]}, old, times);
-    assert.equal(staleReset.changed, false, `${c.provider} stale reset must not reappear`);
-    assert.equal(staleReset.state, result.state);
-  }
-});
-test('overlay uses a normalized future reset but never invents or restores one from display cache', () => {
-  const now = Date.now(), future = now + 3600000;
-  const current = {status: 'success', windows: [{id: 'five-hour', usedPercent: 90, resetAtMs: future, resetLabel: 'old future label'}]};
-  const window = {id: 'primary', used_percent: 10, window_seconds: 18000, observed_at: new Date(now).toISOString()};
-  const withReset = bridge.overlay('codex', current, {windows: [{...window, reset_at: new Date(future).toISOString()}]}, now - 1000);
-  assert.equal(withReset.state.windows[0].resetAtMs, future);
-  assert.equal(withReset.state.windows[0].resetLabel, new Date(future).toLocaleString());
-  for (const reset_at of [undefined, null, '', 'invalid']) {
-    const withoutReset = bridge.overlay('codex', current, {windows: [{...window, reset_at}]}, now - 1000);
-    assert.equal(withoutReset.state.windows[0].usedPercent, 10);
-    assert.equal(Object.hasOwn(withoutReset.state.windows[0], 'resetAtMs'), false);
-    assert.equal(Object.hasOwn(withoutReset.state.windows[0], 'resetLabel'), false);
-  }
-});
-test('partial normalized state creates only supported observed windows', () => {
-  const snapshot = {plan: 'Pro', windows: [{id: 'five_hour', used_percent: 75, observed_at: new Date().toISOString()}]};
-  const result = bridge.overlay('claude', null, snapshot, 0);
-  assert.equal(result.changed, true); assert.equal(result.state.windows.length, 1); assert.equal(result.state.windows[0].id, 'five-hour'); assert.equal(result.state.planType, 'Pro');
-});
-
-function store(initial) {let state = initial; const listeners = []; return {getState: () => state, subscribe(fn) {listeners.push(fn); return () => {};}, setState(patch) {const old = state; if (typeof patch === 'function') patch = patch(state); if (patch === state) return; state = {...state, ...patch}; listeners.forEach(fn => fn(state, old));}};}
-const settle = () => new Promise(resolve => setImmediate(resolve));
-// Records carry plain account facts: provider + account + account_kind. The
-// credential index survives only as transient correlation data for the native page.
-const binding = (account = 'person@example.test', account_kind = 'email', extra = {}) => ({provider: 'codex', key: 'test.json', account, account_kind, auth_index: 'index1', ...extra});
-const success = (usedPercent = 42) => ({status: 'success', windows: [{id: 'five-hour', usedPercent, resetLabel: '-'}]});
-const cachedEntry = (who = binding(), at = Date.now() - 60000) => ({provider: who.provider, key: who.key, account: who.account, account_kind: who.account_kind, observed_at: new Date(at).toISOString(), state: {status: 'success', windows: [{id: 'five-hour', usedPercent: 12, label: 'Five hours', resetLabel: '-', periodHours: 5}]}});
-const providers = ['antigravity', 'claude', 'codex', 'devin', 'kimi', 'meta', 'xai'];
-function harness({cached = [], snapshots = [], origin = 'http://localhost:18317', delayFiles = false, quotaStatus = 200, bindings = [binding()], now = Date.now()} = {}) {
-  const calls = [], events = [], timers = new Map(), listeners = new Map(), holds = []; let nextTimer = 0;
-  const maps = {cacheGeneration: 0, fileGenerations: {}, ...Object.fromEntries(providers.map(provider => [`${provider}Quota`, {}]))};
-  const quota = store(maps), auth = store({isAuthenticated: true, connectionStatus: 'connected', apiBase: origin, managementKey: 'secret-key'});
-  const session = new Map();
-  const window = {dispatchEvent(event) {events.push(event);}, addEventListener(type, fn) {listeners.set(type, fn);}, sessionStorage: {getItem: key => session.has(key) ? session.get(key) : null, setItem: (key, value) => session.set(key, value), removeItem: key => session.delete(key)}};
-  const h = {window, quota, auth, calls, events, timers, bindings, cached, snapshots, quotaStatus, now, putStatus: 200, clearCalls: [], session, hold(path, method = 'GET') {holds.push({path, method});}, refresh() {listeners.get('online')();}, async timersAt(ms) {for (const [id, timer] of [...timers]) if (timer.ms === ms) {timers.delete(id); timer.fn();} await settle();}, puts() {return calls.filter(call => call.options.method === 'PUT');}, resolveFiles() {calls.find(call => call.url.endsWith('/identities') && call.release)?.release();}};
-  if (delayFiles) h.hold('/identities');
-  class Clock extends Date {constructor(...args) {super(...(args.length ? args : [h.now]));} static now() {return h.now;}}
-  const context = vm.createContext({window, location: {origin: 'http://localhost:18317', href: 'http://localhost:18317/management.html'}, document: {hidden: false}, navigator: {onLine: true}, URL, Date: Clock, Map, Set, Object, Number, String, Array, JSON, Promise, TextEncoder, AbortController, DOMException, CustomEvent: class {constructor(type, options) {this.type = type; this.detail = options.detail;}}, console: {warn() {}}, setTimeout(fn, ms) {const id = ++nextTimer; timers.set(id, {fn, ms}); return id;}, clearTimeout(id) {timers.delete(id);}, fetch: async (url, options) => {
-    const call = {url, options}; calls.push(call);
-    let body = {}; if (url.endsWith('/identities')) body = {bindings: h.bindings}; else if (url.endsWith('/quota/cache')) body = {entries: h.cached}; else if (url.endsWith('/quota')) body = {snapshots: h.snapshots};
-    let status = options.method === 'PUT' ? h.putStatus : h.quotaStatus;
-    body = structuredClone(body);
-    const held = holds.findIndex(item => url.endsWith(item.path) && options.method === item.method);
-    if (held >= 0) {holds.splice(held, 1); const override = await new Promise(resolve => {call.release = value => {delete call.release; resolve(value);};}); if (override?.body) body = override.body; if (override?.status) status = override.status;}
-    return {ok: status >= 200 && status < 300, status, json: async () => body};
-  }});
-  vm.runInContext(read('management-bridge.js'), context);
-  const api = window.CPAQuotaPersistence;
-  // Exact semantics of the verified native helpers. Compiled-fixture Go tests
-  // additionally execute the ORIGINAL generated expressions through this bridge.
-  const nativeCapture = name => {const {cacheGeneration, fileGenerations} = quota.getState(); return {cacheGeneration, fileGenerations, name};};
-  const nativeCommit = (generation, commit, name = generation.name) => {const current = quota.getState(); if (current.cacheGeneration !== generation.cacheGeneration) return false; if (name !== undefined) {if ((current.fileGenerations[name] ?? 0) !== (generation.fileGenerations[name] ?? 0)) return false;} else if (current.fileGenerations !== generation.fileGenerations) return false; commit(); return true;};
-  const resolveUpdater = api.wrapUpdater((updater, previous) => typeof updater === 'function' ? updater(previous) : updater);
-  h.capture = api.wrapCapture(nativeCapture); h.commit = api.wrapCommit(nativeCommit);
-  h.update = (provider, updater) => quota.setState(state => ({[`${provider}Quota`]: resolveUpdater(updater, state[`${provider}Quota`])}));
-  h.clear = names => {
-    h.clearCalls.push(names ? [...names] : undefined);
-    quota.setState(state => {
-      if (names) {
-        if (!names.length) return state;
-        const fileGenerations = {...state.fileGenerations}; names.forEach(name => {fileGenerations[name] = (fileGenerations[name] ?? 0) + 1;});
-        return {fileGenerations, ...Object.fromEntries(providers.map(provider => {const map = `${provider}Quota`, cache = state[map], keys = Object.keys(cache).filter(key => names.includes(key.split('\0')[0])); if (!keys.length) return [map, cache]; const next = {...cache}; keys.forEach(key => delete next[key]); return [map, next];}))};
-      }
-      return {cacheGeneration: state.cacheGeneration + 1, fileGenerations: {}, ...Object.fromEntries(providers.map(provider => [`${provider}Quota`, {}]))};
-    });
-  };
-  quota.setState({clearQuotaCache: h.clear});
-  h.succeed = (generation, value = success(), provider = 'codex', key = 'test.json') => h.commit(generation, () => h.update(provider, previous => ({...previous, [key]: value})));
-  h.batch = (generation, results) => {for (const provider of new Set(results.map(result => result.provider))) h.update(provider, previous => {const next = {...previous}; results.filter(result => result.provider === provider).forEach(result => h.commit(generation, () => {next[result.key] = result.state;}, result.key.split('\0')[0])); return next;});};
-  api.attach({quotaStore: quota, authStore: auth});
-  return h;
-}
-
-test('bridge hydrates stored history for the same account facts without uploading it', async () => {
-  const entry = cachedEntry(), h = harness({cached: [entry]}); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'].windows[0].usedPercent, 12);
-  assert.equal(h.window.CPAQuotaPersistence.status.cache_observed_at, entry.observed_at);
-  await h.timersAt(500); assert.equal(h.puts().length, 0);
-  assert.ok(h.calls.every(call => !call.url.includes('secret-key') && call.options.headers.Authorization === 'Bearer secret-key'));
-  assert.equal(h.calls.some(call => call.url.includes('auth-files')), false);
-});
-test('bridge reports unavailable storage on canonical event without replacing quota UI state', async () => {
-  const h = harness({quotaStatus: 503, delayFiles: true}), original = success(90);
-  h.quota.setState({codexQuota: {'test.json': original}}); h.resolveFiles(); await settle();
-  assert.equal(h.window.CPAQuotaPersistence.status.state, 'unavailable');
-  assert.match(h.window.CPAQuotaPersistence.status.message, /original management page and manual quota refresh remain available/);
-  assert.equal(h.quota.getState().codexQuota['test.json'], original);
-  assert.ok(h.events.every(event => event.type === 'cpa-quota-persistence-status'));
-  assert.equal(JSON.stringify(h.window.CPAQuotaPersistence.status).includes('secret-key'), false);
-});
-test('bridge refuses cross-origin or URL-carried credentials without leaking key', async () => {
-  for (const origin of ['https://other.example', 'http://user:secret@localhost:18317', 'http://localhost:18317?token=secret', 'http://localhost:18317#secret']) {const h = harness({origin}); await settle(); assert.equal(h.calls.length, 0); assert.equal(h.window.CPAQuotaPersistence.status.state, 'incompatible');}
-});
-test('bridge hydrates only cache entries whose account facts still match the binding', async () => {
-  const entry = cachedEntry(), h = harness({cached: [entry], delayFiles: true});
-  h.quota.setState({codexQuota: {'test.json': {status: 'loading', windows: []}}}); h.resolveFiles(); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'].status, 'loading');
-  for (const change of [{account: 'other@example.test'}, {account_kind: 'device_id'}, {account: undefined}, {account_kind: undefined}]) {
-    const other = harness({cached: [{...entry, ...change}]}); await settle(); assert.equal(other.quota.getState().codexQuota['test.json'], undefined);
-  }
-});
-test('success before first binding is never retroactively promoted', async () => {
-  const h = harness({delayFiles: true}), operation = h.capture('test.json');
-  assert.equal(h.succeed(operation, {...success(), access_token: 'DO_NOT_PERSIST'}), true);
-  h.resolveFiles(); await settle(); await h.timersAt(500); await h.timersAt(15000);
-  assert.equal(h.puts().length, 0);
-  // A subsequent genuinely bound operation persists normally.
-  const bound = h.capture('test.json'); h.succeed(bound, {...success(), access_token: 'DO_NOT_PERSIST'}); await h.timersAt(500);
-  const body = JSON.parse(h.puts()[0].options.body); assert.equal(body.entries[0].account, 'person@example.test'); assert.equal(body.entries[0].account_kind, 'email'); assert.equal(h.puts()[0].options.body.includes('DO_NOT_PERSIST'), false);
-});
-test('operation starting before identities remains unknown even if its success arrives after lookup', async () => {
-  const h = harness({delayFiles: true}), old = h.capture('test.json'); h.resolveFiles(); await settle();
-  assert.equal(h.succeed(old), false); await h.timersAt(500); assert.equal(h.puts().length, 0);
-});
-test('a normal quota refresh saves only account facts and reloads them without another upload', async () => {
-  const h = harness(); await settle(); const operation = h.capture('test.json');
-  h.succeed(operation, success(25)); await h.timersAt(500); const entries = JSON.parse(h.puts()[0].options.body).entries;
-  assert.deepEqual(Object.keys(entries[0]).sort(), ['account', 'account_kind', 'key', 'observed_at', 'provider', 'state']);
-  assert.equal(entries[0].account, 'person@example.test'); assert.equal(entries[0].account_kind, 'email');
-  const reloaded = harness({cached: entries}); await settle(); assert.equal(reloaded.quota.getState().codexQuota['test.json'].windows[0].usedPercent, 25);
-  await reloaded.timersAt(500); assert.equal(reloaded.puts().length, 0);
-});
-test('an all-provider batch uploads account facts and never a credential index', async () => {
-  const bindings = providers.map(provider => binding(`account-${provider}`, 'email', {provider, key: provider === 'devin' ? 'devin.json\0index1' : `${provider}.json`}));
-  const h = harness({bindings}); await settle(); const capture = h.capture();
-  const states = {antigravity: {status: 'success', groups: []}, claude: success(), codex: success(), devin: success(), kimi: {status: 'success', rows: []}, meta: {status: 'success', data: {windows: []}}, xai: {status: 'success', billing: {usagePercent: 42}}};
-  h.refresh(); await settle(); assert.equal(h.clearCalls.length, 0);
-  h.batch(capture, bindings.map(who => ({provider: who.provider, key: who.key, state: states[who.provider]})));
-  await h.timersAt(500); const body = h.puts()[0].options.body, entries = JSON.parse(body).entries;
-  assert.equal(entries.length, 7);
-  for (const entry of entries) {assert.equal(entry.account, `account-${entry.provider}`); assert.equal(entry.account_kind, 'email'); assert.equal(Object.hasOwn(entry, 'auth_index'), false); assert.equal(Object.hasOwn(entry.state, 'auth_index'), false);}
-  assert.equal(body.includes('"auth_index"'), false, 'the transient credential index never leaves the page');
-  assert.deepEqual(Object.keys(capture).sort(), ['cacheGeneration', 'fileGenerations', 'name']);
-});
-test('A starts, B replaces the same provider and account, identity learns B, then A succeeds', async () => {
-  const h = harness(); await settle();
-  const A = h.capture('test.json'); h.bindings = [{...binding(), auth_index: 'index2'}]; h.refresh(); await settle();
-  assert.equal(h.succeed(A, success(91)), false); assert.equal(h.quota.getState().codexQuota['test.json'], undefined);
-  h.succeed(h.capture('test.json'), success(10)); await h.timersAt(500);
-  const entry = JSON.parse(h.puts()[0].options.body).entries[0];
-  assert.equal(entry.account, 'person@example.test'); assert.equal(entry.state.windows[0].usedPercent, 10);
-  assert.equal(Object.hasOwn(entry, 'auth_index'), false); assert.equal(JSON.stringify(entry).includes('index2'), false);
-});
-test('a replaced binding fences old operations and reloads stored history for the new one', async () => {
-  const h = harness({cached: [cachedEntry()]}); await settle(); const old = h.capture('test.json');
-  h.bindings = [binding('moved@example.test')]; h.refresh(); await settle();
-  assert.equal(h.succeed(old, success(90)), false);
-  assert.equal(h.quota.getState().codexQuota['test.json'], undefined, 'a genuine account change clears the replaced display state');
-  await h.timersAt(500); assert.equal(h.puts().length, 0);
-  const refreshed = harness({cached: [cachedEntry(binding('moved@example.test'))], bindings: [binding('moved@example.test')]}); await settle();
-  assert.equal(refreshed.quota.getState().codexQuota['test.json'].windows[0].usedPercent, 12);
-});
-test('an unchanged binding poll never resets native operations', async () => {
-  const h = harness({cached: [cachedEntry()]}); await settle();
-  const current = h.capture('test.json'); h.refresh(); await settle();
-  assert.equal(h.clearCalls.length, 0);
-  assert.equal(h.commit(current, () => {}), true);
-  h.succeed(h.capture('test.json'), success(33)); await h.timersAt(500);
-  assert.equal(JSON.parse(h.puts()[0].options.body).entries[0].state.windows[0].usedPercent, 33);
-});
-test('unknown batch files remain unknown across unchanged polls and a later binding addition', async () => {
-  const h = harness(); await settle(); const batch = h.capture(); h.refresh(); await settle();
-  h.bindings.push(binding('new@example.test', 'email', {key: 'new.json'})); h.refresh(); await settle();
-  h.batch(batch, [{provider: 'codex', key: 'new.json', state: success(90)}]); assert.equal(h.quota.getState().codexQuota['new.json'], undefined);
-  await h.timersAt(500); assert.equal(h.puts().length, 0);
-});
-test('unknown direct writes and unknown-at-start operations refuse persistence', async () => {
-  const h = harness(); await settle(); h.quota.setState({codexQuota: {'test.json': success()}}); await h.timersAt(500); assert.equal(h.puts().length, 0);
-  const unknown = h.capture('unknown.json'); h.bindings.push(binding('new@example.test', 'email', {key: 'unknown.json'})); h.refresh(); await settle();
-  assert.equal(h.succeed(unknown, success(), 'codex', 'unknown.json'), false); await h.timersAt(500); assert.equal(h.puts().length, 0);
-});
-test('a credential with no account property persists its facts and groups under its provider', async () => {
-  const h = harness({bindings: [binding('', '')]}); await settle(); const capture = h.capture('test.json');
-  h.succeed(capture, success(64)); await h.timersAt(500);
-  const entry = JSON.parse(h.puts()[0].options.body).entries[0];
-  assert.equal(entry.provider, 'codex'); assert.equal(entry.account, ''); assert.equal(entry.account_kind, '');
-  // The dashboard shows one card per credential file even when neither credential
-  // exposes an account property: they are not known to be the same account, so
-  // merging them would present one credential's quota as if it covered the other.
-  const cards = C.summarizeCredentials([], [], [binding('', ''), binding('', '', {key: 'other.json'})]);
-  assert.equal(cards.length, 2); assert.ok(cards.every(card => card.provider === 'codex')); assert.ok(cards.every(card => card.account === ''));
-  assert.deepEqual(cards.map(C.credentialName), ['other.json', 'test.json']);
-});
-test('two live bindings for one account share the single persisted row the pair owns', async () => {
-  const h = harness({bindings: [binding(), binding('person@example.test', 'email', {key: 'other.json', auth_index: 'index2'})]});
-  await settle();
-  // Both credentials resolve to one (provider, account) pair, so both stay legally
-  // correlated; the second one never renames the pair or duplicates the row.
-  h.succeed(h.capture('test.json'), success(41)); await h.timersAt(500);
-  h.succeed(h.capture('other.json'), success(42), 'codex', 'other.json'); await h.timersAt(500);
-  const entries = h.puts().map(call => JSON.parse(call.options.body).entries[0]);
-  assert.equal(entries.length, 2);
-  for (const entry of entries) {assert.equal(entry.provider, 'codex'); assert.equal(entry.account, 'person@example.test'); assert.equal(entry.account_kind, 'email'); assert.equal(Object.hasOwn(entry, 'auth_index'), false);}
-});
-test('a malformed binding is dropped instead of trusted', async () => {
-  for (const bindings of [[{...binding(), key: ''}], [{...binding(), account: 42}], [{...binding(), account_kind: undefined}], [{...binding(), auth_index: 7}], [{...binding(), provider: '__proto__'}]]) {
-    const h = harness({bindings, cached: [cachedEntry()]}); await settle(); h.succeed(h.capture('test.json')); await h.timersAt(500); assert.equal(h.puts().length, 0);
-  }
-});
-test('failed PUT retries preserve the original binding only while current', async () => {
-  const h = harness(); await settle(); h.putStatus = 500; h.succeed(h.capture('test.json')); await h.timersAt(500);
-  assert.equal(h.puts().length, 1); h.putStatus = 200; await h.timersAt(15000); assert.equal(h.puts().length, 2);
-  assert.equal(h.puts()[0].options.body, h.puts()[1].options.body);
-  h.putStatus = 500; h.succeed(h.capture('test.json')); await h.timersAt(500);
-  h.bindings = [binding('replacement@example.test')]; h.refresh(); await settle(); h.putStatus = 200; await h.timersAt(15000); assert.equal(h.puts().length, 3);
-});
-test('failed PUT completion after replacement cannot requeue the old batch', async () => {
-  const h = harness(); await settle(); h.hold('/quota/cache', 'PUT'); h.succeed(h.capture('test.json')); await h.timersAt(500); const put = h.puts()[0];
-  h.bindings = [binding('replacement@example.test')]; h.refresh(); await settle(); put.release({status: 500}); await settle(); await h.timersAt(15000); assert.equal(h.puts().length, 1);
-});
-test('a late 409 cannot erase the replacement display or discard its queued upload', async () => {
-  const h = harness(); await settle(); h.hold('/quota/cache', 'PUT');
-  h.succeed(h.capture('test.json'), success(90)); await h.timersAt(500); const failed = h.puts()[0];
-  h.bindings = [binding('replacement@example.test')]; h.refresh(); await settle();
-  const replacement = h.capture('test.json'), live = success(10); h.succeed(replacement, live);
-  const clears = h.clearCalls.length; failed.release({status: 409}); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'], live);
-  assert.equal(h.clearCalls.length, clears, 'a stale failure must not reset the replacement native generation');
-  assert.equal(h.commit(replacement, () => {}), true);
-  await h.timersAt(500); await h.timersAt(15000);
-  assert.equal(h.puts().length, 2, 'the replacement must upload, the stale batch must never retry');
-  const entries = h.puts().map(call => JSON.parse(call.options.body).entries[0]);
-  assert.deepEqual(entries.map(entry => [entry.account, entry.state.windows[0].usedPercent]), [['person@example.test', 90], ['replacement@example.test', 10]]);
-});
-test('a late 409 never drops newer valid pending work for the same account', async () => {
-  const h = harness(); await settle(); h.hold('/quota/cache', 'PUT');
-  h.succeed(h.capture('test.json'), success(90)); await h.timersAt(500); const failed = h.puts()[0];
-  const newer = h.capture('test.json'), live = success(10); h.succeed(newer, live); await h.timersAt(500);
-  failed.release({status: 409}); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'], live);
-  assert.equal(h.clearCalls.length, 0);
-  assert.equal(h.commit(newer, () => {}), true);
-  await h.timersAt(15000); assert.equal(h.puts().length, 2);
-  const entries = h.puts().map(call => JSON.parse(call.options.body).entries[0]);
-  assert.deepEqual(entries.map(entry => [entry.account, entry.state.windows[0].usedPercent]), [['person@example.test', 90], ['person@example.test', 10]]);
-});
-test('409 is terminal for the whole batch and never re-stamps or retries it', async () => {
-  const h = harness(); await settle(); h.putStatus = 409; h.succeed(h.capture('test.json')); h.bindings = [binding('replacement@example.test')]; await h.timersAt(500);
-  h.putStatus = 200; await h.timersAt(15000); assert.equal(h.puts().length, 1); assert.equal(h.quota.getState().codexQuota['test.json'], undefined);
-  h.succeed(h.capture('test.json'), success(10)); await h.timersAt(500); assert.equal(h.puts().length, 2); assert.equal(JSON.parse(h.puts()[1].options.body).entries[0].account, 'replacement@example.test');
-});
-test('409 does not permanently disable new operations for unchanged valid batch siblings', async () => {
-  const h = harness(); await settle(); const old = h.capture('test.json'); h.putStatus = 409; h.succeed(old); await h.timersAt(500);
-  assert.equal(h.succeed(old), false); h.putStatus = 200; h.succeed(h.capture('test.json'), success(12)); await h.timersAt(500);
-  assert.equal(h.puts().length, 2); assert.equal(JSON.parse(h.puts()[1].options.body).entries[0].state.windows[0].usedPercent, 12);
-});
-test('a per-file reset while a PUT fails prevents requeue without clearing unrelated pending quota', async () => {
-  const other = binding('other@example.test', 'email', {key: 'other.json', auth_index: 'index2'}), h = harness({bindings: [binding(), other]}); await settle();
-  h.hold('/quota/cache', 'PUT'); h.succeed(h.capture('test.json')); await h.timersAt(500); const failed = h.puts()[0];
-  h.succeed(h.capture('other.json'), success(12), 'codex', 'other.json'); h.clear(['test.json']); failed.release({status: 500}); await settle();
-  await h.timersAt(15000); assert.equal(h.puts().length, 2); assert.deepEqual(JSON.parse(h.puts()[1].options.body).entries.map(entry => entry.key), ['other.json']);
-});
-test('global and file resets discard retry/window state and preserve native generation scopes', async () => {
-  const other = binding('other@example.test', 'email', {key: 'other.json'}), h = harness({bindings: [binding(), other], cached: [cachedEntry(), cachedEntry(other)]}); await settle();
-  const A = h.capture('test.json'), B = h.capture('other.json'), global = h.capture();
-  h.succeed(A); h.clear(['test.json']); assert.equal(h.succeed(A), false); assert.equal(h.commit(global, () => {}), false); assert.equal(h.succeed(B, success(), 'codex', 'other.json'), true);
-  h.refresh(); await settle(); assert.equal(h.quota.getState().codexQuota['test.json'], undefined);
-  h.clear(); assert.equal(h.succeed(B, success(), 'codex', 'other.json'), false); await h.timersAt(500); assert.equal(h.puts().length, 0);
-  h.refresh(); await settle(); assert.deepEqual(h.quota.getState().codexQuota, {});
-});
-test('deletion revokes pending, hydrated and native inflight state', async () => {
-  const h = harness({cached: [cachedEntry()]}); await settle(); const operation = h.capture('test.json'); h.succeed(operation);
-  h.bindings = []; h.refresh(); await settle(); assert.equal(h.quota.getState().codexQuota['test.json'], undefined); assert.equal(h.succeed(operation), false);
-  await h.timersAt(500); assert.equal(h.puts().length, 0);
-});
-test('identity refresh responses cannot install in reverse completion order', async () => {
-  const h = harness(); await settle(); h.hold('/identities'); h.refresh(); const stale = h.calls.at(-1);
-  h.bindings = [binding('replacement@example.test')]; h.refresh(); await settle(); stale.release(); await settle();
-  h.succeed(h.capture('test.json')); await h.timersAt(500); assert.equal(JSON.parse(h.puts()[0].options.body).entries[0].account, 'replacement@example.test');
-});
-test('cache and normalized payloads recheck bindings after delayed responses', async () => {
-  const h = harness(); await settle(); h.cached = [cachedEntry()]; h.snapshots = [{provider: 'codex', account: 'person@example.test', account_kind: 'email', windows: [{id: 'primary', window_seconds: 18000, used_percent: 99, observed_at: new Date().toISOString()}]}];
-  h.hold('/quota/cache'); h.refresh(); await settle(); const delayed = h.calls.find(call => call.release);
-  h.bindings = [binding('replacement@example.test')]; delayed.release(); await settle(); assert.equal(h.quota.getState().codexQuota['test.json'], undefined);
-});
-test('a newer normalized observation keeps proving freshness across unchanged polls without re-uploading history', async () => {
-  const now = Date.parse('2026-01-02T03:04:05Z'), iso = offset => new Date(now + offset).toISOString();
-  const snapshot = (used, offset) => ({provider: 'codex', account: 'person@example.test', account_kind: 'email', windows: [{id: 'primary', window_seconds: 18000, used_percent: used, observed_at: iso(offset)}]});
-  // The fixture must sit on the harness clock: the stored display state's own
-  // observation time is the floor below which a normalized snapshot is ignored.
-  const h = harness({now, cached: [cachedEntry(binding(), now - 60000)], snapshots: [snapshot(20, -30000)]}); await settle();
-  const live = success(77); h.succeed(h.capture('test.json'), live);
-  h.refresh(); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'], live, 'older cached and normalized data must not replace fresh live state');
-  assert.equal(h.clearCalls.length, 0, 'unchanged polls must not reset native operations');
-  h.now += 2000; h.snapshots = [snapshot(88, 1000)]; h.refresh(); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'].windows[0].usedPercent, 88, 'a newer normalized observation still overlays');
-  h.snapshots = [snapshot(89, 1500)]; h.refresh(); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'].windows[0].usedPercent, 89);
-  // Only the one live success was ever uploaded; no hydrated or overlaid history follows it.
-  await h.timersAt(500); await h.timersAt(15000);
-  assert.deepEqual(h.puts().map(call => JSON.parse(call.options.body).entries[0].state.windows[0].usedPercent), [77]);
-  assert.equal(h.clearCalls.length, 0);
-});
-test('an unchanged binding poll keeps a settled display without clearing native state', async () => {
-  for (const state of [{status: 'error', error: 'original provider failure', errorCode: 429, windows: []}, {status: 'idle', windows: []}, {...success(77), originalDisplayField: 'keep locally'}]) {
-    const h = harness(); await settle();
-    h.quota.setState({codexQuota: {'test.json': state}});
-    h.refresh(); await settle();
-    assert.equal(h.quota.getState().codexQuota['test.json'], state, state.status);
-    assert.equal(h.clearCalls.length, 0, 'a settled poll must not reset native operations');
-    h.succeed(h.capture('test.json'), success(90)); await h.timersAt(500);
-    assert.equal(h.puts().length, 1, state.status);
-  }
-});
-test('a repeated poll hydrates the newest cache observation for the same account facts', async () => {
-  const h = harness({cached: [cachedEntry()]}); await settle();
-  assert.equal(h.quota.getState().codexQuota['test.json'].windows[0].usedPercent, 12);
-  // The stored observation is display history, never a new observation to publish.
-  h.cached = [{...cachedEntry(), observed_at: new Date().toISOString(), state: {status: 'success', windows: [{id: 'five-hour', usedPercent: 37, label: 'Five hours', resetLabel: '-', periodHours: 5}]}}];
-  h.refresh(); await settle();
-  await h.timersAt(500); await h.timersAt(15000);
-  assert.equal(h.puts().length, 0);
-  assert.equal(h.clearCalls.length, 0);
-});
-test('a file reset fences an operation taken before it even when the binding is unchanged', async () => {
-  const h = harness(); await settle();
-  const before = h.capture('test.json');
-  h.clear(['test.json']);
-  assert.equal(h.commit(before, () => assert.fail('pre-reset callback ran')), false);
-  assert.equal(h.succeed(before, success(90)), false);
-  await h.timersAt(500); assert.equal(h.puts().length, 0);
-  // A fresh operation after the reset is current again and persists.
-  h.succeed(h.capture('test.json'), success(90)); await h.timersAt(500);
-  assert.equal(JSON.parse(h.puts()[0].options.body).entries[0].state.windows[0].usedPercent, 90);
-});
-test('logout aborts synchronization and late callbacks cannot enter a new auth session', async () => {
-  const h = harness({cached: [cachedEntry()]}); await settle(); const old = h.capture('test.json');
-  h.hold('/quota/cache'); h.refresh(); await settle(); const delayed = h.calls.find(call => call.release);
-  h.auth.setState({isAuthenticated: false, connectionStatus: 'disconnected', managementKey: ''}); assert.equal(delayed.options.signal.aborted, true);
-  delayed.release(); await settle(); assert.equal(h.window.CPAQuotaPersistence.status.state, 'waiting-for-login'); assert.equal(h.succeed(old), false);
-  h.auth.setState({isAuthenticated: true, connectionStatus: 'connected', managementKey: 'new-key'}); await settle(); assert.equal(h.succeed(old), false); await h.timersAt(500); assert.equal(h.puts().length, 0);
-});
 
 // Minimal DOM used by the navigation asset: enough structure to prove it finds the
 // verified sidebar classes, appends one idempotent entry and leaves unknown markup alone.
@@ -947,7 +518,7 @@ function fakeDocument({section = true} = {}) {
 const nav = require('./management-nav.js');
 test('navigation asset adds one statistics link to the verified sidebar markup', () => {
   const document = fakeDocument();
-  assert.equal(nav.mount(document, null), true);
+  assert.equal(nav.mount(document), true);
   assert.equal(document.navSection.children.length, 1);
   const group = document.navSection.children[0];
   assert.equal(group.className, 'nav-group');
@@ -957,33 +528,22 @@ test('navigation asset adds one statistics link to the verified sidebar markup',
   assert.equal(link.attributes.href, nav.href);
   assert.equal(link.children[0].className, 'nav-icon');
   assert.equal(link.children[1].children[0].textContent, nav.label);
-  assert.equal(nav.mount(document, null), true);
+  assert.equal(nav.mount(document), true);
   assert.equal(document.navSection.children.length, 1);
 });
 test('navigation asset leaves unavailable or unknown sidebar markup unchanged', () => {
   const absent = fakeDocument({section: false});
-  assert.equal(nav.mount(absent, null), false);
+  assert.equal(nav.mount(absent), false);
   assert.equal(absent.created.length, 0);
-  assert.equal(nav.mount({querySelector: () => {throw new Error('unexpected');}}, null), false);
+  assert.equal(nav.mount({querySelector: () => {throw new Error('unexpected');}}), false);
 });
-test('plain left clicks hand over the tab key and navigate; modified clicks are never rewritten', () => {
+test('the entry is a plain anchor: every click keeps its native behavior', () => {
   const document = fakeDocument();
-  const aims = [], opened = [], prevented = [];
-  const bridge = {armStatistics: () => aims.push('armed')};
-  assert.equal(nav.mount(document, bridge, target => opened.push(target)), true);
+  assert.equal(nav.mount(document), true);
   const link = document.navSection.children[0].children[0];
-  link.dispatch({defaultPrevented: false, button: 0, preventDefault: () => prevented.push('prevented')});
-  assert.deepEqual(aims, ['armed']);
-  assert.deepEqual(opened, [nav.href]);
-  assert.deepEqual(prevented, ['prevented']);
-  for (const event of [{defaultPrevented: false, button: 1}, {defaultPrevented: false, button: 0, ctrlKey: true}, {defaultPrevented: false, button: 0, metaKey: true}, {defaultPrevented: true, button: 0}, {defaultPrevented: false, button: 0, shiftKey: true}]) {
-    event.preventDefault = () => prevented.push('modified');
-    for (const listener of link.listeners) listener.fn(event);
-  }
-  assert.deepEqual(aims, ['armed']);
-  assert.deepEqual(opened, [nav.href]);
-  assert.deepEqual(prevented, ['prevented']);
-  assert.equal(nav.plainLeftClick(null), false);
+  // No handler intercepts clicks: there is no key to hand over, so modified
+  // and plain clicks alike simply open the dashboard, which authenticates itself.
+  assert.equal(link.listeners.length, 0);
   assert.equal(link.attributes.href, nav.href);
 });
 test('navigation asset never exposes or reads the management key itself', () => {
@@ -992,24 +552,7 @@ test('navigation asset never exposes or reads the management key itself', () => 
     assert.equal(source.includes(secret), false, secret);
   }
 });
-test('the bridge never reads the management key from storage and never writes it to localStorage', () => {
-  const source = read('management-bridge.js');
-  assert.equal(source.includes('localStorage'), false);
-  assert.equal(source.includes('getItem'), false);
-  assert.equal(source.includes('sessionStorage.getItem'), false);
-  assert.match(source, /window\.sessionStorage\.setItem\('cpa-stats-management-key', key\)/);
-  assert.equal(source.includes('auth-files'), false);
-});
-test('statistics handoff exposes only the tab-scoped key the dashboard already reads', async () => {
-  const h = harness(); await settle();
-  h.window.CPAQuotaPersistence.armStatistics();
-  assert.equal(h.session.get('cpa-stats-management-key'), 'secret-key');
-  h.auth.setState({isAuthenticated: false, connectionStatus: 'disconnected', managementKey: ''});
-  h.session.clear();
-  h.window.CPAQuotaPersistence.armStatistics();
-  assert.equal(h.session.has('cpa-stats-management-key'), false);
-});
-test('the dashboard reads the tab-scoped handoff key only from sessionStorage', () => {
+test('the dashboard remembers its own management key only in tab-scoped sessionStorage', () => {
   const source = read('stats.js');
   assert.match(source, /storage\.get\(sessionStorage, sessionKey\)/);
   assert.match(source, /storage\.set\(sessionStorage, sessionKey,/);

@@ -694,7 +694,7 @@ func TestQuotaIdentityRequestStartAndAPICallProof(t *testing.T) {
 			auth.Metadata["account_id"] = "account-A"
 			manager := bindQuotaFixtures(t, s, auth)
 			engine := gin.New()
-			engine.Use(s.ManagementMiddleware(nil, nil))
+			engine.Use(s.ManagementMiddleware())
 			output := middlewareQuotaEnvelope(t, "")
 			engine.POST("/v0/management/api-call", func(c *gin.Context) {
 				var request map[string]any

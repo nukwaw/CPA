@@ -25,9 +25,9 @@ import (
 
 const middlewareQuotaURL = "https://chatgpt.com/backend-api/wham/usage"
 
-// readMiddlewareManagementHTML shares the pinned, syntax-valid source excerpt
-// with API integration tests. It includes selector declarations and references,
-// not only the store/helper subset deliberately rejected by strict recognition.
+// readMiddlewareManagementHTML shares the reduced upstream document fixture with
+// API integration tests. The navigation asset does not recognize upstream
+// builds, so any HTML document with a script or body anchor would do.
 func readMiddlewareManagementHTML(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join("..", "api", "testdata", "management-upstream.html")
@@ -52,8 +52,6 @@ func middlewareTestStore(t *testing.T) *Store {
 	wpBindManagementFixtures(t, store)
 	return store
 }
-
-func middlewareResolver(index string) (string, bool) { return "codex", index == "account" }
 
 func middlewareQuotaEnvelope(t *testing.T, padding string) []byte {
 	t.Helper()
@@ -93,7 +91,7 @@ func TestManagementMiddlewarePreservesAPICallBytesAndObservesQuota(t *testing.T)
 		t.Run(path, func(t *testing.T) {
 			store := middlewareTestStore(t)
 			engine := gin.New()
-			engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
+			engine.Use(store.ManagementMiddleware())
 			input := []byte(` {"authIndex":"account","url":"` + middlewareQuotaURL + `","header":{"Authorization":"Bearer $TOKEN$"},"data":"{}"} `)
 			output := middlewareQuotaEnvelope(t, "")
 			engine.POST(path, func(c *gin.Context) {
@@ -150,7 +148,7 @@ func TestManagementMiddlewareIgnoresFailuresUnknownAndOversizedCaptures(t *testi
 		t.Run(test.name, func(t *testing.T) {
 			store := middlewareTestStore(t)
 			engine := gin.New()
-			engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
+			engine.Use(store.ManagementMiddleware())
 			engine.POST(test.path, func(c *gin.Context) {
 				got, errRead := io.ReadAll(c.Request.Body)
 				if errRead != nil || !bytes.Equal(got, test.input) {
@@ -185,7 +183,7 @@ func TestManagementMiddlewareFetchPreservesMissingFraction(t *testing.T) {
 		t.Run(test.path, func(t *testing.T) {
 			store := middlewareTestStore(t)
 			engine := gin.New()
-			engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
+			engine.Use(store.ManagementMiddleware())
 			output := []byte(`{"groups":[{"displayName":"Plan","buckets":[{"window":"missing"},{"window":"unknown","remainingFraction":null},{"window":"monthly","remainingFraction":0}]}]}`)
 			engine.Handle(test.method, strings.Split(test.path, "?")[0], func(c *gin.Context) {
 				_, _ = io.Copy(io.Discard, c.Request.Body)
@@ -222,7 +220,7 @@ func TestManagementMiddlewareResetRequiresConfirmedSuccessfulResponse(t *testing
 			store := middlewareTestStore(t)
 			wpObserveAPICall(store, context.Background(), "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
 			engine := gin.New()
-			engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
+			engine.Use(store.ManagementMiddleware())
 			engine.Handle(test.method, strings.Split(test.path, "?")[0], func(c *gin.Context) {
 				_, _ = io.Copy(io.Discard, c.Request.Body)
 				c.Data(test.status, "application/json", []byte(test.response))
@@ -239,10 +237,9 @@ func TestManagementMiddlewareResetRequiresConfirmedSuccessfulResponse(t *testing
 }
 
 func TestManagementMiddlewareHTMLInjectsRealFileAndRepairsHeaders(t *testing.T) {
-	store := middlewareTestStore(t)
 	cfg := &config.Config{}
 	engine := gin.New()
-	engine.Use(store.ManagementMiddleware(nil, func() *config.Config { return cfg }))
+	engine.Use(ManagementNavMiddleware(func() *config.Config { return cfg }))
 	path := filepath.Join(t.TempDir(), "management.html")
 	if errWrite := os.WriteFile(path, []byte(readMiddlewareManagementHTML(t)), 0600); errWrite != nil {
 		t.Fatal(errWrite)
@@ -256,10 +253,10 @@ func TestManagementMiddlewareHTMLInjectsRealFileAndRepairsHeaders(t *testing.T) 
 		c.File(path)
 	})
 	response := middlewareRequest(t, engine, http.MethodGet, "/management.html?safe-mode=configure", nil)
-	if response.Code != 200 || !strings.Contains(response.Body.String(), "CPAQuotaPersistence.attach") || !strings.Contains(response.Body.String(), `<body><div id="root"></div></body>`) {
-		t.Fatalf("original file adapter missing: %d, %s", response.Code, response.Body.String())
+	if response.Code != 200 || !strings.Contains(response.Body.String(), "data-cpa-stats-nav") || !strings.Contains(response.Body.String(), `<body><div id="root"></div></body>`) {
+		t.Fatalf("navigation asset missing: %d, %s", response.Code, response.Body.String())
 	}
-	if response.Header().Get("X-CPA-Quota-Persistence") != "enabled" || response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) || response.Header().Get("ETag") != "" || response.Header().Get("Last-Modified") != "" || response.Header().Get("Cache-Control") != "no-store" {
+	if response.Header().Get("X-CPA-Stats-Nav") != "enabled" || response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) || response.Header().Get("ETag") != "" || response.Header().Get("Last-Modified") != "" || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("modified entity headers stale: %v", response.Header())
 	}
 	original, errRead := os.ReadFile(path)
@@ -269,7 +266,6 @@ func TestManagementMiddlewareHTMLInjectsRealFileAndRepairsHeaders(t *testing.T) 
 }
 
 func TestManagementMiddlewareHTMLPreUpgradeConditionalCacheGetsFullRepresentation(t *testing.T) {
-	store := middlewareTestStore(t)
 	path := filepath.Join(t.TempDir(), "management.html")
 	if errWrite := os.WriteFile(path, []byte(readMiddlewareManagementHTML(t)), 0600); errWrite != nil {
 		t.Fatal(errWrite)
@@ -318,7 +314,7 @@ func TestManagementMiddlewareHTMLPreUpgradeConditionalCacheGetsFullRepresentatio
 					t.Error("middleware did not restore the caller's exact request")
 				}
 			})
-			after.Use(store.ManagementMiddleware(nil, func() *config.Config { return &config.Config{} }))
+			after.Use(ManagementNavMiddleware(func() *config.Config { return &config.Config{} }))
 			after.GET("/management.html", func(c *gin.Context) {
 				if c.Request == request || c.Request.Header.Get("If-None-Match") != "" || c.Request.Header.Get("If-Modified-Since") != "" || c.Request.Header.Get("X-Original") != "preserved" || c.Request.Body != originalBody || c.Request.URL.RawQuery != "safe-mode=configure" {
 					t.Error("local handler did not receive an isolated full-representation request")
@@ -330,10 +326,10 @@ func TestManagementMiddlewareHTMLPreUpgradeConditionalCacheGetsFullRepresentatio
 			})
 			response := httptest.NewRecorder()
 			after.ServeHTTP(response, request)
-			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "CPAQuotaPersistence.attach") {
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "data-cpa-stats-nav") {
 				t.Fatalf("old cached page was not replaced with full augmented HTML: %d", response.Code)
 			}
-			if response.Header().Get("X-CPA-Quota-Persistence") != "enabled" || response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Pragma") != "no-cache" {
+			if response.Header().Get("X-CPA-Stats-Nav") != "enabled" || response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("Pragma") != "no-cache" {
 				t.Fatalf("new representation has invalid cache/length headers: %v", response.Header())
 			}
 			for _, header := range []string{"ETag", "Last-Modified", "Content-MD5", "Digest", "Accept-Ranges"} {
@@ -350,7 +346,6 @@ func TestManagementMiddlewareHTMLPreUpgradeConditionalCacheGetsFullRepresentatio
 }
 
 func TestManagementMiddlewareHTMLRangeAndPreconditionsPreserveSourceBytes(t *testing.T) {
-	store := middlewareTestStore(t)
 	modified := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	for _, test := range []struct {
 		name   string
@@ -369,7 +364,7 @@ func TestManagementMiddlewareHTMLRangeAndPreconditionsPreserveSourceBytes(t *tes
 			makeEngine := func(augmented bool) *gin.Engine {
 				engine := gin.New()
 				if augmented {
-					engine.Use(store.ManagementMiddleware(nil, func() *config.Config { return &config.Config{} }))
+					engine.Use(ManagementNavMiddleware(func() *config.Config { return &config.Config{} }))
 				}
 				engine.GET("/management.html", func(c *gin.Context) {
 					c.Header("ETag", `"original"`)
@@ -393,9 +388,8 @@ func TestManagementMiddlewareHTMLRangeAndPreconditionsPreserveSourceBytes(t *tes
 }
 
 func TestManagementMiddlewareHTMLMultipartRangesRemainSourceBytes(t *testing.T) {
-	store := middlewareTestStore(t)
 	engine := gin.New()
-	engine.Use(store.ManagementMiddleware(nil, func() *config.Config { return &config.Config{} }))
+	engine.Use(ManagementNavMiddleware(func() *config.Config { return &config.Config{} }))
 	engine.GET("/management.html", func(c *gin.Context) {
 		c.Header("ETag", `"source"`)
 		http.ServeContent(c.Writer, c.Request, "management.html", time.Unix(1700000000, 0), strings.NewReader(readMiddlewareManagementHTML(t)))
@@ -405,7 +399,7 @@ func TestManagementMiddlewareHTMLMultipartRangesRemainSourceBytes(t *testing.T) 
 	response := httptest.NewRecorder()
 	engine.ServeHTTP(response, request)
 	mediaType, params, errType := mime.ParseMediaType(response.Header().Get("Content-Type"))
-	if errType != nil || mediaType != "multipart/byteranges" || response.Code != http.StatusPartialContent || response.Header().Get("ETag") != `"source"` || response.Header().Get("X-CPA-Quota-Persistence") != "" || response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) {
+	if errType != nil || mediaType != "multipart/byteranges" || response.Code != http.StatusPartialContent || response.Header().Get("ETag") != `"source"` || response.Header().Get("X-CPA-Stats-Nav") != "" || response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) {
 		t.Fatalf("multipart representation changed: %d %v", response.Code, response.Header())
 	}
 	reader := multipart.NewReader(bytes.NewReader(response.Body.Bytes()), params["boundary"])
@@ -428,7 +422,6 @@ func TestManagementMiddlewareHTMLMultipartRangesRemainSourceBytes(t *testing.T) 
 }
 
 func TestManagementMiddlewareHTMLScopeDoesNotTouchOtherRequests(t *testing.T) {
-	store := middlewareTestStore(t)
 	for _, test := range []struct{ method, path string }{
 		{http.MethodPost, "/management.html"}, {http.MethodHead, "/management.html"},
 		{http.MethodGet, "/management.html/extra"}, {http.MethodGet, "/other.html"},
@@ -440,7 +433,7 @@ func TestManagementMiddlewareHTMLScopeDoesNotTouchOtherRequests(t *testing.T) {
 			request.Header = http.Header{"If-None-Match": {`"source"`}, "If-Modified-Since": {"Fri, 02 Jan 2026 03:04:05 GMT"}, "Accept-Encoding": {"gzip"}, "Range": {"bytes=0-10"}, "Upgrade": {"websocket"}, "Connection": {"upgrade"}}
 			originalHeaders, originalBody := request.Header.Clone(), request.Body
 			engine := gin.New()
-			engine.Use(store.ManagementMiddleware(nil, func() *config.Config { return &config.Config{} }))
+			engine.Use(ManagementNavMiddleware(func() *config.Config { return &config.Config{} }))
 			engine.Handle(test.method, test.path, func(c *gin.Context) {
 				if c.Request != request || c.Request.Body != originalBody || !reflect.DeepEqual(c.Request.Header, originalHeaders) {
 					t.Error("request outside GET management.html was wrapped or changed")
@@ -459,7 +452,7 @@ func TestManagementMiddlewareHTMLScopeDoesNotTouchOtherRequests(t *testing.T) {
 			})
 			response := httptest.NewRecorder()
 			engine.ServeHTTP(response, request)
-			if response.Body.String() != readMiddlewareManagementHTML(t) || response.Header().Get("ETag") != `"source"` || response.Header().Get("X-CPA-Quota-Persistence") != "" || !response.Flushed || !reflect.DeepEqual(request.Header, originalHeaders) {
+			if response.Body.String() != readMiddlewareManagementHTML(t) || response.Header().Get("ETag") != `"source"` || response.Header().Get("X-CPA-Stats-Nav") != "" || !response.Flushed || !reflect.DeepEqual(request.Header, originalHeaders) {
 				t.Fatal("non-document response bytes/headers/streaming changed")
 			}
 		})
@@ -475,9 +468,8 @@ func TestManagementMiddlewareHTMLCompressedBytesRemainUnchanged(t *testing.T) {
 	if errClose := compressor.Close(); errClose != nil {
 		t.Fatal(errClose)
 	}
-	store := middlewareTestStore(t)
 	engine := gin.New()
-	engine.Use(store.ManagementMiddleware(nil, func() *config.Config { return &config.Config{} }))
+	engine.Use(ManagementNavMiddleware(func() *config.Config { return &config.Config{} }))
 	engine.GET("/management.html", func(c *gin.Context) {
 		c.Header("Content-Encoding", "gzip")
 		c.Header("ETag", `"compressed-source"`)
@@ -485,19 +477,19 @@ func TestManagementMiddlewareHTMLCompressedBytesRemainUnchanged(t *testing.T) {
 		c.Data(http.StatusOK, "text/html", encoded.Bytes())
 	})
 	response := middlewareRequest(t, engine, http.MethodGet, "/management.html", nil)
-	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), encoded.Bytes()) || response.Header().Get("Content-Encoding") != "gzip" || response.Header().Get("Content-Length") != strconv.Itoa(encoded.Len()) || response.Header().Get("ETag") != `"compressed-source"` || response.Header().Get("X-CPA-Quota-Persistence") != "" {
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), encoded.Bytes()) || response.Header().Get("Content-Encoding") != "gzip" || response.Header().Get("Content-Length") != strconv.Itoa(encoded.Len()) || response.Header().Get("ETag") != `"compressed-source"` || response.Header().Get("X-CPA-Stats-Nav") != "" {
 		t.Fatal("encoded response bytes or representation headers changed")
 	}
 }
 
 func TestManagementMiddlewareHTMLFailOpen(t *testing.T) {
 	for _, test := range []struct {
-		name                   string
-		status                 int
-		body, encoding, bridge string
-		flush, disabled, home  bool
+		name                      string
+		status                    int
+		body, encoding, navHeader string
+		flush, disabled, home     bool
 	}{
-		{name: "unknown", status: 200, body: "<html>unknown upstream</html>", bridge: "unsupported"},
+		{name: "unknown", status: 200, body: "<html>unknown upstream</html>"},
 		{name: "partial", status: 206, body: readMiddlewareManagementHTML(t)},
 		{name: "not-modified", status: 304},
 		{name: "denied", status: 403, body: readMiddlewareManagementHTML(t)},
@@ -508,12 +500,11 @@ func TestManagementMiddlewareHTMLFailOpen(t *testing.T) {
 		{name: "home-mode", status: 200, body: readMiddlewareManagementHTML(t), home: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store := middlewareTestStore(t)
 			cfg := &config.Config{}
 			cfg.RemoteManagement.DisableControlPanel = test.disabled
 			cfg.Home.Enabled = test.home
 			engine := gin.New()
-			engine.Use(store.ManagementMiddleware(nil, func() *config.Config { return cfg }))
+			engine.Use(ManagementNavMiddleware(func() *config.Config { return cfg }))
 			engine.GET("/management.html", func(c *gin.Context) {
 				c.Header("Content-Type", "text/html")
 				c.Header("ETag", `"unchanged"`)
@@ -529,7 +520,7 @@ func TestManagementMiddlewareHTMLFailOpen(t *testing.T) {
 				}
 			})
 			response := middlewareRequest(t, engine, http.MethodGet, "/management.html", nil)
-			if response.Code != test.status || response.Body.String() != test.body || response.Header().Get("ETag") != `"unchanged"` || response.Header().Get("X-CPA-Quota-Persistence") != test.bridge {
+			if response.Code != test.status || response.Body.String() != test.body || response.Header().Get("ETag") != `"unchanged"` || response.Header().Get("X-CPA-Stats-Nav") != test.navHeader {
 				t.Fatalf("fallback changed original: status=%d headers=%v body=%q", response.Code, response.Header(), response.Body.String())
 			}
 		})
@@ -555,7 +546,7 @@ func TestManagementHTMLBufferOverflowAndWriteSemantics(t *testing.T) {
 		writer.finish(true)
 	})
 	response := middlewareRequest(t, engine, http.MethodGet, "/overflow", nil)
-	if response.Code != 200 || response.Body.String() != "123456789tail" || response.Header().Get("X-Before") != "preserved" || response.Header().Get("X-Late") != "" || response.Header().Get("X-CPA-Quota-Persistence") != "" {
+	if response.Code != 200 || response.Body.String() != "123456789tail" || response.Header().Get("X-Before") != "preserved" || response.Header().Get("X-Late") != "" || response.Header().Get("X-CPA-Stats-Nav") != "" {
 		t.Fatalf("overflow changed original writer behavior: %d %v %q", response.Code, response.Header(), response.Body.String())
 	}
 }
@@ -563,7 +554,7 @@ func TestManagementHTMLBufferOverflowAndWriteSemantics(t *testing.T) {
 func TestManagementMiddlewareDoesNotAttributeAnonymousAPICallByQuery(t *testing.T) {
 	store := middlewareTestStore(t)
 	engine := gin.New()
-	engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
+	engine.Use(store.ManagementMiddleware())
 	output := middlewareQuotaEnvelope(t, "")
 	engine.POST("/v0/management/api-call", func(c *gin.Context) {
 		_, _ = io.Copy(io.Discard, c.Request.Body)
@@ -598,9 +589,8 @@ func TestManagementMiddlewareActualHTMLBuild(t *testing.T) {
 	if errRead != nil {
 		t.Fatal(errRead)
 	}
-	store := middlewareTestStore(t)
 	engine := gin.New()
-	engine.Use(store.ManagementMiddleware(nil, func() *config.Config { return &config.Config{} }))
+	engine.Use(ManagementNavMiddleware(func() *config.Config { return &config.Config{} }))
 	engine.GET("/management.html", func(c *gin.Context) { c.File(path) })
 	server := httptest.NewServer(engine)
 	t.Cleanup(server.Close)
@@ -623,7 +613,7 @@ func TestManagementMiddlewareActualHTMLBuild(t *testing.T) {
 		}
 	}()
 	body, errBody := io.ReadAll(response.Body)
-	if errBody != nil || response.StatusCode != 200 || len(body) <= len(original) || !bytes.Contains(body, []byte("CPAQuotaPersistence.attach")) || response.Header.Get("X-CPA-Quota-Persistence") != "enabled" || response.ContentLength != int64(len(body)) {
+	if errBody != nil || response.StatusCode != 200 || len(body) <= len(original) || !bytes.Contains(body, []byte("data-cpa-stats-nav")) || response.Header.Get("X-CPA-Stats-Nav") != "enabled" || response.ContentLength != int64(len(body)) {
 		t.Fatalf("real HTTP HTML buffer failed: status=%d bytes=%d original=%d length=%d err=%v", response.StatusCode, len(body), len(original), response.ContentLength, errBody)
 	}
 }
@@ -640,7 +630,7 @@ func TestManagementMiddlewareSkipsObservationUntilIdentityIsPublished(t *testing
 	serve := func(t *testing.T, store *Store) (*httptest.ResponseRecorder, *Store) {
 		t.Helper()
 		engine := gin.New()
-		engine.Use(store.ManagementMiddleware(middlewareResolver, nil))
+		engine.Use(store.ManagementMiddleware())
 		engine.POST("/v0/management/api-call", func(c *gin.Context) {
 			// The capture is a passive tee: it fills only as the original handler
 			// reads, exactly like the real handler binding its JSON body.

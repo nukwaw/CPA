@@ -97,7 +97,7 @@ func TestUsagePersistenceUnavailableAssetsAndLiveConfig(t *testing.T) {
 		server.Handler().ServeHTTP(w, r)
 		return w
 	}
-	for _, asset := range []string{"/stats.html", usageweb.AssetsPrefix + "/stats.css", usageweb.AssetsPrefix + "/stats.js", usageweb.AssetsPrefix + "/management-bridge.js"} {
+	for _, asset := range []string{"/stats.html", usageweb.AssetsPrefix + "/stats.css", usageweb.AssetsPrefix + "/stats.js", usageweb.AssetsPrefix + "/management-nav.js"} {
 		if w := request(asset, ""); w.Code != http.StatusOK {
 			t.Fatalf("disabled collection/unavailable storage hid asset %s: %d", asset, w.Code)
 		}

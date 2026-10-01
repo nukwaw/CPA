@@ -113,7 +113,7 @@ func TestManagementWorkerBlockedBackendPreservesOriginalResponses(t *testing.T) 
 			}
 			backend := blockManagementStore(t, s)
 			engine := gin.New()
-			engine.Use(s.ManagementMiddleware(middlewareResolver, nil))
+			engine.Use(s.ManagementMiddleware())
 			engine.POST(test.path, func(c *gin.Context) {
 				body, errRead := io.ReadAll(c.Request.Body)
 				if errRead != nil || string(body) != test.input {

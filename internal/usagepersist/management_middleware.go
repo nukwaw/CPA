@@ -24,41 +24,50 @@ const (
 	middlewareHTMLLimit     = 16 << 20
 )
 
-// ManagementMiddleware observes the existing authenticated management pipeline;
-// it neither authorizes requests nor replaces handlers. Only bounded, successful
-// known quota responses are normalized. Captured raw bytes are never persisted.
-// The optional HTML adapter preserves the original page on unsupported bundles,
-// encoded/partial responses, flushes, and oversized responses.
-func (s *Store) ManagementMiddleware(_ func(string) (string, bool), currentConfig func() *config.Config) gin.HandlerFunc {
+// ManagementNavMiddleware augments only the management document with the
+// statistics navigation asset. It needs no store and never recognizes the
+// upstream build: the asset tolerates unknown sidebar markup, and the dashboard
+// stays reachable by URL. Encoded, partial, flushed, and oversized responses
+// keep their original bytes.
+func ManagementNavMiddleware(currentConfig func() *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if s == nil || c.Request == nil || c.Request.URL == nil {
+		if c.Request == nil || c.Request.URL == nil || c.Request.Method != http.MethodGet || c.Request.URL.Path != "/management.html" || !middlewarePanelEnabled(currentConfig) {
 			c.Next()
 			return
 		}
-		if c.Request.Method == http.MethodGet && c.Request.URL.Path == "/management.html" && middlewarePanelEnabled(currentConfig) {
-			// Source-file validators do not describe the augmented representation.
-			// A browser may still hold a pre-upgrade page without the adapter, so
-			// obtain the full document rather than revalidating that old entity.
-			// Clone only this local GET; the caller's request/header/body objects
-			// remain untouched, as do range and other precondition semantics.
-			originalRequest := c.Request
-			c.Request = originalRequest.Clone(originalRequest.Context())
-			c.Request.Header.Del("If-None-Match")
-			c.Request.Header.Del("If-Modified-Since")
-			defer func() { c.Request = originalRequest }()
-			original := c.Writer
-			writer := newMiddlewareHTMLWriter(original, middlewareHTMLLimit)
-			c.Writer = writer
-			defer func() {
-				// If a downstream handler panics after writing, preserve its
-				// original partial response before the outer recovery resumes.
-				if writer.Written() && !writer.passthrough {
-					_ = writer.forward()
-				}
-				c.Writer = original
-			}()
+		// Source-file validators do not describe the augmented representation.
+		// A browser may still hold a pre-upgrade page without the asset, so
+		// obtain the full document rather than revalidating that old entity.
+		// Clone only this local GET; the caller's request/header/body objects
+		// remain untouched, as do range and other precondition semantics.
+		originalRequest := c.Request
+		c.Request = originalRequest.Clone(originalRequest.Context())
+		c.Request.Header.Del("If-None-Match")
+		c.Request.Header.Del("If-Modified-Since")
+		defer func() { c.Request = originalRequest }()
+		original := c.Writer
+		writer := newMiddlewareHTMLWriter(original, middlewareHTMLLimit)
+		c.Writer = writer
+		defer func() {
+			// If a downstream handler panics after writing, preserve its
+			// original partial response before the outer recovery resumes.
+			if writer.Written() && !writer.passthrough {
+				_ = writer.forward()
+			}
+			c.Writer = original
+		}()
+		c.Next()
+		writer.finish(!c.IsAborted())
+	}
+}
+
+// ManagementMiddleware observes the existing authenticated management pipeline;
+// it neither authorizes requests nor replaces handlers. Only bounded, successful
+// known quota responses are normalized. Captured raw bytes are never persisted.
+func (s *Store) ManagementMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || c.Request == nil || c.Request.URL == nil {
 			c.Next()
-			writer.finish(!c.IsAborted())
 			return
 		}
 		kind := middlewareQuotaRoute(c.Request.Method, c.Request.URL.Path)
@@ -436,19 +445,17 @@ func (writer *middlewareHTMLWriter) finish(allowInjection bool) {
 	}
 	mediaType, _, errMediaType := mime.ParseMediaType(contentType)
 	if allowInjection && writer.status == http.StatusOK && errMediaType == nil && mediaType == "text/html" && middlewareIdentityEncoding(writer.header) {
-		result, hooked := usageweb.InjectManagementHTML(writer.body.Bytes())
-		if hooked {
+		result, injected := usageweb.InjectManagementNav(writer.body.Bytes())
+		if injected {
 			writer.body.Reset()
 			_, _ = writer.body.Write(result)
-			writer.header.Set("X-CPA-Quota-Persistence", "enabled")
+			writer.header.Set("X-CPA-Stats-Nav", "enabled")
 			writer.header.Set("Content-Length", strconv.Itoa(len(result)))
 			writer.header.Set("Cache-Control", "no-store")
 			writer.header.Set("Pragma", "no-cache")
 			for _, name := range []string{"ETag", "Last-Modified", "Content-MD5", "Digest", "Accept-Ranges"} {
 				writer.header.Del(name)
 			}
-		} else {
-			writer.header.Set("X-CPA-Quota-Persistence", "unsupported")
 		}
 	}
 	if errWrite := writer.forward(); errWrite != nil {

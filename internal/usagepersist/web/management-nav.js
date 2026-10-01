@@ -1,7 +1,9 @@
 /* Navigation helper for the embedded statistics dashboard.
    It adds exactly one sidebar link and reads no upstream store state. Unknown
    navigation markup is left untouched, so an unrecognized upstream build simply
-   keeps its original sidebar and the dashboard stays reachable by URL. */
+   keeps its original sidebar and the dashboard stays reachable by URL. The link
+   is a plain anchor: the dashboard asks for the management key itself, so no
+   credential ever enters this document's navigation markup. */
 (function (root) {
   'use strict';
   const entryAttribute = 'data-cpa-stats-entry', href = '/stats.html', label = 'Usage statistics';
@@ -18,20 +20,7 @@
     }
     return svg;
   }
-  function plainLeftClick(event) {
-    return !!event && !event.defaultPrevented && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
-  }
-  // The bridge owns the management key. It writes the same tab-scoped entry the
-  // upstream "remember for this tab" option uses, and the dashboard reads it once
-  // at load; the key value never enters this document's navigation markup.
-  function arm(bridge) {
-    try {if (bridge && typeof bridge.armStatistics === 'function') bridge.armStatistics();} catch {}
-  }
-  function navigate(target) {
-    const location = root.location;
-    if (location && typeof location.assign === 'function') location.assign(target);
-  }
-  function element(document, bridge, open = navigate) {
+  function element(document) {
     const group = document.createElement('div');
     group.className = 'nav-group';
     group.setAttribute(entryAttribute, '');
@@ -50,28 +39,20 @@
     text.appendChild(caption);
     link.appendChild(iconHolder);
     link.appendChild(text);
-    link.addEventListener('click', event => {
-      // Modified clicks keep their native behavior: a new tab loads the dashboard
-      // without a handed-over key instead of being silently rewritten.
-      if (!plainLeftClick(event)) return;
-      event.preventDefault();
-      arm(bridge);
-      open(href);
-    });
     group.appendChild(link);
     return group;
   }
-  function mount(document, bridge, open) {
+  function mount(document) {
     try {
       if (document.querySelector('[' + entryAttribute + ']')) return true;
       const section = document.querySelector('.sidebar .nav-section');
       if (!section || typeof section.appendChild !== 'function') return false;
-      section.appendChild(element(document, bridge, open));
+      section.appendChild(element(document));
       return true;
     } catch {return false;}
   }
-  function start(document, bridge, observer) {
-    mount(document, bridge);
+  function start(document, observer) {
+    mount(document);
     if (typeof observer !== 'function' || !document.documentElement) return;
     let scheduled = false;
     // The sidebar is re-rendered by the upstream router (login, logout, mobile
@@ -79,16 +60,16 @@
     new observer(() => {
       if (scheduled) return;
       scheduled = true;
-      const resume = () => {scheduled = false; mount(document, bridge);};
+      const resume = () => {scheduled = false; mount(document);};
       if (typeof root.requestAnimationFrame === 'function') root.requestAnimationFrame(resume);
       else root.setTimeout(resume, 250);
     }).observe(document.documentElement, {childList: true, subtree: true});
   }
-  const api = {mount, element, plainLeftClick, arm, start, entryAttribute, href, label};
+  const api = {mount, element, start, entryAttribute, href, label};
   if (typeof module !== 'undefined' && module.exports) {module.exports = api; return;}
   if (root.CPAStatsNav) return;
   root.CPAStatsNav = api;
-  const boot = () => start(document, root.CPAQuotaPersistence, root.MutationObserver);
+  const boot = () => start(document, root.MutationObserver);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, {once: true});
   else boot();
 })(typeof window === 'undefined' ? globalThis : window);

@@ -32,11 +32,11 @@ func TestUsagePersistenceActualManagementResponse(t *testing.T) {
 	server := NewServer(cfg, nil, nil, filepath.Join(dir, "config.yaml"), WithUsagePersistence(persistenceTestStore(t)))
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/management.html?safe-mode=configure", nil))
-	if response.Code != 200 || response.Header().Get("X-CPA-Quota-Persistence") != "enabled" {
+	if response.Code != 200 || response.Header().Get("X-CPA-Stats-Nav") != "enabled" {
 		t.Fatalf("real management response not adapted: status=%d header=%v", response.Code, response.Header())
 	}
-	if !bytes.Contains(response.Body.Bytes(), []byte("CPAQuotaPersistence.attach")) {
-		t.Fatal("compiled module did not receive bridge binding")
+	if !bytes.Contains(response.Body.Bytes(), []byte("data-cpa-stats-nav")) {
+		t.Fatal("compiled document did not receive the navigation asset")
 	}
 	if response.Header().Get("Content-Length") != strconv.Itoa(response.Body.Len()) {
 		t.Fatal("injected response content length is incorrect")

@@ -66,7 +66,7 @@ func TestUsagePersistenceDynamicRoutesActivateWithoutReregistration(t *testing.T
 			t.Fatalf("unowned route %s was swallowed: %d", path, w.Code)
 		}
 	}
-	for _, path := range []string{"/stats.html", usageweb.AssetsPrefix + "/stats.js", usageweb.AssetsPrefix + "/management-bridge.js"} {
+	for _, path := range []string{"/stats.html", usageweb.AssetsPrefix + "/stats.js", usageweb.AssetsPrefix + "/management-nav.js"} {
 		if w := request(http.MethodGet, path, false); w.Code != http.StatusOK {
 			t.Fatalf("pending store hid canonical asset %s: %d", path, w.Code)
 		}
@@ -111,14 +111,14 @@ func TestUsagePersistenceDynamicRoutesActivateWithoutReregistration(t *testing.T
 
 func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
-	// The shared fixture contains actual pinned declarations for the stores,
-	// native generation helpers, and all verified provider selector sources.
+	// The shared fixture is a reduced management document; the navigation asset
+	// does not recognize upstream builds, so it must accept any anchored HTML.
 	data, err := os.ReadFile(filepath.Join("testdata", "management-upstream.html"))
 	if err != nil {
 		t.Fatalf("read reduced management fixture: %v", err)
 	}
-	if _, recognized := usageweb.InjectManagementHTML(data); !recognized {
-		t.Fatal("pinned reduced management fixture no longer satisfies strict recognition")
+	if _, injected := usageweb.InjectManagementNav(data); !injected {
+		t.Fatal("reduced management fixture has no navigation injection anchor")
 	}
 	original := string(data)
 	dir := t.TempDir()
@@ -155,9 +155,12 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 	}
 	store := persistenceTestStore(t)
 	body := `{"auth_index":"` + index + `"}`
+	// The sidebar entry is independent of storage availability: the document is
+	// augmented even while initialization is pending, and the dashboard itself
+	// reports an unavailable store.
 	beforeHTML := request(http.MethodGet, "/management.html", "")
-	if beforeHTML.Body.String() != original || beforeHTML.Header().Get("X-CPA-Quota-Persistence") != "" {
-		t.Fatal("pending initialization changed original management HTML")
+	if !strings.Contains(beforeHTML.Body.String(), "data-cpa-stats-nav") || beforeHTML.Header().Get("X-CPA-Stats-Nav") != "enabled" {
+		t.Fatal("pending initialization hid the navigation asset")
 	}
 	beforeQuota := request(http.MethodPost, "/v0/management/quota/fetch", body)
 	if snapshots, err := store.Quotas(context.Background()); err != nil || len(snapshots) != 0 {
@@ -165,10 +168,10 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 	}
 	current.Store(store)
 	afterHTML := request(http.MethodGet, "/management.html", "")
-	if !strings.Contains(afterHTML.Body.String(), "CPAQuotaPersistence.attach") || afterHTML.Header().Get("X-CPA-Quota-Persistence") != "enabled" {
-		t.Fatal("ready store did not activate the HTML bridge")
+	if !strings.Contains(afterHTML.Body.String(), "data-cpa-stats-nav") || afterHTML.Header().Get("X-CPA-Stats-Nav") != "enabled" {
+		t.Fatal("ready store did not keep the navigation asset")
 	}
-	// The bridge primes immediate, sanitized request-start evidence through an
+	// The dashboard primes immediate, sanitized request-start evidence through an
 	// explicit add-on read; original handlers never query live manager locks.
 	request(http.MethodGet, "/v0/management/stats/quota/identities", "")
 	afterQuota := request(http.MethodPost, "/v0/management/quota/fetch", body)
@@ -208,10 +211,10 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 		t.Fatalf("rotated observation windows = %#v", rotated[0].Windows)
 	}
 	current.Store(nil)
-	if w := request(http.MethodGet, "/management.html", ""); w.Body.String() != original {
-		t.Fatal("withdrawn store still changed management HTML")
+	if w := request(http.MethodGet, "/management.html", ""); !strings.Contains(w.Body.String(), "data-cpa-stats-nav") {
+		t.Fatal("withdrawn store hid the navigation asset")
 	}
 	if stored, err := os.ReadFile(assetPath); err != nil || string(stored) != original {
-		t.Fatal("dynamic bridge modified original asset on disk")
+		t.Fatal("navigation injection modified original asset on disk")
 	}
 }

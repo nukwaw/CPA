@@ -157,7 +157,7 @@ func TestUsageQuotaConfirmedCodexConsumeBodyPreservesResetBarrier(t *testing.T) 
 				t.Fatal(err)
 			}
 			router := gin.New()
-			router.Use(store.ManagementMiddleware(nil, nil))
+			router.Use(store.ManagementMiddleware())
 			const original = `{"status_code":200,"header":{},"body":"{\"code\":\"reset\",\"windows_reset\":1}"}`
 			router.POST("/v0/management/api-call", func(c *gin.Context) {
 				var input map[string]any

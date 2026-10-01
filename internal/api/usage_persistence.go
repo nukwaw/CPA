@@ -52,13 +52,16 @@ func WithUsagePersistenceProvider(current func() *usagepersist.Store) ServerOpti
 			}
 			return store
 		}
+		// The sidebar entry is independent of storage availability: the
+		// dashboard itself reports an unavailable store.
+		server.engine.Use(usagepersist.ManagementNavMiddleware(server.getConfig))
 		server.engine.Use(func(c *gin.Context) {
 			store := currentStore()
 			if store == nil {
 				c.Next()
 				return
 			}
-			store.ManagementMiddleware(nil, server.getConfig)(c)
+			store.ManagementMiddleware()(c)
 		})
 		usagepersist.RegisterDynamicRoutes(usageManagementGroup(server), currentStore, func() bool {
 			cfg := server.getConfig()
