@@ -1,8 +1,6 @@
 package api
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +15,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist"
 	usageweb "github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/web"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestUsagePersistenceDynamicRoutesActivateWithoutReregistration(t *testing.T) {
@@ -127,19 +124,12 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("MANAGEMENT_STATIC_PATH", assetPath)
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{ID: "dynamic-quota-fixture", FileName: "fixture.json", Provider: "codex", Metadata: map[string]any{"access_token": "fixture-token", "email": "observed@example.invalid"}}
-	index := auth.EnsureIndex()
-	if _, err := manager.Register(context.Background(), auth); err != nil {
-		t.Fatal(err)
-	}
 	cfg := &config.Config{CommercialMode: true, AuthDir: t.TempDir()}
 	cfg.RemoteManagement.SecretKey = "configured-secret"
 	cfg.RemoteManagement.DisableAutoUpdatePanel = true
 	var current atomic.Pointer[usagepersist.Store]
-	server := NewServer(cfg, manager, nil, filepath.Join(dir, "config.yaml"),
+	server := NewServer(cfg, nil, nil, filepath.Join(dir, "config.yaml"),
 		WithUsagePersistenceProvider(current.Load), WithLocalManagementPassword("dynamic-test-key"))
-	installUsageQuotaFixture(server)
 	request := func(method, path, body string) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -153,8 +143,6 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 		}
 		return w
 	}
-	store := persistenceTestStore(t)
-	body := `{"auth_index":"` + index + `"}`
 	// The sidebar entry is independent of storage availability: the document is
 	// augmented even while initialization is pending, and the dashboard itself
 	// reports an unavailable store.
@@ -162,53 +150,10 @@ func TestUsagePersistenceDynamicMiddlewareActivatesAfterReady(t *testing.T) {
 	if !strings.Contains(beforeHTML.Body.String(), "data-cpa-stats-nav") || beforeHTML.Header().Get("X-CPA-Stats-Nav") != "enabled" {
 		t.Fatal("pending initialization hid the navigation asset")
 	}
-	beforeQuota := request(http.MethodPost, "/v0/management/quota/fetch", body)
-	if snapshots, err := store.Quotas(context.Background()); err != nil || len(snapshots) != 0 {
-		t.Fatalf("pending store observed management output: %#v %v", snapshots, err)
-	}
-	current.Store(store)
+	current.Store(persistenceTestStore(t))
 	afterHTML := request(http.MethodGet, "/management.html", "")
 	if !strings.Contains(afterHTML.Body.String(), "data-cpa-stats-nav") || afterHTML.Header().Get("X-CPA-Stats-Nav") != "enabled" {
 		t.Fatal("ready store did not keep the navigation asset")
-	}
-	// The dashboard primes immediate, sanitized request-start evidence through an
-	// explicit add-on read; original handlers never query live manager locks.
-	request(http.MethodGet, "/v0/management/stats/quota/identities", "")
-	afterQuota := request(http.MethodPost, "/v0/management/quota/fetch", body)
-	if !bytes.Equal(beforeQuota.Body.Bytes(), afterQuota.Body.Bytes()) {
-		t.Fatal("dynamic observer changed original management quota response")
-	}
-	if err := store.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// The credential's account fact, not its transient index, groups the stored
-	// observation: the projection publishes the email the credential carries, and
-	// the observation is keyed by (provider, account).
-	snapshots, err := store.Quotas(context.Background())
-	if err != nil || len(snapshots) != 1 || snapshots[0].Provider != "codex" || snapshots[0].Account != "observed@example.invalid" || snapshots[0].AccountKind != "email" {
-		t.Fatalf("ready store did not activate account-scoped quota observation: %#v %v", snapshots, err)
-	}
-	if len(snapshots[0].Windows) != 1 || snapshots[0].Windows[0].RemainingPercent == nil || *snapshots[0].Windows[0].RemainingPercent != 75 {
-		t.Fatalf("observed quota windows = %#v", snapshots[0].Windows)
-	}
-	// Rotating the access token is the ordinary refresh core performs during normal
-	// operation. It must not move the account the observation is grouped under:
-	// identity is (provider, account), never a token.
-	auth.Metadata["access_token"] = "rotated-token"
-	if _, err := manager.Update(context.Background(), auth); err != nil {
-		t.Fatal(err)
-	}
-	request(http.MethodGet, "/v0/management/stats/quota/identities", "")
-	request(http.MethodPost, "/v0/management/quota/fetch", body)
-	if err := store.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	rotated, err := store.Quotas(context.Background())
-	if err != nil || len(rotated) != 1 || rotated[0].Provider != "codex" || rotated[0].Account != "observed@example.invalid" || rotated[0].AccountKind != "email" {
-		t.Fatalf("token rotation changed the account the observation is grouped under: %#v %v", rotated, err)
-	}
-	if len(rotated[0].Windows) != 1 || rotated[0].Windows[0].RemainingPercent == nil || *rotated[0].Windows[0].RemainingPercent != 75 {
-		t.Fatalf("rotated observation windows = %#v", rotated[0].Windows)
 	}
 	current.Store(nil)
 	if w := request(http.MethodGet, "/management.html", ""); !strings.Contains(w.Body.String(), "data-cpa-stats-nav") {

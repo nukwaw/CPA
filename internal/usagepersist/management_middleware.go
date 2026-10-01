@@ -3,8 +3,6 @@ package usagepersist
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
-	"io"
 	"mime"
 	"net"
 	"net/http"
@@ -14,15 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	usageweb "github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/web"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
-const (
-	middlewareRequestLimit  = 1 << 20
-	middlewareResponseLimit = 4 << 20
-	middlewareHTMLLimit     = 16 << 20
-)
+const middlewareHTMLLimit = 16 << 20
 
 // ManagementNavMiddleware augments only the management document with the
 // statistics navigation asset. It needs no store and never recognizes the
@@ -61,266 +54,12 @@ func ManagementNavMiddleware(currentConfig func() *config.Config) gin.HandlerFun
 	}
 }
 
-// ManagementMiddleware observes the existing authenticated management pipeline;
-// it neither authorizes requests nor replaces handlers. Only bounded, successful
-// known quota responses are normalized. Captured raw bytes are never persisted.
-func (s *Store) ManagementMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if s == nil || c.Request == nil || c.Request.URL == nil {
-			c.Next()
-			return
-		}
-		kind := middlewareQuotaRoute(c.Request.Method, c.Request.URL.Path)
-		if kind == "" {
-			c.Next()
-			return
-		}
-		// Only take an immediate immutable publication. Live manager "reads" may
-		// wait on core storage under its lock, so neither side of c.Next may query
-		// that manager. Missing/stale proof is harmless: skip or queue the captured
-		// evidence, and let the isolated worker authoritatively reject stale work.
-		startBindings := s.publishedQuotaBindings()
-		if len(startBindings) == 0 {
-			c.Next()
-			return
-		}
-		requestCapture := &middlewareBoundedBuffer{limit: middlewareRequestLimit}
-		if c.Request.Body != nil {
-			originalBody := c.Request.Body
-			c.Request.Body = &middlewareBodyTee{ReadCloser: originalBody, capture: requestCapture}
-			defer func() { c.Request.Body = originalBody }()
-		}
-		responseCapture := &middlewareBoundedBuffer{limit: middlewareResponseLimit}
-		original := c.Writer
-		c.Writer = &middlewareResponseTee{ResponseWriter: original, capture: responseCapture}
-		defer func() { c.Writer = original }()
-		c.Next()
-		if c.IsAborted() || original.Status() < 200 || original.Status() >= 300 || requestCapture.overflow || responseCapture.overflow || !middlewareIdentityEncoding(original.Header()) {
-			return
-		}
-		s.observeMiddlewareQuota(c, kind, requestCapture.Bytes(), responseCapture.Bytes(), startBindings)
-	}
-}
-
 func middlewarePanelEnabled(currentConfig func() *config.Config) bool {
 	if currentConfig == nil {
 		return false
 	}
 	cfg := currentConfig()
 	return cfg != nil && !cfg.Home.Enabled && !cfg.RemoteManagement.DisableControlPanel
-}
-
-func middlewareQuotaRoute(method, path string) string {
-	if method == http.MethodPost {
-		switch path {
-		case "/v0/management/api-call", "/v8/management/requests/api-call":
-			return "api-call"
-		case "/v0/management/quota/fetch", "/v8/management/credentials/quota/fetch":
-			return "fetch"
-		case "/v0/management/reset-quota", "/v0/management/quota/reset", "/v8/management/routing/cooldown/reset", "/v8/management/credentials/quota/reset":
-			return "reset"
-		}
-	}
-	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	if len(parts) < 5 || (parts[0] != "v0" && parts[0] != "v8") || parts[1] != "management" || parts[2] != "plugins" || parts[3] == "" || parts[4] != "quota" {
-		return ""
-	}
-	if len(parts) == 5 {
-		switch method {
-		case http.MethodGet, http.MethodPost:
-			return "fetch"
-		case http.MethodDelete:
-			return "reset"
-		}
-	}
-	if len(parts) == 6 && parts[0] == "v0" && parts[5] == "reset" && method == http.MethodPost {
-		return "reset"
-	}
-	return ""
-}
-
-func (s *Store) observeMiddlewareQuota(c *gin.Context, kind string, requestBytes, responseBytes []byte, startBindings []QuotaBinding) {
-	var request struct {
-		AuthIndex      string            `json:"auth_index"`
-		AuthIndexCamel string            `json:"authIndex"`
-		AuthIndexUpper string            `json:"AuthIndex"`
-		URL            string            `json:"url"`
-		Header         map[string]string `json:"header"`
-		Data           string            `json:"data"`
-		Provider       string            `json:"provider"`
-	}
-	if len(bytes.TrimSpace(requestBytes)) > 0 && json.Unmarshal(requestBytes, &request) != nil {
-		return
-	}
-	index := middlewareFirstString(request.AuthIndex, request.AuthIndexCamel, request.AuthIndexUpper)
-	pluginPath := strings.HasPrefix(c.Request.URL.Path, "/v0/management/plugins/") || strings.HasPrefix(c.Request.URL.Path, "/v8/management/plugins/")
-	if pluginPath && (c.Request.Method == http.MethodGet || kind == "reset") {
-		// Only these existing handlers accept query identity, with query taking
-		// precedence. API-call does not: never attribute its anonymous request
-		// using an auth_index that the original handler ignored.
-		if queryIndex := middlewareFirstString(c.Query("auth_index"), c.Query("authIndex")); queryIndex != "" {
-			index = queryIndex
-		}
-	}
-	if index == "" || len(index) > 256 {
-		return
-	}
-	var binding QuotaBinding
-	for _, candidate := range startBindings {
-		if candidate.AuthIndex == index {
-			if binding.AuthIndex != "" {
-				return
-			}
-			binding = candidate
-		}
-	}
-	if binding.AuthIndex == "" || (request.Provider != "" && request.Provider != binding.Provider) {
-		return
-	}
-	for _, alias := range []string{request.AuthIndex, request.AuthIndexCamel, request.AuthIndexUpper} {
-		if alias != "" && strings.TrimSpace(alias) != index {
-			return
-		}
-	}
-	ctx := c.Request.Context()
-	switch kind {
-	case "api-call":
-		if !quotaAPICallProof(binding, request.URL, request.Header, request.Data) {
-			return
-		}
-		var response struct {
-			StatusCode int         `json:"status_code"`
-			Header     http.Header `json:"header"`
-			Body       string      `json:"body"`
-		}
-		if request.URL == "" || json.Unmarshal(responseBytes, &response) != nil || response.StatusCode < 100 || response.StatusCode > 599 {
-			return
-		}
-		s.ObserveAPICall(ctx, binding, request.URL, response.StatusCode, response.Header, []byte(response.Body))
-	case "fetch":
-		response, valid := middlewareFetchResponse(responseBytes)
-		if valid {
-			s.ObserveQuotaFetch(ctx, binding, response)
-		}
-	case "reset":
-		var response struct {
-			Status    string `json:"status"`
-			AuthIndex string `json:"auth_index"`
-		}
-		if json.Unmarshal(responseBytes, &response) != nil || response.Status != "ok" || response.AuthIndex != index {
-			return
-		}
-		s.ObserveQuotaReset(ctx, binding)
-	}
-}
-
-func middlewareFirstString(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
-
-func middlewareFetchResponse(data []byte) (pluginapi.QuotaFetchResponse, bool) {
-	var response pluginapi.QuotaFetchResponse
-	if json.Unmarshal(data, &response) != nil {
-		return response, false
-	}
-	// The SDK's value-type numbers default to zero. Preserve missing-field
-	// semantics at this JSON boundary instead of inventing measured quota.
-	var presence struct {
-		Groups []struct {
-			Buckets []map[string]json.RawMessage `json:"buckets"`
-		} `json:"groups"`
-		Summary []map[string]json.RawMessage `json:"summary"`
-	}
-	if json.Unmarshal(data, &presence) != nil {
-		return pluginapi.QuotaFetchResponse{}, false
-	}
-	for i := range response.Groups {
-		buckets := response.Groups[i].Buckets[:0]
-		if i < len(presence.Groups) {
-			for j, bucket := range response.Groups[i].Buckets {
-				if j >= len(presence.Groups[i].Buckets) {
-					continue
-				}
-				raw := presence.Groups[i].Buckets[j]
-				var fraction *float64
-				_ = json.Unmarshal(raw["remainingFraction"], &fraction)
-				if fraction == nil {
-					_ = json.Unmarshal(raw["remaining_fraction"], &fraction)
-				}
-				if fraction != nil {
-					bucket.RemainingFraction = *fraction
-					buckets = append(buckets, bucket)
-				}
-			}
-		}
-		response.Groups[i].Buckets = buckets
-	}
-	summary := response.Summary[:0]
-	for i, metric := range response.Summary {
-		if i >= len(presence.Summary) {
-			continue
-		}
-		var value *float64
-		if json.Unmarshal(presence.Summary[i]["value"], &value) == nil && value != nil {
-			metric.Value = *value
-			summary = append(summary, metric)
-		}
-	}
-	response.Summary = summary
-	return response, true
-}
-
-// middlewareBoundedBuffer drops its entire observation when the cap is exceeded,
-// but always accepts the original byte count so teeing cannot affect I/O.
-type middlewareBoundedBuffer struct {
-	bytes.Buffer
-	limit    int
-	overflow bool
-}
-
-func (capture *middlewareBoundedBuffer) Write(data []byte) (int, error) {
-	if !capture.overflow {
-		if len(data) > capture.limit-capture.Len() {
-			capture.Reset()
-			capture.overflow = true
-		} else {
-			_, _ = capture.Buffer.Write(data)
-		}
-	}
-	return len(data), nil
-}
-
-type middlewareBodyTee struct {
-	io.ReadCloser
-	capture *middlewareBoundedBuffer
-}
-
-func (body *middlewareBodyTee) Read(data []byte) (int, error) {
-	n, errRead := body.ReadCloser.Read(data)
-	_, _ = body.capture.Write(data[:n])
-	return n, errRead
-}
-
-type middlewareResponseTee struct {
-	gin.ResponseWriter
-	capture *middlewareBoundedBuffer
-}
-
-func (writer *middlewareResponseTee) Write(data []byte) (int, error) {
-	n, errWrite := writer.ResponseWriter.Write(data)
-	_, _ = writer.capture.Write(data[:n])
-	return n, errWrite
-}
-
-func (writer *middlewareResponseTee) WriteString(data string) (int, error) {
-	n, errWrite := writer.ResponseWriter.WriteString(data)
-	_, _ = writer.capture.Write([]byte(data[:n]))
-	return n, errWrite
 }
 
 func middlewareIdentityEncoding(header http.Header) bool {

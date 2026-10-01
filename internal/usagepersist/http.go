@@ -114,7 +114,6 @@ func RegisterDynamicRoutes(group *gin.RouterGroup, current func() *Store, collec
 	})
 	register(http.MethodGet, "/quota", (*Store).quotaHTTP)
 	register(http.MethodGet, "/quota/summary", (*Store).quotaSummaryHTTP)
-	register(http.MethodGet, "/quota/identities", (*Store).quotaIdentitiesHTTP)
 	register(http.MethodGet, "/quota/cache", (*Store).quotaCacheGetHTTP)
 	register(http.MethodPut, "/quota/cache", (*Store).quotaCachePutHTTP)
 	register(http.MethodGet, "/status", func(s *Store, c *gin.Context) {

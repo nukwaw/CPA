@@ -6,6 +6,9 @@ import "time"
 
 const (
 	SourceHeaders = "response_headers"
+	// SourceAPICall and SourceFetch are legacy provenance labels: observations
+	// are no longer produced from management routes, but stored history may
+	// still carry them.
 	SourceAPICall = "management_api"
 	SourceFetch   = "management_fetch"
 	maxWindows    = 128

@@ -2,7 +2,6 @@ package usagepersist
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/quota"
@@ -10,57 +9,17 @@ import (
 )
 
 // The worker retains at most this many queued records plus one in-flight
-// record, shared by usage, quota-only observations and reset barriers. Admission
-// never waits for capacity or creates per-event goroutines. Overflow drops the
-// incoming record (including resets) and increments queue_overflows/dropped_events;
-// resets have no unbounded priority path. Health's event counters include all work.
+// record. Admission never waits for capacity or creates per-event goroutines.
+// Overflow drops the incoming record and increments
+// queue_overflows/dropped_events. Health's event counters include all work.
 // This fixed bound is deliberately not another runtime setting.
 const usageQueueCapacity = 256
 
-type queuedWorkKind uint8
-
-const (
-	queuedUsageEvent queuedWorkKind = iota // Keep existing Consume admission unchanged.
-	queuedQuotaObservation
-	queuedQuotaResetBarrier
-)
-
 // queuedUsage is the entire queued representation. Do not add raw JSON, headers,
-// credentials, callbacks or request contexts here. Only usage work inserts Event;
-// quota-only observations and resets never produce dummy accounting events.
+// credentials, callbacks or request contexts here.
 type queuedUsage struct {
-	Event Event             `json:"event"`
-	Quota *quota.Snapshot   `json:"quota,omitempty"`
-	Kind  queuedWorkKind    `json:"kind,omitempty"`
-	Reset *queuedQuotaReset `json:"reset,omitempty"`
-}
-
-// queuedQuotaReset carries only the account a reset applies to and when it was
-// received. There is no credential fence to retain.
-type queuedQuotaReset struct {
-	Provider   string    `json:"provider"`
-	Account    string    `json:"account"`
-	ObservedAt time.Time `json:"observed_at"`
-}
-
-// enqueueManagement uses the same admission/bookkeeping contract as Consume.
-// Normalization must finish before calling it. This lock never covers backend I/O
-// and a full queue never blocks the original management handler's response.
-func (s *Store) enqueueManagement(item queuedUsage) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closing || s.workerStopped || s.workerCtx.Err() != nil {
-		s.recordDrop(1)
-		return
-	}
-	select {
-	case s.queue <- item:
-		s.accepted++
-		s.pendingEvents.Add(1)
-	default:
-		s.queueOverflows.Add(1)
-		s.recordDrop(1)
-	}
+	Event Event           `json:"event"`
+	Quota *quota.Snapshot `json:"quota,omitempty"`
 }
 
 func (s *Store) startWorker(lifecycle context.Context) {
@@ -127,23 +86,11 @@ func (s *Store) runWorker() {
 }
 
 func (s *Store) persistUsage(ctx context.Context, item queuedUsage) error {
-	switch item.Kind {
-	case queuedUsageEvent:
-		if _, err := s.store.Insert(ctx, item.Event); err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-	case queuedQuotaObservation:
-		// Quota-only management observations never enter usage statistics.
-	case queuedQuotaResetBarrier:
-		if item.Reset == nil {
-			return errors.New("missing queued quota reset")
-		}
-		return s.resetBoundQuotaAt(ctx, item.Reset)
-	default:
-		return errors.New("unknown queued observation kind")
+	if _, err := s.store.Insert(ctx, item.Event); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if item.Quota != nil {
 		return s.mergeQuota(ctx, *item.Quota)

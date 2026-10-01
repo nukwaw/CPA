@@ -65,14 +65,6 @@ func TestPostgresPersistence(t *testing.T) {
 	// own account, and a third claude credential whose different account must land
 	// in its own row and never mix with the first.
 	const devinAccount = "devin@example.invalid"
-	const parallelAccount = "parallel@example.invalid"
-	bindFixtures := func(target *Store) {
-		wpBindFixtures(t, target,
-			wpQuotaAuth("claude", "account-1", "claude.json", "source-token"),
-			wpQuotaAuthWithAccount("devin", "devin-account", "devin.json", "devin-token", devinAccount),
-			wpQuotaAuthWithAccount("claude", "parallel", "parallel.json", "parallel-token", parallelAccount))
-	}
-	bindFixtures(s)
 	at := time.Now().UTC().Add(-time.Minute)
 	record := fixtureRecord("pg-event", at)
 	record.Model = "gpt-test\x00suffix"
@@ -90,13 +82,9 @@ func TestPostgresPersistence(t *testing.T) {
 	if _, err = s.SetPrice(ctx, price); err != nil {
 		t.Fatal(err)
 	}
-	cache := wpBindCacheFixture(s, QuotaCacheEntry{Provider: "devin", Key: "devin-account", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"daily","remainingPercent":80,"resetAtMs":1800000000000,"periodHours":24}],"observedAtMs":1700000000000,"plan":"pro"}`)})
-	if cache.Key != "devin.json\x00devin-account" {
-		t.Fatalf("fixture lost Devin's native composite key: %q", cache.Key)
-	}
-	if cache.Account != devinAccount || cache.AccountKind != "email" {
-		t.Fatalf("fixture lost devin's account facts: %#v", cache)
-	}
+	// Devin uses a filename+NUL+auth-index composite key; it must round trip
+	// through JSONB unchanged.
+	cache := QuotaCacheEntry{Provider: "devin", Key: "devin.json\x00devin-account", Account: devinAccount, AccountKind: "email", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"daily","remainingPercent":80,"resetAtMs":1800000000000,"periodHours":24}],"observedAtMs":1700000000000,"plan":"pro"}`)}
 	if err = s.SaveQuotaCache(ctx, []QuotaCacheEntry{cache}); err != nil {
 		t.Fatalf("Devin NUL composite key must round trip through JSONB: %v", err)
 	}
@@ -107,7 +95,6 @@ func TestPostgresPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bindFixtures(s)
 	page, err := s.Events(ctx, Filter{}, 100, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -118,10 +105,6 @@ func TestPostgresPersistence(t *testing.T) {
 	cached, err := s.QuotaCache(ctx)
 	if err != nil || len(cached) != 1 || cached[0].Key != cache.Key || cached[0].Account != cache.Account || cached[0].AccountKind != cache.AccountKind {
 		t.Fatalf("PostgreSQL cache roundtrip: %#v %v", cached, err)
-	}
-	// A token rotation changes nothing durable: the account keeps its row.
-	if current := wpReadBinding(s, "devin", "devin-account"); current.Account != cache.Account || current.AccountKind != cache.AccountKind {
-		t.Fatal("reopen changed stable account identity")
 	}
 	snapshots, err := s.Quotas(ctx)
 	if err != nil || len(snapshots) != 1 || len(snapshots[0].Windows) != 1 {
@@ -138,7 +121,6 @@ func TestPostgresPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = other.Close(ctx) }()
-	bindFixtures(other)
 	var wg sync.WaitGroup
 	errs := make(chan error, 12)
 	for i := range 12 {
@@ -168,58 +150,15 @@ func TestPostgresPersistence(t *testing.T) {
 	}
 	found := false
 	for _, snapshot := range snapshots {
-		if snapshot.Account == parallelAccount {
+		if snapshot.Account == fixtureAccount {
 			found = true
-			if len(snapshot.Windows) != 12 {
+			if len(snapshot.Windows) != 13 {
 				t.Fatalf("lost concurrent windows: %d", len(snapshot.Windows))
 			}
 		}
 	}
 	if !found {
 		t.Fatal("parallel snapshot missing")
-	}
-
-	if err = s.ResetQuota(ctx, "devin", devinAccount); err != nil {
-		t.Fatal(err)
-	}
-	// The cutoff is durable and shared by every replica: a stale display write
-	// from another process cannot resurrect pre-reset state.
-	if err = other.SaveQuotaCache(ctx, []QuotaCacheEntry{cache}); err != nil {
-		t.Fatal(err)
-	}
-	cached, err = other.QuotaCache(ctx)
-	if err != nil || len(cached) != 0 {
-		t.Fatalf("reset allowed stale cache resurrection: %#v %v", cached, err)
-	}
-	if err = s.ResetQuota(ctx, "claude", fixtureAccount); err != nil {
-		t.Fatal(err)
-	}
-	if err = other.recordFixture(ctx, record); err != nil {
-		t.Fatal(err)
-	}
-	snapshots, err = s.Quotas(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, snapshot := range snapshots {
-		if snapshot.Account == fixtureAccount && snapshot.Provider == "claude" {
-			t.Fatal("reset allowed stale header resurrection")
-		}
-	}
-	if err = s.Close(ctx); err != nil {
-		t.Fatal(err)
-	}
-	s, err = Open(ctx, Options{Database: db, Schema: schema})
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindFixtures(s)
-	if err = s.SaveQuotaCache(ctx, []QuotaCacheEntry{cache}); err != nil {
-		t.Fatal(err)
-	}
-	cached, err = s.QuotaCache(ctx)
-	if err != nil || len(cached) != 0 {
-		t.Fatal("reset watermark not persistent")
 	}
 }
 

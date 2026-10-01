@@ -237,11 +237,12 @@
     if (!lines.length) for (const window of arrays(snapshot, 'windows')) {const at = push(window.id || window.label, window.label || window.id, percentOf(window.used_percent), window.reset_at); if (at != null) lines[at].source = String(window.id || '');}
     return lines;
   }
-  // Join saved display state, normalized snapshots and known credentials into cards.
-  // One card is one `(provider, account)` pair: several credentials that resolve to
-  // the same facts are deliberately merged, and an empty account is grouped under
-  // its provider alone.
-  function summarizeCredentials(entries, snapshots, bindings) {
+  // Join saved display state, normalized snapshots and the live credential files
+  // (the management auth-files list) into cards. One card is one credential file:
+  // every file gets its own card, even when two files serve one account, because
+  // each is separately refreshable, which is what the control panel's quota page
+  // offers. An empty account is grouped under its provider alone.
+  function summarizeCredentials(entries, snapshots, authFiles) {
     const credentials = new Map();
     const ensure = (provider, account, accountKind, key) => {
       const id = credentialKey(provider, key);
@@ -253,15 +254,23 @@
       if (!credential.account_kind && accountKind) credential.account_kind = accountKind;
       return credential;
     };
-    // A card is one credential file: every file the add-on can attribute gets its
-    // own card, even when two files serve one account. Each is separately
-    // refreshable, which is what the control panel's quota page offers.
-    for (const binding of bindings) {
-      const credential = ensure(binding.provider, binding.account, binding.account_kind, binding.key);
+    for (const file of authFiles) {
+      if (!file || typeof file !== 'object' || file.runtime_only) continue;
+      const provider = String(file.provider || file.type || '').trim().toLowerCase();
+      const name = String(file.name || '').trim();
+      if (!provider || !name) continue;
+      // Only the email is an account fact: the entry's `account` field can carry an
+      // API key, and a credential that publishes no email keeps empty facts. A
+      // saved entry for the same file later fills the fact it recorded.
+      const email = String(file.email || '').trim();
       // `auth_index` is transient correlation: it addresses the live credential in the
       // core manager so the original quota handler can be asked to refresh it. It is
       // never rendered, persisted, or uploaded; only the account fact is durable.
-      const index = typeof binding.auth_index === 'string' ? binding.auth_index.trim() : '';
+      const index = typeof file.auth_index === 'string' ? file.auth_index.trim() : '';
+      // A devin file can expose more than one credential identity, so its native
+      // composite key keeps the transient suffix, matching its display cache keys.
+      const key = provider === 'devin' && index ? `${name} ${index}` : name;
+      const credential = ensure(provider, email, email ? 'email' : '', key);
       if (index && !credential.indices.includes(index)) credential.indices.push(index);
     }
     const snapshotFor = (provider, account) => snapshots.find(item => item.provider === provider && String(item.account || '') === String(account || ''));

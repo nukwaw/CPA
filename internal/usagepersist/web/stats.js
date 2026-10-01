@@ -256,10 +256,11 @@
   }
   // Ask the original credential-quota handler to refresh one card's credentials from
   // the provider. This add-on performs no provider traffic itself: the existing
-  // handler owns that call, and the passive middleware records the response under
-  // the (provider, account) facts. A card can hold several credentials, and one may
+  // handler owns that call. A card can hold several credentials, and one may
   // legitimately fail (no quota plugin covers it), so every attempt is reported
-  // without discarding the ones that succeeded.
+  // without discarding the ones that succeeded. Fresh values reach this page the
+  // same way all quota does: passively, from provider response observations and
+  // the control panel's saved state.
   async function refreshFromProvider(credentials, button) {
     const targets = (Array.isArray(credentials) ? credentials : [credentials]).filter(credential => credential && credential.indices.length);
     if (!targets.length) {message('quota-message', 'No credential here can be refreshed: the add-on publishes no live credential for this group.', true); return;}
@@ -279,8 +280,6 @@
           }
         }
       }
-      // The observation is recorded by an isolated worker after the handler returns,
-      // so give it a moment before re-reading the saved state it just produced.
       if (requested) await new Promise(resolve => setTimeout(resolve, 900));
       await refresh(false);
       if (failures.length) message('quota-message', `Some credentials could not be refreshed — ${failures.join(' · ')}`, true);
@@ -293,10 +292,13 @@
 
   async function loadQuota(epoch) {
     try {
-      const [cache, snapshots, identities] = await Promise.all([api('quota/cache'), api('quota'), api('quota/identities')]);
+      // The live credential files come from the EXISTING management auth-files
+      // list: the add-on keeps no credential projection of its own. Only each
+      // entry's name, provider, email and transient auth_index are read.
+      const [cache, snapshots, authFiles] = await Promise.all([api('quota/cache'), api('quota'), api('./v0/management/auth-files', {root: true})]);
       if (epoch !== state.epoch) return;
       state.quota = {entries: C.arrays(cache, 'entries'), snapshots: C.arrays(snapshots, 'snapshots')};
-      state.credentials = C.summarizeCredentials(state.quota.entries, state.quota.snapshots, C.arrays(identities, 'bindings'));
+      state.credentials = C.summarizeCredentials(state.quota.entries, state.quota.snapshots, C.arrays(authFiles, 'files'));
       // Quota history is only recorded under the backend's own window id, so only
       // windows a line can name a backend id for are offered. A display id that
       // reached the card from saved state alone has no recorded history and would

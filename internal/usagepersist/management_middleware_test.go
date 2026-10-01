@@ -3,8 +3,6 @@ package usagepersist
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
-	"encoding/json"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -20,10 +18,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
-
-const middlewareQuotaURL = "https://chatgpt.com/backend-api/wham/usage"
 
 // readMiddlewareManagementHTML shares the reduced upstream document fixture with
 // API integration tests. The navigation asset does not recognize upstream
@@ -38,35 +33,6 @@ func readMiddlewareManagementHTML(t *testing.T) string {
 	return string(data)
 }
 
-func middlewareTestStore(t *testing.T) *Store {
-	t.Helper()
-	store, errOpen := Open(context.Background(), Options{DataDir: t.TempDir()})
-	if errOpen != nil {
-		t.Fatal(errOpen)
-	}
-	t.Cleanup(func() {
-		if errClose := store.Close(context.Background()); errClose != nil {
-			t.Error(errClose)
-		}
-	})
-	wpBindManagementFixtures(t, store)
-	return store
-}
-
-func middlewareQuotaEnvelope(t *testing.T, padding string) []byte {
-	t.Helper()
-	data, errJSON := json.Marshal(map[string]any{
-		"status_code": 200,
-		"header":      map[string][]string{"Set-Cookie": {"private-cookie"}},
-		"body":        `{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}},"token":"private-body-token"}`,
-		"unrelated":   padding,
-	})
-	if errJSON != nil {
-		t.Fatal(errJSON)
-	}
-	return data
-}
-
 func middlewareRequest(t *testing.T, handler http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	request := httptest.NewRequest(method, path, bytes.NewReader(body))
@@ -74,166 +40,6 @@ func middlewareRequest(t *testing.T, handler http.Handler, method, path string, 
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
-}
-
-func middlewareQuotaCount(t *testing.T, store *Store) int {
-	t.Helper()
-	flushFixture(t, store)
-	snapshots, errRead := store.Quotas(context.Background())
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-	return len(snapshots)
-}
-
-func TestManagementMiddlewarePreservesAPICallBytesAndObservesQuota(t *testing.T) {
-	for _, path := range []string{"/v0/management/api-call", "/v8/management/requests/api-call"} {
-		t.Run(path, func(t *testing.T) {
-			store := middlewareTestStore(t)
-			engine := gin.New()
-			engine.Use(store.ManagementMiddleware())
-			input := []byte(` {"authIndex":"account","url":"` + middlewareQuotaURL + `","header":{"Authorization":"Bearer $TOKEN$"},"data":"{}"} `)
-			output := middlewareQuotaEnvelope(t, "")
-			engine.POST(path, func(c *gin.Context) {
-				got, errRead := io.ReadAll(c.Request.Body)
-				if errRead != nil || !bytes.Equal(got, input) {
-					t.Errorf("request body changed: %q, %v", got, errRead)
-				}
-				c.Header("Content-Type", "application/json")
-				c.Header("X-Original", "preserved")
-				c.Status(http.StatusOK)
-				_, _ = c.Writer.WriteString(string(output[:10]))
-				_, _ = c.Writer.Write(output[10:])
-			})
-			response := middlewareRequest(t, engine, http.MethodPost, path, input)
-			if response.Code != 200 || !bytes.Equal(response.Body.Bytes(), output) || response.Header().Get("X-Original") != "preserved" {
-				t.Fatalf("original response altered: %d, %q", response.Code, response.Body.String())
-			}
-			flushFixture(t, store)
-			snapshots, errRead := store.Quotas(context.Background())
-			if errRead != nil || len(snapshots) != 1 || len(snapshots[0].Windows) != 1 || *snapshots[0].Windows[0].UsedPercent != 25 {
-				t.Fatalf("quota observation missing: %+v, %v", snapshots, errRead)
-			}
-			serialized, _ := json.Marshal(snapshots)
-			for _, secret := range []string{"request-secret", "private-body-token", "private-cookie", middlewareQuotaURL} {
-				if strings.Contains(string(serialized), secret) {
-					t.Fatalf("persisted raw response/request data: %s", serialized)
-				}
-			}
-		})
-	}
-}
-
-func TestManagementMiddlewareIgnoresFailuresUnknownAndOversizedCaptures(t *testing.T) {
-	input := []byte(`{"auth_index":"account","url":"` + middlewareQuotaURL + `","header":{"Authorization":"Bearer $TOKEN$"}}`)
-	output := middlewareQuotaEnvelope(t, "")
-	for _, test := range []struct {
-		name, path    string
-		status        int
-		input, output []byte
-		abort         bool
-		encoding      string
-	}{
-		{name: "unauthorized", path: "/v0/management/api-call", status: 401, input: input, output: output, abort: true},
-		{name: "forbidden", path: "/v0/management/api-call", status: 403, input: input, output: output, abort: true},
-		{name: "handler-error", path: "/v0/management/api-call", status: 500, input: input, output: output},
-		{name: "unknown-route", path: "/v0/management/arbitrary", status: 200, input: input, output: output},
-		{name: "unknown-credential", path: "/v0/management/api-call", status: 200, input: []byte(`{"auth_index":"unknown","url":"` + middlewareQuotaURL + `","header":{"Authorization":"Bearer $TOKEN$"}}`), output: output},
-		{name: "unknown-envelope", path: "/v0/management/api-call", status: 200, input: input, output: []byte(`{"message":"success"}`)},
-		{name: "invalid-json", path: "/v0/management/api-call", status: 200, input: input, output: []byte("not-json")},
-		{name: "encoded-json", path: "/v0/management/api-call", status: 200, input: input, output: output, encoding: "gzip"},
-		{name: "request-cap", path: "/v0/management/api-call", status: 200, input: append(append([]byte(nil), input...), bytes.Repeat([]byte(" "), middlewareRequestLimit)...), output: output},
-		{name: "response-cap", path: "/v0/management/api-call", status: 200, input: input, output: middlewareQuotaEnvelope(t, strings.Repeat("x", middlewareResponseLimit))},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			store := middlewareTestStore(t)
-			engine := gin.New()
-			engine.Use(store.ManagementMiddleware())
-			engine.POST(test.path, func(c *gin.Context) {
-				got, errRead := io.ReadAll(c.Request.Body)
-				if errRead != nil || !bytes.Equal(got, test.input) {
-					t.Errorf("cap/error truncated input: got=%d want=%d err=%v", len(got), len(test.input), errRead)
-				}
-				if test.encoding != "" {
-					c.Header("Content-Encoding", test.encoding)
-				}
-				if test.abort {
-					c.Abort()
-				}
-				c.Data(test.status, "application/json", test.output)
-			})
-			response := middlewareRequest(t, engine, http.MethodPost, test.path, test.input)
-			if response.Code != test.status || !bytes.Equal(response.Body.Bytes(), test.output) {
-				t.Fatalf("cap/error altered output: status=%d bytes=%d", response.Code, response.Body.Len())
-			}
-			if got := middlewareQuotaCount(t, store); got != 0 {
-				t.Fatalf("unexpected %d observations", got)
-			}
-		})
-	}
-}
-
-func TestManagementMiddlewareFetchPreservesMissingFraction(t *testing.T) {
-	for _, test := range []struct{ method, path, request string }{
-		{http.MethodPost, "/v0/management/quota/fetch", `{"AuthIndex":"account"}`},
-		{http.MethodPost, "/v8/management/credentials/quota/fetch", `{"auth_index":"account"}`},
-		{http.MethodGet, "/v0/management/plugins/custom/quota?auth_index=account", ""},
-		{http.MethodGet, "/v8/management/plugins/custom/quota?authIndex=account", ""},
-	} {
-		t.Run(test.path, func(t *testing.T) {
-			store := middlewareTestStore(t)
-			engine := gin.New()
-			engine.Use(store.ManagementMiddleware())
-			output := []byte(`{"groups":[{"displayName":"Plan","buckets":[{"window":"missing"},{"window":"unknown","remainingFraction":null},{"window":"monthly","remainingFraction":0}]}]}`)
-			engine.Handle(test.method, strings.Split(test.path, "?")[0], func(c *gin.Context) {
-				_, _ = io.Copy(io.Discard, c.Request.Body)
-				c.Data(200, "application/json", output)
-			})
-			response := middlewareRequest(t, engine, test.method, test.path, []byte(test.request))
-			if !bytes.Equal(response.Body.Bytes(), output) {
-				t.Fatal("fetch output changed")
-			}
-			flushFixture(t, store)
-			snapshots, errRead := store.Quotas(context.Background())
-			if errRead != nil || len(snapshots) != 1 || len(snapshots[0].Windows) != 1 || snapshots[0].Windows[0].Label != "monthly" || *snapshots[0].Windows[0].RemainingPercent != 0 {
-				t.Fatalf("missing value fabricated exhausted quota: %+v, %v", snapshots, errRead)
-			}
-		})
-	}
-}
-
-func TestManagementMiddlewareResetRequiresConfirmedSuccessfulResponse(t *testing.T) {
-	for _, test := range []struct {
-		name, method, path, response string
-		status                       int
-		removed                      bool
-	}{
-		{"routing", http.MethodPost, "/v0/management/reset-quota", `{"status":"ok","auth_index":"account"}`, 200, true},
-		{"credential", http.MethodPost, "/v8/management/credentials/quota/reset", `{"status":"ok","auth_index":"account"}`, 200, true},
-		{"plugin", http.MethodDelete, "/v0/management/plugins/custom/quota?auth_index=account", `{"status":"ok","auth_index":"account"}`, 200, true},
-		{"plugin-action", http.MethodPost, "/v0/management/plugins/custom/quota/reset", `{"status":"ok","auth_index":"account"}`, 200, true},
-		{"failed", http.MethodPost, "/v0/management/quota/reset", `{"status":"ok","auth_index":"account"}`, 500, false},
-		{"unconfirmed", http.MethodPost, "/v0/management/quota/reset", `{"message":"success"}`, 200, false},
-		{"wrong-identity", http.MethodPost, "/v0/management/quota/reset", `{"status":"ok","auth_index":"other"}`, 200, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			store := middlewareTestStore(t)
-			wpObserveAPICall(store, context.Background(), "codex", "account", middlewareQuotaURL, 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25}}}`))
-			engine := gin.New()
-			engine.Use(store.ManagementMiddleware())
-			engine.Handle(test.method, strings.Split(test.path, "?")[0], func(c *gin.Context) {
-				_, _ = io.Copy(io.Discard, c.Request.Body)
-				c.Data(test.status, "application/json", []byte(test.response))
-			})
-			response := middlewareRequest(t, engine, test.method, test.path, []byte(`{"auth_index":"account"}`))
-			if response.Code != test.status || response.Body.String() != test.response {
-				t.Fatal("reset response changed")
-			}
-			if removed := middlewareQuotaCount(t, store) == 0; removed != test.removed {
-				t.Fatalf("removed=%v want=%v", removed, test.removed)
-			}
-		})
-	}
 }
 
 func TestManagementMiddlewareHTMLInjectsRealFileAndRepairsHeaders(t *testing.T) {
@@ -551,35 +357,6 @@ func TestManagementHTMLBufferOverflowAndWriteSemantics(t *testing.T) {
 	}
 }
 
-func TestManagementMiddlewareDoesNotAttributeAnonymousAPICallByQuery(t *testing.T) {
-	store := middlewareTestStore(t)
-	engine := gin.New()
-	engine.Use(store.ManagementMiddleware())
-	output := middlewareQuotaEnvelope(t, "")
-	engine.POST("/v0/management/api-call", func(c *gin.Context) {
-		_, _ = io.Copy(io.Discard, c.Request.Body)
-		c.Data(200, "application/json", output)
-	})
-	response := middlewareRequest(t, engine, http.MethodPost, "/v0/management/api-call?auth_index=account", []byte(`{"url":"`+middlewareQuotaURL+`","header":{"Authorization":"Bearer $TOKEN$"}}`))
-	if response.Code != 200 || !bytes.Equal(response.Body.Bytes(), output) || middlewareQuotaCount(t, store) != 0 {
-		t.Fatal("anonymous API-call was incorrectly attributed using ignored query input")
-	}
-}
-
-func TestManagementFetchSnakeCaseAndMissingValues(t *testing.T) {
-	response, valid := middlewareFetchResponse([]byte(`{"groups":[{"buckets":[{"remaining_fraction":0.75},{"remainingFraction":0,"remaining_fraction":0.8},{"remainingFraction":null}]}]}`))
-	if !valid || len(response.Groups) != 1 || len(response.Groups[0].Buckets) != 2 || response.Groups[0].Buckets[0].RemainingFraction != 0.75 || response.Groups[0].Buckets[1].RemainingFraction != 0 {
-		t.Fatalf("fraction presence or alias precedence lost: %+v", response)
-	}
-}
-
-func TestManagementFetchSummaryValuePresence(t *testing.T) {
-	response, valid := middlewareFetchResponse([]byte(`{"summary":[{"key":"missing"},{"key":"null","value":null},{"key":"zero","value":0},{"key":"measured","value":12.5}]}`))
-	if !valid || len(response.Summary) != 2 || response.Summary[0].Key != "zero" || response.Summary[0].Value != 0 || response.Summary[1].Value != 12.5 {
-		t.Fatalf("summary missing value was fabricated as zero: %+v", response.Summary)
-	}
-}
-
 func TestManagementMiddlewareActualHTMLBuild(t *testing.T) {
 	path := os.Getenv("CPA_MANAGEMENT_FIXTURE")
 	if path == "" {
@@ -624,68 +401,3 @@ func TestManagementMiddlewareActualHTMLBuild(t *testing.T) {
 // the captured evidence, and only for a credential it can already name. Publication
 // happens when the add-on identity endpoint is read, so a refresh before that read
 // is skipped silently rather than guessed at.
-func TestManagementMiddlewareSkipsObservationUntilIdentityIsPublished(t *testing.T) {
-	input := []byte(`{"auth_index":"account","url":"` + middlewareQuotaURL + `","header":{"Authorization":"Bearer $TOKEN$"},"data":"{}"}`)
-	output := middlewareQuotaEnvelope(t, "")
-	serve := func(t *testing.T, store *Store) (*httptest.ResponseRecorder, *Store) {
-		t.Helper()
-		engine := gin.New()
-		engine.Use(store.ManagementMiddleware())
-		engine.POST("/v0/management/api-call", func(c *gin.Context) {
-			// The capture is a passive tee: it fills only as the original handler
-			// reads, exactly like the real handler binding its JSON body.
-			_, _ = io.ReadAll(c.Request.Body)
-			c.Header("Content-Type", "application/json")
-			c.Status(http.StatusOK)
-			_, _ = c.Writer.Write(output)
-		})
-		return middlewareRequest(t, engine, http.MethodPost, "/v0/management/api-call", input), store
-	}
-
-	t.Run("unprimed", func(t *testing.T) {
-		store := openTestStore(t)
-		// A source is bound, but nothing has read identities yet: no advisory
-		// binding copy exists, which is the state after a fresh start.
-		manager := coreauth.NewManager(nil, nil, nil)
-		if _, errRegister := manager.Register(context.Background(), wpQuotaAuth("codex", "account", "account.json", "fixture-secret")); errRegister != nil {
-			t.Fatal(errRegister)
-		}
-		store.BindQuotaIdentitySource(NewQuotaIdentitySource(func() *coreauth.Manager { return manager }))
-		if len(store.publishedQuotaBindings()) != 0 {
-			t.Fatal("fixture unexpectedly published bindings before any identity read")
-		}
-		response, store := serve(t, store)
-		// The original response is returned byte-for-byte; only the copy is skipped.
-		if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), output) {
-			t.Fatalf("original response altered: %d, %q", response.Code, response.Body.String())
-		}
-		if count := middlewareQuotaCount(t, store); count != 0 {
-			t.Fatalf("quota state recorded without published identity: %d", count)
-		}
-	})
-
-	t.Run("primed", func(t *testing.T) {
-		store := middlewareTestStore(t) // publishes an advisory binding copy
-		if len(store.publishedQuotaBindings()) == 0 {
-			t.Fatal("fixture did not publish bindings")
-		}
-		response, store := serve(t, store)
-		if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), output) {
-			t.Fatalf("original response altered: %d, %q", response.Code, response.Body.String())
-		}
-		if count := middlewareQuotaCount(t, store); count != 1 {
-			t.Fatalf("primed observation was not recorded: %d", count)
-		}
-	})
-}
-
-func TestManagementMiddlewareRouteAllowlist(t *testing.T) {
-	for _, path := range []string{"/v0/management/plugins/p/quota/other", "/v0/management/plugins/p/quota/reset/extra", "/v1/management/api-call", "/v0/management/quota/providers", "/v0/management/auth-files", "/v0/management/stats/quota/cache"} {
-		if got := middlewareQuotaRoute(http.MethodPost, path); got != "" {
-			t.Fatalf("unknown route %q classified %q", path, got)
-		}
-	}
-	if middlewareQuotaRoute(http.MethodGet, "/v0/management/api-call") != "" {
-		t.Fatal("unknown method observed")
-	}
-}

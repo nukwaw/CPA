@@ -14,9 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // fixtureAccount is the account fact every fixture credential publishes. It is a
@@ -122,89 +120,6 @@ func openTestStore(t *testing.T) *Store {
 		}
 	})
 	return s
-}
-
-// wpQuotaAuth builds a credential whose account fact is its email metadata,
-// the property every provider except kimi identifies an account by. The transient
-// index still addresses the live credential in the manager.
-func wpQuotaAuth(provider, index, name, token string) *coreauth.Auth {
-	return wpQuotaAuthWithAccount(provider, index, name, token, fixtureAccount)
-}
-
-// wpQuotaAuthWithAccount books a distinct account fact on one credential, so
-// fixtures can prove that two accounts never share a quota row.
-func wpQuotaAuthWithAccount(provider, index, name, token, account string) *coreauth.Auth {
-	metadata := map[string]any{"access_token": token}
-	if account != "" {
-		metadata["email"] = account
-	}
-	return &coreauth.Auth{ID: name, Index: index, FileName: name, Provider: provider, Metadata: metadata}
-}
-
-// wpBindFixtures registers the credentials and publishes an advisory binding
-// copy, modelling the explicit add-on identity GET that arms observation.
-func wpBindFixtures(t *testing.T, s *Store, auths ...*coreauth.Auth) *coreauth.Manager {
-	t.Helper()
-	manager := coreauth.NewManager(nil, nil, nil)
-	for _, auth := range auths {
-		if _, err := manager.Register(context.Background(), auth); err != nil {
-			t.Fatal(err)
-		}
-	}
-	s.BindQuotaIdentitySource(NewQuotaIdentitySource(func() *coreauth.Manager { return manager }))
-	s.publishQuotaBindings()
-	return manager
-}
-
-// wpBindManagementFixtures registers the two codex credentials the middleware and
-// worker fixtures address by their transient index.
-func wpBindManagementFixtures(t *testing.T, s *Store) *coreauth.Manager {
-	t.Helper()
-	return wpBindFixtures(t, s, wpQuotaAuth("codex", "account", "account.json", "fixture-secret"), wpQuotaAuth("codex", "later", "later.json", "later-secret"))
-}
-
-// wpReadBinding performs the authoritative read a trusted caller would use,
-// then returns the live binding for one transient credential index, normalized
-// exactly as the producer normalizes the index it reports.
-func wpReadBinding(s *Store, provider, index string) QuotaBinding {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	index = strings.TrimSpace(index)
-	for _, binding := range s.publishQuotaBindings() {
-		if binding.Provider == provider && binding.AuthIndex == index {
-			return binding
-		}
-	}
-	panic("test requires a registered quota source fixture")
-}
-
-func wpObserveAPICall(s *Store, ctx context.Context, provider, index, url string, status int, header http.Header, body []byte) {
-	s.ObserveAPICall(ctx, wpReadBinding(s, provider, index), url, status, header, body)
-}
-
-func wpObserveQuotaFetch(s *Store, ctx context.Context, provider, index string, response pluginapi.QuotaFetchResponse) {
-	s.ObserveQuotaFetch(ctx, wpReadBinding(s, provider, index), response)
-}
-
-func wpObserveQuotaReset(s *Store, ctx context.Context, provider, index string) {
-	s.ObserveQuotaReset(ctx, wpReadBinding(s, provider, index))
-}
-
-// wpObserveResetAt admits a reset with an explicit receipt time so ordering
-// can be tested without a wall-clock sleep.
-func wpObserveResetAt(s *Store, provider, index string, at time.Time) {
-	binding := wpReadBinding(s, provider, index)
-	s.observeQuotaResetAt(binding, at)
-}
-
-// wpBindCacheFixture fills a display entry from the live credential it addresses
-// transiently: on input Key holds the credential index, on output it holds the
-// durable display key and the account facts.
-func wpBindCacheFixture(s *Store, entry QuotaCacheEntry) QuotaCacheEntry {
-	binding := wpReadBinding(s, entry.Provider, entry.Key)
-	entry.Key = binding.Key
-	entry.Account = binding.Account
-	entry.AccountKind = binding.AccountKind
-	return entry
 }
 
 func TestFilePersistenceDedupAndSecretExclusion(t *testing.T) {
@@ -471,11 +386,7 @@ func TestQuotaCacheValidationFreshnessAndHeaders(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	at := time.Now().UTC().Add(-time.Minute)
-	wpBindFixtures(t, s, wpQuotaAuth("claude", "account-1", "auth.json", "source-token"))
-	e := wpBindCacheFixture(s, QuotaCacheEntry{Provider: "claude", Key: "account-1", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"five-hour","usedPercent":20,"resetAtMs":1234}],"planType":"plus"}`)})
-	if e.Account != fixtureAccount || e.AccountKind != "email" {
-		t.Fatalf("display entry lost its account facts: %#v", e)
-	}
+	e := QuotaCacheEntry{Provider: "claude", Key: "auth.json", Account: fixtureAccount, AccountKind: "email", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[{"id":"five-hour","usedPercent":20,"resetAtMs":1234}],"planType":"plus"}`)}
 	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{e}); err != nil {
 		t.Fatal(err)
 	}
@@ -512,13 +423,6 @@ func TestQuotaCacheValidationFreshnessAndHeaders(t *testing.T) {
 	if !snapshots[0].ObservedAt.Equal(at.Add(r.Latency)) {
 		t.Fatalf("quota timestamp used start: %v", snapshots[0].ObservedAt)
 	}
-	if err := s.ResetQuota(ctx, "claude", fixtureAccount); err != nil {
-		t.Fatal(err)
-	}
-	cached, err = s.QuotaCache(ctx)
-	if err != nil || len(cached) != 0 {
-		t.Fatalf("reset cache: %#v %v", cached, err)
-	}
 }
 
 // TestQuotaCacheRejectsUnsafeStateBeforeBatchWrite keeps the pre-write protection
@@ -544,8 +448,7 @@ func TestQuotaCacheRejectsUnsafeStateBeforeBatchWrite(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := openTestStore(t)
-			wpBindFixtures(t, s, wpQuotaAuth("claude", "account-1", "auth.json", "source-token"))
-			valid := wpBindCacheFixture(s, QuotaCacheEntry{Provider: "claude", Key: "account-1", ObservedAt: time.Now().Add(-time.Minute), State: json.RawMessage(`{"status":"success","windows":[]}`)})
+			valid := QuotaCacheEntry{Provider: "claude", Key: "auth.json", Account: fixtureAccount, AccountKind: "email", ObservedAt: time.Now().Add(-time.Minute), State: json.RawMessage(`{"status":"success","windows":[]}`)}
 			invalid := valid
 			test.mutate(&invalid)
 			if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{valid, invalid}); err == nil {

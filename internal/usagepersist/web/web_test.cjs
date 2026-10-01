@@ -154,13 +154,17 @@ test('provider quota rows become labelled percentage lines for every supported s
   const derived = C.quotaLines({state: {groups: [{id: 'g', label: 'Group', buckets: [{id: 'b1', remainingFraction: 0.25}, {id: 'b2', remainingFraction: 1.5}]},], rows: [{id: 'r1', used: 1, limit: 0}, {id: 'r2', used: -5, limit: 100}]}});
   assert.deepEqual(derived.map(line => [line.label, line.percent]), [['r1', null], ['r2', 0], ['Group · b1', 75], ['Group · b2', 0]]);
 });
-test('two bindings sharing one account keep one card EACH, as the control panel does', () => {
-  const bindings = [
-    {provider: 'claude', key: 'claude-a.json', account: 'shared@example.test', account_kind: 'email', auth_index: 'index-a'},
-    {provider: 'claude', key: 'claude-b.json', account: 'shared@example.test', account_kind: 'email', auth_index: 'index-b'},
-    {provider: 'kimi', key: 'kimi.json\u0000device-42', account: 'device-42', account_kind: 'device_id', auth_index: 'device-42'},
+test('two auth files sharing one account keep one card EACH, as the control panel does', () => {
+  const authFiles = [
+    {provider: 'claude', name: 'claude-a.json', email: 'shared@example.test', auth_index: 'index-a'},
+    {provider: 'claude', name: 'claude-b.json', email: 'shared@example.test', auth_index: 'index-b'},
+    // Kimi publishes no email through auth-files; a saved entry for the same file
+    // would fill its device account fact. The entry's account field is never read:
+    // it can carry an API key.
+    {provider: 'kimi', name: 'kimi.json', account: 'sk-secret-api-key', auth_index: 'device-42'},
+    {provider: 'gemini', name: 'ignored.json', runtime_only: true, auth_index: 'runtime'},
   ];
-  const cards = C.summarizeCredentials([], [], bindings);
+  const cards = C.summarizeCredentials([], [], authFiles);
   assert.equal(cards.length, 3, 'one card per credential file');
   const claude = cards.filter(card => card.provider === 'claude');
   assert.equal(claude.length, 2, 'two files serving one account stay two cards');
@@ -174,7 +178,10 @@ test('two bindings sharing one account keep one card EACH, as the control panel 
   assert.equal(C.describeCredential(claude[0]), 'claude · shared@example.test · claude-a.json');
   // Each card is addressed by its own credential, so each refreshes on its own.
   assert.deepEqual(claude.map(card => card.indices[0]), ['index-a', 'index-b']);
-  assert.equal(cards.find(card => card.provider === 'kimi').account_kind, 'device_id');
+  const kimi = cards.find(card => card.provider === 'kimi');
+  assert.equal(kimi.account, '', 'the account field never becomes an account fact');
+  assert.equal(kimi.account_kind, '');
+  assert.ok(!cards.some(card => card.key === 'ignored.json'), 'runtime-only entries get no card');
 });
 test('saved states land on their own credential file, and an unknown account never merges', () => {
   const entries = [
@@ -320,7 +327,7 @@ test('the dashboard groups by account facts and never reads a removed credential
   // Cards are identified by the credential file, matching the control panel's own
   // quota page. The account is recorded as a fact on each card, not used as the key.
   assert.match(core, /const credentialKey = \(provider, key\) =>/);
-  assert.match(source, /C\.summarizeCredentials\(state\.quota\.entries, state\.quota\.snapshots, C\.arrays\(identities, 'bindings'\)\)/);
+  assert.match(source, /C\.summarizeCredentials\(state\.quota\.entries, state\.quota\.snapshots, C\.arrays\(authFiles, 'files'\)\)/);
   // A snapshot reaches a card through the account facts, matched in the core. The
   // window choices a card offers come from the backend ids its own lines recorded,
   // so the dropdown can never offer a window the card does not display.

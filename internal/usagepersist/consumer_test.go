@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/quota"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
@@ -67,12 +68,13 @@ func TestPassiveConsumerUsesOriginalGatesWithoutStealingQueue(t *testing.T) {
 	if _, err = s.SetPrice(ctx, fixturePrice()); err != nil {
 		t.Fatal(err)
 	}
-	wpBindFixtures(t, s, wpQuotaAuth("codex", "management-only", "management.json", "secret"))
-	wpObserveAPICall(s, ctx, "codex", "management-only", "https://chatgpt.com/backend-api/wham/usage", 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}`))
-	flushFixture(t, s)
+	used := 25.0
+	if err = s.mergeQuota(ctx, quota.Snapshot{Provider: "codex", Account: fixtureAccount, Source: quota.SourceHeaders, ObservedAt: time.Now().UTC(), Windows: []quota.Window{{ID: "primary", UsedPercent: &used}}}); err != nil {
+		t.Fatal(err)
+	}
 	quotas, err := s.Quotas(ctx)
 	if err != nil || len(quotas) != 1 {
-		t.Fatalf("disabled usage blocked independent management quota: %#v %v", quotas, err)
+		t.Fatalf("disabled usage blocked independent quota merge: %#v %v", quotas, err)
 	}
 }
 
@@ -200,7 +202,6 @@ func TestConsumeNormalizesOnlyKnownProviderHeaders(t *testing.T) {
 	ctx := context.Background()
 	r := fixtureRecord("header-provider", time.Now().Add(-time.Minute))
 	r.Provider = "claude"
-	wpBindFixtures(t, s, wpQuotaAuth("claude", "header-provider", "claude.json", "source-token"))
 	r.ResponseHeaders = http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": []string{"0.4"}, "Authorization": []string{"private-header"}, "Set-Cookie": []string{"private-cookie"}}
 	s.Consume(ctx, fixturePayload(r))
 	flushFixture(t, s)

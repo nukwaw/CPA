@@ -213,9 +213,10 @@ All data routes are under `/v0/management/stats` and reuse the existing manageme
 | `DELETE /pricing?model=...` | Remove a manual override |
 | `POST /pricing/sync` | Synchronize catalog rates |
 | `GET /quota` | Saved normalized quota snapshots keyed by provider and account |
-| `GET /quota/identities` | Current secret-free credential-generation and operation bindings |
 | `GET /quota/summary` | Bounded window history plus attributed request value for one credential |
-| `GET /quota/cache`, `PUT /quota/cache` | Read/upsert sanitized original UI display state with mandatory identity preconditions |
+| `GET /quota/cache`, `PUT /quota/cache` | Read/upsert sanitized original UI display state with mandatory freshness preconditions |
+
+Live credential files are read from the existing `GET /v0/management/auth-files`; the add-on keeps no credential projection of its own.
 
 Manual prices require `model` plus finite, nonnegative, non-null `input_per_million`, `output_per_million`, `cache_read_per_million`, and `cache_write_per_million`; explicit zero is allowed. There is no separate read-only statistics role. Filters use `from`/`to` (RFC3339, inclusive/exclusive), `provider`, `account`, `model`, `key_id`, and `status` (`success`/`failed`). Missing dates mean the last 24 hours; analysis buckets are UTC `hour`/`day`, and event pagination uses `limit` (1–500) and `offset`.
 

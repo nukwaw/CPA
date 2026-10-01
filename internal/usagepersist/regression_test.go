@@ -12,8 +12,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestMissingCacheRatesStayUnpricedUnlessExplicitZero(t *testing.T) {
@@ -53,140 +51,6 @@ func TestPricingHTTPRequiresEveryRateAndDisablesCaching(t *testing.T) {
 	}
 }
 
-func TestOriginalProviderApproximateHeaderTimeAndResetBarrier(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	at := time.Now().UTC().Add(-time.Hour)
-	r := fixtureRecord("old-stream", at)
-	r.Provider = "claude"
-	wpBindFixtures(t, s, wpQuotaAuth(r.Provider, "old-stream", "file.json", "source-token"))
-	r.Latency = 30 * time.Minute
-	r.ResponseHeaders = http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"}}
-	if err := s.recordFixture(ctx, r); err != nil {
-		t.Fatal(err)
-	}
-	qs, err := s.Quotas(ctx)
-	if err != nil || len(qs) != 1 || !qs[0].ObservedAt.Equal(at.Add(r.Latency)) || qs[0].Account != fixtureAccount {
-		t.Fatalf("original provider completion approximation lost: %#v %v", qs, err)
-	}
-	entry := wpBindCacheFixture(s, QuotaCacheEntry{Provider: r.Provider, Key: "old-stream", ObservedAt: at, State: json.RawMessage(`{"status":"success","windows":[]}`)})
-	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{entry}); err != nil {
-		t.Fatal(err)
-	}
-	wpObserveQuotaReset(s, ctx, r.Provider, "old-stream")
-	flushFixture(t, s)
-	if err := s.recordFixture(ctx, r); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SaveQuotaCache(ctx, []QuotaCacheEntry{entry}); err != nil {
-		t.Fatal(err)
-	}
-	qs, err = s.Quotas(ctx)
-	if err != nil || len(qs) != 0 {
-		t.Fatalf("pre-reset headers resurrected: %#v %v", qs, err)
-	}
-	entries, err := s.QuotaCache(ctx)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("pre-reset UI cache resurrected: %#v %v", entries, err)
-	}
-}
-
-// TestFixtureHeaderCaptureKeepsAccountFactsOnEveryProvider covers the headline
-// behavior of the account-fact model: an observation is attributed to the
-// credential's single account property (email everywhere except kimi, which uses
-// device_id), a credential with neither property keeps empty facts and is still
-// recorded, and a refreshing access token never changes identity. Codex and
-// claude are exercised through their rate-limit headers; the other providers
-// carry the same facts through the shared quota-fetch path.
-func TestFixtureHeaderCaptureKeepsAccountFactsOnEveryProvider(t *testing.T) {
-	for _, test := range []struct {
-		provider string
-		property string
-		metadata map[string]any
-		header   http.Header
-	}{
-		{provider: "codex", property: "email", metadata: map[string]any{"email": fixtureAccount}, header: http.Header{"X-Codex-Primary-Used-Percent": {"40"}, "X-Codex-Primary-Window-Minutes": {"300"}}},
-		{provider: "claude", property: "email", metadata: map[string]any{"email": fixtureAccount}, header: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"}}},
-		// Kimi has no email; its device id is the account property.
-		{provider: "kimi", property: "device_id", metadata: map[string]any{"device_id": "device-fixture"}},
-		{provider: "devin", property: "email", metadata: map[string]any{"email": fixtureAccount}},
-		{provider: "xai", property: "email", metadata: map[string]any{"email": fixtureAccount}},
-		{provider: "meta", property: "email", metadata: map[string]any{"email": fixtureAccount}},
-		{provider: "antigravity", property: "email", metadata: map[string]any{"email": fixtureAccount}},
-		// A credential with neither property has empty account facts and is still
-		// recorded: the observation is grouped by provider alone.
-		{provider: "claude", property: "", metadata: map[string]any{}, header: http.Header{"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"}}},
-	} {
-		name := test.provider
-		if test.property == "" {
-			name += "-no-account-property"
-		}
-		t.Run(name, func(t *testing.T) {
-			s := openTestStore(t)
-			ctx := context.Background()
-			auth := &coreauth.Auth{ID: name + ".json", Index: "slot", FileName: name + ".json", Provider: test.provider, Metadata: map[string]any{"access_token": "secret-A"}}
-			for key, value := range test.metadata {
-				auth.Metadata[key] = value
-			}
-			manager := wpBindFixtures(t, s, auth)
-			binding := wpReadBinding(s, test.provider, "slot")
-			var wantAccount, wantKind string
-			if test.property != "" {
-				wantAccount = test.metadata[test.property].(string)
-				wantKind = test.property
-			}
-			if binding.Account != wantAccount || binding.AccountKind != wantKind {
-				t.Fatalf("projected account facts = %+v, want account=%q kind=%q", binding, wantAccount, wantKind)
-			}
-			r := fixtureRecord(name, time.Now().Add(-time.Minute))
-			r.Provider = test.provider
-			r.Account, r.AccountKind = wantAccount, wantKind
-			r.ResponseHeaders = test.header
-			if err := s.recordFixture(ctx, r); err != nil {
-				t.Fatal(err)
-			}
-			if len(test.header) == 0 {
-				// The remaining providers publish no rate-limit headers at all; the
-				// same account facts travel the shared quota-fetch path.
-				s.ObserveQuotaFetch(ctx, binding, pluginapi.QuotaFetchResponse{Groups: []pluginapi.QuotaGroup{{Buckets: []pluginapi.QuotaBucket{{Window: "monthly", RemainingFraction: 0.25}}}}})
-				flushFixture(t, s)
-			}
-			rows, err := s.Quotas(ctx)
-			if err != nil || len(rows) != 1 || rows[0].Account != wantAccount || rows[0].AccountKind != wantKind {
-				t.Fatalf("account facts = %+v %v, want account=%q kind=%q", rows, err, wantAccount, wantKind)
-			}
-			// Rotating the credential's access token must not change identity: the
-			// token is not an account, and the same (provider, account) keeps its row.
-			current, _ := manager.GetByID(auth.ID)
-			current.Metadata["access_token"] = "secret-B"
-			if _, err = manager.Update(ctx, current); err != nil {
-				t.Fatal(err)
-			}
-			rotated := fixtureRecord(name+"-rotated", time.Now())
-			rotated.Provider = test.provider
-			rotated.Account, rotated.AccountKind = wantAccount, wantKind
-			rotated.ResponseHeaders = test.header
-			if err = s.recordFixture(ctx, rotated); err != nil {
-				t.Fatal(err)
-			}
-			rows, err = s.Quotas(ctx)
-			if err != nil || len(rows) != 1 || rows[0].Account != wantAccount || rows[0].AccountKind != wantKind {
-				t.Fatalf("token rotation changed identity: %+v %v", rows, err)
-			}
-			page, err := s.Events(ctx, Filter{}, 10, 0)
-			if err != nil || page.Total != 2 || page.Events[0].ID != rotated.RequestID || page.Events[1].ID != r.RequestID {
-				t.Fatalf("account capture dropped or altered accounting: %+v %v", page, err)
-			}
-			if page.Events[0].Account != wantAccount || page.Events[0].AccountKind != wantKind {
-				t.Fatalf("persisted account facts = %+v", page.Events[0])
-			}
-			if s.droppedEvents.Load() != 0 || s.writeFailures.Load() != 0 {
-				t.Fatal("account fact capture was accounted as an ingestion failure")
-			}
-		})
-	}
-}
-
 // TestAutomaticCodexHeadersUseSlotIdentityWithoutLosingAccounting keeps the
 // accounting protection of the former slot-identity test: a credential's
 // rate-limit headers are attributed to the account it publishes, a credential
@@ -204,15 +68,11 @@ func TestAutomaticCodexHeadersUseSlotIdentityWithoutLosingAccounting(t *testing.
 			ctx := context.Background()
 			r := fixtureRecord("codex-sample", time.Now().Add(-time.Minute))
 			r.ResponseHeaders = http.Header{"X-Codex-Primary-Used-Percent": {"40"}, "X-Codex-Primary-Window-Minutes": {"300"}}
-			auth := &coreauth.Auth{ID: "codex.json", Index: "slot", FileName: "codex.json", Provider: r.Provider, Metadata: map[string]any{"access_token": "codex-token"}}
-			if test.account != "" {
-				auth.Metadata["email"] = test.account
-			} else {
+			if test.account == "" {
 				// Model a credential that publishes no account property: the fact is
 				// empty and the sample is grouped by provider alone, never guessed.
 				r.Account, r.AccountKind = "", ""
 			}
-			wpBindFixtures(t, s, auth)
 			if err := s.recordFixture(ctx, r); err != nil {
 				t.Fatal(err)
 			}

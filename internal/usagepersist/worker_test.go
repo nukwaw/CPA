@@ -125,7 +125,6 @@ func TestQueuedUsageContainsOnlySanitizedSnapshots(t *testing.T) {
 	s := &Store{queue: make(chan queuedUsage, usageQueueCapacity), workerCtx: context.Background()}
 	r := fixtureRecord("sanitized", time.Now())
 	r.Provider = "claude"
-	wpBindFixtures(t, s, wpQuotaAuth(r.Provider, "sanitized", "auth.json", "private-source-token"))
 	r.ResponseHeaders = http.Header{
 		"Anthropic-Ratelimit-Unified-5h-Utilization": {"0.4"},
 		"Authorization":      []string{"private-header"},
@@ -148,8 +147,6 @@ func TestQueuedUsageContainsOnlySanitizedSnapshots(t *testing.T) {
 	}{
 		{"Event", reflect.TypeOf(Event{})},
 		{"Quota", reflect.TypeOf((*quota.Snapshot)(nil))},
-		{"Kind", reflect.TypeOf(queuedWorkKind(0))},
-		{"Reset", reflect.TypeOf((*queuedQuotaReset)(nil))},
 	}
 	if typ.NumField() != len(fields) {
 		t.Fatalf("queue retains fields outside the sanitized work union: %v", typ)
@@ -158,9 +155,6 @@ func TestQueuedUsageContainsOnlySanitizedSnapshots(t *testing.T) {
 		if typ.Field(i).Name != field.name || typ.Field(i).Type != field.typeOf {
 			t.Fatalf("unexpected queued field %d: %v", i, typ.Field(i))
 		}
-	}
-	if item.Kind != queuedUsageEvent || item.Reset != nil {
-		t.Fatal("ordinary usage admission created control work")
 	}
 	if item.Event.ID != r.RequestID || len(item.Event.KeyID) != 64 || item.Quota == nil || len(item.Quota.Windows) != 1 {
 		t.Fatalf("normalization must happen before enqueue: %#v", item)

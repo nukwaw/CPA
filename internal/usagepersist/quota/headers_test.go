@@ -2,14 +2,11 @@ package quota
 
 import (
 	"encoding/json"
-	"fmt"
 	"math"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 var observed = time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
@@ -35,6 +32,42 @@ func assertAccountFacts(t *testing.T, snapshot Snapshot, identity Identity) {
 	wantProvider := strings.ToLower(strings.TrimSpace(identity.Provider))
 	if snapshot.Provider != wantProvider || snapshot.Account != strings.TrimSpace(identity.Account) || snapshot.AccountKind != identity.AccountKind {
 		t.Fatalf("parser lost account facts: %+v from %+v", snapshot, identity)
+	}
+}
+
+func TestAccountFactsContract(t *testing.T) {
+	identity := parserIdentity("codex", "user@example.invalid")
+	encodedIdentity, errJSON := json.Marshal(identity)
+	if errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	if want := `{"provider":"codex","account":"user@example.invalid","account_kind":"email"}`; string(encodedIdentity) != want {
+		t.Fatalf("identity contract changed: got %s, want %s", encodedIdentity, want)
+	}
+	snapshot, ok := ParseHeaders(identity, http.Header{"X-Codex-Primary-Used-Percent": {"10"}, "X-Codex-Primary-Window-Minutes": {"300"}, "X-Codex-Primary-Reset-After-Seconds": {"60"}}, observed)
+	if !ok {
+		t.Fatal("fixture not recognized")
+	}
+	assertAccountFacts(t, snapshot, identity)
+	encoded, errJSON := json.Marshal(snapshot)
+	if errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	prefix := `{"provider":"codex","account":"user@example.invalid","account_kind":"email","source":"response_headers","observed_at":"2026-09-29T12:00:00Z","windows":[`
+	if !strings.HasPrefix(string(encoded), prefix) {
+		t.Fatalf("snapshot contract changed: %s", encoded)
+	}
+
+	// A credential with no account property is still recorded: it is grouped by
+	// provider alone and claims no account kind.
+	accountless := parserIdentity("codex", "")
+	snapshot, ok = ParseHeaders(accountless, http.Header{"X-Codex-Primary-Used-Percent": {"10"}}, observed)
+	if !ok || snapshot.Account != "" || snapshot.AccountKind != "" {
+		t.Fatalf("account-less credential was hidden: %+v, parsed=%v", snapshot, ok)
+	}
+	assertAccountFacts(t, snapshot, accountless)
+	if account, exists := accountFact("   "); !exists || account != "" {
+		t.Fatalf("blank account property not treated as absent: %q, %v", account, exists)
 	}
 }
 
@@ -99,41 +132,6 @@ func TestParseCodexHeadersMeasuredWindows(t *testing.T) {
 // TestAccountFactsContract pins the persisted fact contract other packages
 // decode: the exact JSON keys, their order, and the fact that account is an
 // optional credential property rather than part of a credential identity.
-func TestAccountFactsContract(t *testing.T) {
-	encodedIdentity, errJSON := json.Marshal(parserIdentity("codex", "user@example.invalid"))
-	if errJSON != nil {
-		t.Fatal(errJSON)
-	}
-	if want := `{"provider":"codex","account":"user@example.invalid","account_kind":"email"}`; string(encodedIdentity) != want {
-		t.Fatalf("identity contract changed: got %s, want %s", encodedIdentity, want)
-	}
-	identity := parserIdentity("codex", "user@example.invalid")
-	snapshot, ok := ParseAPICall(identity, "https://chatgpt.com/backend-api/wham/usage", 200, nil, []byte(`{"rate_limit":{"primary_window":{"used_percent":10}}}`), observed)
-	if !ok {
-		t.Fatal("fixture not recognized")
-	}
-	assertAccountFacts(t, snapshot, identity)
-	encoded, errJSON := json.Marshal(snapshot)
-	if errJSON != nil {
-		t.Fatal(errJSON)
-	}
-	prefix := `{"provider":"codex","account":"user@example.invalid","account_kind":"email","source":"management_api","observed_at":"2026-09-29T12:00:00Z","windows":[`
-	if !strings.HasPrefix(string(encoded), prefix) {
-		t.Fatalf("snapshot contract changed: %s", encoded)
-	}
-
-	// A credential with no account property is still recorded: it is grouped by
-	// provider alone and claims no account kind.
-	accountless := parserIdentity("codex", "")
-	snapshot, ok = ParseHeaders(accountless, http.Header{"X-Codex-Primary-Used-Percent": {"10"}}, observed)
-	if !ok || snapshot.Account != "" || snapshot.AccountKind != "" {
-		t.Fatalf("account-less credential was hidden: %+v, parsed=%v", snapshot, ok)
-	}
-	assertAccountFacts(t, snapshot, accountless)
-	if account, exists := accountFact("   "); !exists || account != "" {
-		t.Fatalf("blank account property not treated as absent: %q, %v", account, exists)
-	}
-}
 
 func TestCodexAdditionalActiveLimitDoesNotPolluteMain(t *testing.T) {
 	for _, additionalPrefix := range []string{"bengalfox", "additional-gpt-5-3-codex-spark"} {
@@ -234,104 +232,15 @@ func TestHeadersRejectMalformedAndNonQuotaSignals(t *testing.T) {
 	}
 }
 
-func TestAPICallKnownProviderPayloads(t *testing.T) {
-	tests := []struct {
-		provider, endpoint, body, id string
-		wantUsed                     float64
-	}{
-		{"codex", "https://chatgpt.com/backend-api/wham/usage", `{"plan_type":"plus","rate_limit":{"allowed":true,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":0}},"secret":"body-secret"}`, "primary", 0},
-		{"codex", "https://chatgpt.com/backend-api/wham/usage", `{"additional_rate_limits":[{"limit_name":"GPT-5.3-Codex-Spark","rate_limit":{"primary_window":{"used_percent":"15"}}}]}`, "additional:gpt-5-3-codex-spark:primary", 15},
-		{"claude", "https://api.anthropic.com/api/oauth/usage", `{"five_hour":{"utilization":37,"resets_at":"2026-09-30T10:00:00Z"},"account":{"access_token":"body-secret"}}`, "five_hour", 37},
-		{"claude", "https://api.anthropic.com/api/oauth/usage", `{"seven_day_sonnet":{"utilization":"0"}}`, "seven_day_sonnet", 0},
-		{"gemini-cli", "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota", `{"buckets":[{"modelId":"gemini-2.5-pro","tokenType":"REQUESTS","remainingFraction":0.8,"remainingAmount":80,"resetTime":"2026-10-01T00:00:00Z"}]}`, "bucket:gemini-2-5-pro:requests", 20},
-		{"antigravity", "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary", `{"body":{"groups":[{"displayName":"Gemini Models","buckets":[{"bucketId":"pro","window":"weekly","remainingFraction":"25%","resetTime":"2026-10-01T00:00:00Z"}]}]}}`, "group:gemini-models:pro", 75},
-		{"kimi", "https://api.kimi.com/coding/v1/usages", `{"usage":{"limit":100,"remaining":25},"limits":[{"name":"short","detail":{"limit":10,"remaining":0},"window":{"duration":5,"timeUnit":"hour"}}]}`, "limits:short", 100},
-		{"xai", "https://cli-chat-proxy.grok.com/v1/billing?format=credits", `{"config":{"currentPeriod":{"type":"weekly","end":"2026-10-01T00:00:00Z"},"creditUsagePercent":10,"productUsage":[{"product":"grok","usagePercent":30}]}}`, "billing.weekly", 10},
-		{"xai", "https://cli-chat-proxy.grok.com/v1/billing", `{"config":{"monthlyLimit":{"val":20000},"used":{"val":10000},"onDemandCap":{"val":500},"onDemandUsed":{"val":0},"billingPeriodEnd":"2026-10-01T00:00:00Z"}}`, "billing.monthly", 50},
-	}
-	for _, test := range tests {
-		t.Run(test.provider+"/"+test.id, func(t *testing.T) {
-			identity := parserIdentity(test.provider, "a@example.invalid")
-			snapshot, ok := ParseAPICall(identity, test.endpoint, 200, nil, []byte(test.body), observed)
-			if !ok {
-				t.Fatalf("known quota body unrecognized: %s", test.body)
-			}
-			assertAccountFacts(t, snapshot, identity)
-			window := getWindow(t, snapshot, test.id)
-			assertNumber(t, window.UsedPercent, test.wantUsed)
-			if window.Source != SourceAPICall || !window.ObservedAt.Equal(observed) {
-				t.Fatalf("wrong provenance: %+v", window)
-			}
-			encoded, errJSON := json.Marshal(snapshot)
-			if errJSON != nil {
-				t.Fatal(errJSON)
-			}
-			if strings.Contains(string(encoded), "body-secret") || strings.Contains(string(encoded), "https://") {
-				t.Fatalf("raw response/URL persisted: %s", encoded)
-			}
-		})
-	}
-}
-
-func TestAPICallRejectsUnknownErrorAndMalformedResponses(t *testing.T) {
-	body := []byte(`{"rate_limit":{"primary_window":{"used_percent":100}}}`)
-	for _, endpoint := range []string{
-		"https://evil.example/backend-api/wham/usage", "https://chatgpt.com.evil.example/backend-api/wham/usage",
-		"https://chatgpt.com/backend-api/conversation", "http://chatgpt.com/backend-api/wham/usage",
-		"https://chatgpt.com:444/backend-api/wham/usage", "https://user:password@chatgpt.com/backend-api/wham/usage",
-		":not-a-url", "https://chatgpt.com/backend-api/wham/usage/extra",
-	} {
-		if _, ok := ParseAPICall(parserIdentity("codex", "a"), endpoint, 200, nil, body, observed); ok {
-			t.Fatalf("accepted untrusted endpoint %s", endpoint)
-		}
-	}
-	endpoint := "https://chatgpt.com/backend-api/wham/usage"
-	for _, status := range []int{0, 199, 300, 401, 429, 500} {
-		if _, ok := ParseAPICall(parserIdentity("codex", "a"), endpoint, status, nil, body, observed); ok {
-			t.Fatalf("accepted error/status %d as body quota", status)
-		}
-	}
-	for _, invalid := range []string{`not-json`, `{}`, `null`, `{"rate_limit":{"primary_window":{"used_percent":null}}}`, `{"rate_limit":{"primary_window":{"used_percent":"NaN"}}}`, strings.Repeat(" ", maxBodyBytes+1)} {
-		if _, ok := ParseAPICall(parserIdentity("codex", "a"), endpoint, 200, nil, []byte(invalid), observed); ok {
-			t.Fatal("invalid response fabricated quota")
-		}
-	}
-	if _, ok := ParseAPICall(parserIdentity("claude", "a"), endpoint, 200, nil, body, observed); ok {
-		t.Fatal("accepted provider-mismatched endpoint")
-	}
-	// Unknown providers own no quota endpoint; the account facts cannot widen it.
-	for _, provider := range []string{"unknown-provider", "", "co\ndex"} {
-		if _, ok := ParseAPICall(parserIdentity(provider, "a"), endpoint, 200, nil, body, observed); ok {
-			t.Fatalf("accepted unknown provider %q", provider)
-		}
-	}
-	snapshot, ok := ParseAPICall(parserIdentity("codex", "a"), endpoint, 429, http.Header{"X-Codex-Primary-Used-Percent": {"100"}}, []byte(`{"secret":"error-body"}`), observed)
-	if !ok || getWindow(t, snapshot, "primary").Source != SourceHeaders {
-		t.Fatal("measured error-response header lost")
-	}
-}
-
-func TestAPICallAliasesNullAndIndependentWindows(t *testing.T) {
-	body := `{"planType":"pro","rateLimit":{"primaryWindow":{"usedPercent":"NaN"},"secondaryWindow":{"usedPercent":"0","limitWindowSeconds":"604800","resetAt":"1790704800","resetAfterSeconds":"10"}}}`
-	encoded, errJSON := json.Marshal(body)
-	if errJSON != nil {
-		t.Fatal(errJSON)
-	}
-	snapshot, ok := ParseAPICall(parserIdentity("codex", "a"), "https://chatgpt.com/backend-api/wham/usage", 200, nil, encoded, observed)
-	if !ok || snapshot.Plan != "pro" || len(snapshot.Windows) != 1 {
-		t.Fatalf("valid independent window lost: %+v", snapshot)
-	}
-	window := getWindow(t, snapshot, "secondary")
-	assertNumber(t, window.UsedPercent, 0)
-	if window.ResetAt.Unix() != 1790704800 || *window.WindowSeconds != 604800 {
-		t.Fatal("camelCase fields or numeric strings lost")
-	}
-}
-
 func TestMergeOrdersWindowsAndDoesNotAlias(t *testing.T) {
 	identity := parserIdentity("codex", "a@example.invalid")
-	initial, _ := ParseAPICall(identity, "https://chatgpt.com/backend-api/wham/usage", 200, nil,
-		[]byte(`{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10},"secondary_window":{"used_percent":20}}}`), observed)
+	initial, _ := ParseHeaders(identity, http.Header{
+		"X-Codex-Plan-Type":                {"pro"},
+		"X-Codex-Primary-Used-Percent":     {"10"},
+		"X-Codex-Secondary-Used-Percent":   {"20"},
+		"X-Codex-Primary-Window-Minutes":   {"300"},
+		"X-Codex-Secondary-Window-Minutes": {"10080"},
+	}, observed)
 	newer, _ := ParseHeaders(identity, http.Header{"X-Codex-Primary-Used-Percent": {"30"}}, observed.Add(time.Minute))
 	merged := Merge(initial, newer)
 	if len(merged.Windows) != 2 || merged.Plan != "pro" {
@@ -382,8 +291,13 @@ func TestMergeOrdersWindowsAndDoesNotAlias(t *testing.T) {
 
 func TestMergeRetainsStableMetadataButNotExpiredResetOrFlags(t *testing.T) {
 	identity := parserIdentity("codex", "a")
-	initial, _ := ParseAPICall(identity, "https://chatgpt.com/backend-api/wham/usage", 200, nil,
-		[]byte(`{"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_after_seconds":3600}}}`), observed)
+	initial, _ := ParseHeaders(identity, http.Header{
+		"X-Codex-Allowed":                     {"false"},
+		"X-Codex-Limit-Reached":               {"true"},
+		"X-Codex-Primary-Used-Percent":        {"100"},
+		"X-Codex-Primary-Window-Minutes":      {"300"},
+		"X-Codex-Primary-Reset-After-Seconds": {"3600"},
+	}, observed)
 	update, _ := ParseHeaders(identity, http.Header{"X-Codex-Primary-Used-Percent": {"10"}}, observed.Add(time.Minute))
 	merged := Merge(initial, update)
 	window := getWindow(t, merged, "primary")
@@ -397,88 +311,6 @@ func TestMergeRetainsStableMetadataButNotExpiredResetOrFlags(t *testing.T) {
 	window = getWindow(t, Merge(merged, later), "primary")
 	if window.ResetAt != nil || window.WindowSeconds == nil || *window.WindowSeconds != 18000 {
 		t.Fatalf("expired reset survived or stable duration lost: %+v", window)
-	}
-}
-
-func TestClaudeCurrentScopedFablePayload(t *testing.T) {
-	body := []byte(`{"iguana_necktie":{"utilization":90},"limits":[
-		{"kind":"weekly_scoped","percent":20,"scope":{"model":{"display_name":"Fable"}}},
-		{"kind":"weekly_scoped","percent":0,"is_active":true,"resets_at":"2026-10-01T00:00:00Z","scope":{"model":{"display_name":"Fable 5"}}},
-		{"kind":"weekly_scoped","percent":70,"scope":{"model":{"display_name":"Other"}}}
-	]}`)
-	snapshot, ok := ParseAPICall(parserIdentity("claude", "a"), "https://api.anthropic.com/api/oauth/usage", 200, nil, body, observed)
-	if !ok || len(snapshot.Windows) != 1 {
-		t.Fatalf("Fable compatibility row duplicated: %+v", snapshot)
-	}
-	window := getWindow(t, snapshot, "iguana_necktie")
-	assertNumber(t, window.UsedPercent, 0)
-	if window.Model != "fable" || window.WindowSeconds == nil || *window.WindowSeconds != 604800 || window.ResetAt == nil {
-		t.Fatalf("active Fable limit lost: %+v", window)
-	}
-}
-
-func TestFetchKnownFields(t *testing.T) {
-	response := pluginapi.QuotaFetchResponse{
-		Subscription: &pluginapi.QuotaSubscription{Plan: "pro", TierName: "Premium", TierID: "p"},
-		Groups: []pluginapi.QuotaGroup{{DisplayName: "Custom", Buckets: []pluginapi.QuotaBucket{
-			{Window: "monthly", RemainingFraction: 0, ResetTime: "2026-10-01T00:00:00Z", Description: "not-retained"},
-			{Window: "invalid", RemainingFraction: math.NaN()},
-			{Window: "overflow", RemainingFraction: 2},
-		}}},
-		Summary: []pluginapi.QuotaMetric{{Key: "balance", Label: "Balance", Value: 0, Unit: "credits", Format: "number"}, {Key: "bad", Value: math.Inf(1)}},
-	}
-	// Declarative plugins name their own provider; any non-empty provider is a
-	// valid account fact.
-	identity := parserIdentity("custom", "a")
-	snapshot, ok := ParseFetch(identity, response, observed)
-	if !ok || len(snapshot.Windows) != 1 || len(snapshot.Summary) != 1 {
-		t.Fatalf("unexpected plugin snapshot: %+v", snapshot)
-	}
-	assertAccountFacts(t, snapshot, identity)
-	window := getWindow(t, snapshot, "fetch:custom:monthly")
-	assertNumber(t, window.RemainingPercent, 0)
-	assertNumber(t, window.UsedPercent, 100)
-	if snapshot.Plan != "pro" || snapshot.TierName != "Premium" || snapshot.TierID != "p" {
-		t.Fatalf("subscription fields lost: %+v", snapshot)
-	}
-	if !snapshot.ObservedAt.Equal(observed) || window.Source != SourceFetch {
-		t.Fatal("normalization changed observation metadata")
-	}
-	encoded, errJSON := json.Marshal(snapshot)
-	if errJSON != nil || strings.Contains(string(encoded), "not-retained") {
-		t.Fatalf("unexpected serialized snapshot: %s, %v", encoded, errJSON)
-	}
-	// kimi credentials publish device_id instead of email.
-	if kimi, ok := ParseFetch(parserIdentity("kimi", "device-1"), response, observed); !ok || kimi.Account != "device-1" || kimi.AccountKind != "device_id" {
-		t.Fatalf("kimi device_id account fact lost: %+v, parsed=%v", kimi, ok)
-	}
-	// The fetch parser validates account facts exactly like the other parsers.
-	for _, identity := range []Identity{parserIdentity("", "a"), parserIdentity("custom", "a\nsecret"), parserIdentity("custom", strings.Repeat("a", maxText+1))} {
-		if _, ok := ParseFetch(identity, response, observed); ok {
-			t.Fatalf("fetch accepted invalid account facts %+v", identity)
-		}
-	}
-	pluginSnapshot, ok := ParseFetch(parserIdentity("custom", ""), response, observed)
-	if !ok || pluginSnapshot.Account != "" {
-		t.Fatalf("account-less plugin credential was hidden: %+v, parsed=%v", pluginSnapshot, ok)
-	}
-	if _, ok := ParseFetch(parserIdentity("custom", "a"), pluginapi.QuotaFetchResponse{}, observed); ok {
-		t.Fatal("empty fetch fabricated quota")
-	}
-	if _, ok := ParseFetch(parserIdentity("custom", "a"), response, time.Time{}); ok {
-		t.Fatal("fetch accepted a missing observation time")
-	}
-}
-
-func TestBoundedWindows(t *testing.T) {
-	var buckets []string
-	for i := 0; i < maxWindows*2; i++ {
-		buckets = append(buckets, fmt.Sprintf(`{"modelId":"model-%d","remainingFraction":0}`, i))
-	}
-	body := []byte(`{"buckets":[` + strings.Join(buckets, ",") + `]}`)
-	snapshot, ok := ParseAPICall(parserIdentity("gemini-cli", "a"), "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota", 200, nil, body, observed)
-	if !ok || len(snapshot.Windows) != maxWindows {
-		t.Fatalf("windows not bounded: %d", len(snapshot.Windows))
 	}
 }
 

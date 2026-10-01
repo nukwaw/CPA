@@ -6,7 +6,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist"
 	usageweb "github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/web"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // WithServerConfigurator composes an extension hook after standard middleware
@@ -44,26 +43,10 @@ func WithUsagePersistenceProvider(current func() *usagepersist.Store) ServerOpti
 		current = func() *usagepersist.Store { return nil }
 	}
 	return WithServerConfigurator(func(server *Server) {
-		source := newUsageQuotaIdentitySource(func() *coreauth.Manager { return server.handlers.AuthManager })
-		currentStore := func() *usagepersist.Store {
-			store := current()
-			if store != nil {
-				store.BindQuotaIdentitySource(source)
-			}
-			return store
-		}
 		// The sidebar entry is independent of storage availability: the
 		// dashboard itself reports an unavailable store.
 		server.engine.Use(usagepersist.ManagementNavMiddleware(server.getConfig))
-		server.engine.Use(func(c *gin.Context) {
-			store := currentStore()
-			if store == nil {
-				c.Next()
-				return
-			}
-			store.ManagementMiddleware()(c)
-		})
-		usagepersist.RegisterDynamicRoutes(usageManagementGroup(server), currentStore, func() bool {
+		usagepersist.RegisterDynamicRoutes(usageManagementGroup(server), current, func() bool {
 			cfg := server.getConfig()
 			return cfg != nil && cfg.UsageStatisticsEnabled
 		})

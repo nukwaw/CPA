@@ -17,23 +17,21 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/quota"
 )
 
-const (
-	historyTestProvider = "claude"
-	historyTestIndex    = "account-1"
-)
+const historyTestProvider = "claude"
 
 func floatPtr(value float64) *float64 { return &value }
 
-// mergeHistorySnapshot merges one explicit-timestamp observation. Tests never
-// sleep: ordering comes from the supplied times.
-func mergeHistorySnapshot(t *testing.T, s *Store, binding QuotaBinding, at time.Time, source string, windows map[string]float64) {
+// mergeHistorySnapshot merges one explicit-timestamp observation for one
+// (provider, account) pair. Tests never sleep: ordering comes from the
+// supplied times.
+func mergeHistorySnapshot(t *testing.T, s *Store, provider, account string, at time.Time, source string, windows map[string]float64) {
 	t.Helper()
 	ordered := make([]quota.Window, 0, len(windows))
 	for _, id := range sortedKeys(windows) {
 		ordered = append(ordered, quota.Window{ID: id, UsedPercent: floatPtr(windows[id]), ObservedAt: at, Source: source})
 	}
 	snapshot := quota.Snapshot{
-		Provider: binding.Provider, Account: binding.Account, AccountKind: binding.AccountKind,
+		Provider: provider, Account: account,
 		Source: source, ObservedAt: at, Windows: ordered,
 	}
 	if err := s.mergeQuota(context.Background(), snapshot); err != nil {
@@ -79,16 +77,14 @@ func (backend *historyFailingStore) MutateCache(ctx context.Context, namespace, 
 
 func TestQuotaHistoryAppendOrderingBoundAndDedupe(t *testing.T) {
 	s := openTestStore(t)
-	bindQuotaFixtures(t, s, quotaFixtureAuth(historyTestProvider, historyTestIndex, "auth.json", "source-token"))
-	binding := fixtureBinding(s, historyTestProvider, historyTestIndex)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i := range quotaHistoryLimit + 1 {
-		mergeHistorySnapshot(t, s, binding, base.Add(time.Duration(i)*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": float64(i)})
+		mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(time.Duration(i)*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": float64(i)})
 	}
 	// A repeat of the same (observed_at, source) pair is deduplicated, even when
 	// it arrives with a different percentage.
-	mergeHistorySnapshot(t, s, binding, base.Add(time.Duration(quotaHistoryLimit)*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 999})
-	row := loadQuotaHistoryRow(t, s, binding.Provider, binding.Account)
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(time.Duration(quotaHistoryLimit)*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 999})
+	row := loadQuotaHistoryRow(t, s, historyTestProvider, fixtureAccount)
 	if len(row.Observations) != quotaHistoryLimit {
 		t.Fatalf("history bound: %d observations", len(row.Observations))
 	}
@@ -106,8 +102,8 @@ func TestQuotaHistoryAppendOrderingBoundAndDedupe(t *testing.T) {
 	}
 	// The same instant from another source is a distinct observation, and the
 	// bound still holds: the oldest entry is dropped again.
-	mergeHistorySnapshot(t, s, binding, newest, quota.SourceFetch, map[string]float64{"five_hour": 77})
-	row = loadQuotaHistoryRow(t, s, binding.Provider, binding.Account)
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, newest, quota.SourceFetch, map[string]float64{"five_hour": 77})
+	row = loadQuotaHistoryRow(t, s, historyTestProvider, fixtureAccount)
 	if len(row.Observations) != quotaHistoryLimit || !row.Observations[0].ObservedAt.Equal(base.Add(2*time.Minute)) {
 		t.Fatalf("bound after a distinct source: %d %v", len(row.Observations), row.Observations[0].ObservedAt)
 	}
@@ -134,41 +130,32 @@ func TestQuotaHistoryAppendOrderingBoundAndDedupe(t *testing.T) {
 func TestQuotaHistoryIsolationAndUnusableWindows(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
-	bindQuotaFixtures(t, s,
-		quotaFixtureAuth(historyTestProvider, "account-1", "one.json", "token-one"),
-		quotaFixtureAuth(historyTestProvider, "account-2", "two.json", "token-two"),
-		quotaFixtureAuth("codex", "grouped", "grouped.json", "grouped-token"))
-	first := fixtureBinding(s, historyTestProvider, "account-1")
-	second := fixtureBinding(s, historyTestProvider, "account-2")
-	grouped := fixtureBinding(s, "codex", "grouped")
-	if first.Account == second.Account {
-		t.Fatal("fixture accounts are not distinct")
-	}
+	firstAccount, secondAccount, groupedAccount := fixtureAccount, "second@example.invalid", "grouped@example.invalid"
 	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	mergeHistorySnapshot(t, s, first, at, quota.SourceHeaders, map[string]float64{"five_hour": 10})
-	mergeHistorySnapshot(t, s, second, at, quota.SourceHeaders, map[string]float64{"five_hour": 20})
+	mergeHistorySnapshot(t, s, historyTestProvider, firstAccount, at, quota.SourceHeaders, map[string]float64{"five_hour": 10})
+	mergeHistorySnapshot(t, s, historyTestProvider, secondAccount, at, quota.SourceHeaders, map[string]float64{"five_hour": 20})
 	// A provider that reports groups/buckets has no windows: record nothing.
 	if err := s.mergeQuota(ctx, quota.Snapshot{
-		Provider: "codex", Account: grouped.Account, AccountKind: grouped.AccountKind,
+		Provider: "codex", Account: groupedAccount,
 		Source: quota.SourceFetch, ObservedAt: at,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// Windows without an id or without a percentage cannot be charted.
 	if err := s.mergeQuota(ctx, quota.Snapshot{
-		Provider: historyTestProvider, Account: first.Account, AccountKind: first.AccountKind,
+		Provider: historyTestProvider, Account: firstAccount,
 		Source: quota.SourceHeaders, ObservedAt: at.Add(time.Minute),
 		Windows: []quota.Window{{ID: "", UsedPercent: floatPtr(5)}, {ID: "five_hour"}, {ID: "seven_day"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if row := loadQuotaHistoryRow(t, s, historyTestProvider, first.Account); len(row.Observations) != 1 {
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, firstAccount); len(row.Observations) != 1 {
 		t.Fatalf("unusable windows were recorded: %+v", row)
 	}
-	if row := loadQuotaHistoryRow(t, s, historyTestProvider, second.Account); len(row.Observations) != 1 || row.Observations[0].Windows["five_hour"] != 20 {
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, secondAccount); len(row.Observations) != 1 || row.Observations[0].Windows["five_hour"] != 20 {
 		t.Fatalf("history leaked between accounts: %+v", row)
 	}
-	if row := loadQuotaHistoryRow(t, s, "codex", grouped.Account); len(row.Observations) != 0 {
+	if row := loadQuotaHistoryRow(t, s, "codex", groupedAccount); len(row.Observations) != 0 {
 		t.Fatalf("grouped provider recorded history: %+v", row)
 	}
 	// The observation itself must still be merged for both providers.
@@ -189,44 +176,25 @@ func TestQuotaHistoryAccountIsolationAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := quotaFixtureAuth(historyTestProvider, historyTestIndex, "auth.json", "source-token")
-	manager := bindQuotaFixtures(t, s, auth)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	first := fixtureBinding(s, historyTestProvider, historyTestIndex)
-	mergeHistorySnapshot(t, s, first, base, quota.SourceHeaders, map[string]float64{"five_hour": 10})
-	mergeHistorySnapshot(t, s, first, base.Add(time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 20})
-	if row := loadQuotaHistoryRow(t, s, first.Provider, first.Account); len(row.Observations) != 2 || row.Observations[1].Windows["five_hour"] != 20 {
+	firstAccount, secondAccount := fixtureAccount, "second@example.invalid"
+	mergeHistorySnapshot(t, s, historyTestProvider, firstAccount, base, quota.SourceHeaders, map[string]float64{"five_hour": 10})
+	mergeHistorySnapshot(t, s, historyTestProvider, firstAccount, base.Add(time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 20})
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, firstAccount); len(row.Observations) != 2 || row.Observations[1].Windows["five_hour"] != 20 {
 		t.Fatalf("initial history: %+v", row)
 	}
-	// A different account taking over the same slot must never inherit the
+	// A different account taking over the same provider must never inherit the
 	// previous account's history.
-	auth.Metadata["email"] = "second@example.invalid"
-	if _, err = manager.Update(ctx, auth); err != nil {
-		t.Fatal(err)
-	}
-	second := fixtureBinding(s, historyTestProvider, historyTestIndex)
-	if second.Account == first.Account {
-		t.Fatal("fixture did not change the account")
-	}
-	mergeHistorySnapshot(t, s, second, base.Add(2*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 30})
-	if row := loadQuotaHistoryRow(t, s, second.Provider, second.Account); len(row.Observations) != 1 || row.Observations[0].Windows["five_hour"] != 30 {
+	mergeHistorySnapshot(t, s, historyTestProvider, secondAccount, base.Add(2*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 30})
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, secondAccount); len(row.Observations) != 1 || row.Observations[0].Windows["five_hour"] != 30 {
 		t.Fatalf("account change did not start a fresh history row: %+v", row)
 	}
-	if row := loadQuotaHistoryRow(t, s, first.Provider, first.Account); len(row.Observations) != 2 {
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, firstAccount); len(row.Observations) != 2 {
 		t.Fatalf("the previous account's history was disturbed: %+v", row)
 	}
-	// A token rotation for the second account keeps its row and identity.
-	auth.Metadata["access_token"] = "rotated-token"
-	if _, err = manager.Update(ctx, auth); err != nil {
-		t.Fatal(err)
-	}
-	rotated := fixtureBinding(s, historyTestProvider, historyTestIndex)
-	if rotated.Account != second.Account {
-		t.Fatal("token rotation changed the account")
-	}
-	mergeHistorySnapshot(t, s, rotated, base.Add(3*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 40})
-	if row := loadQuotaHistoryRow(t, s, second.Provider, second.Account); len(row.Observations) != 2 {
-		t.Fatalf("token rotation started a fresh history row: %+v", row)
+	mergeHistorySnapshot(t, s, historyTestProvider, secondAccount, base.Add(3*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 40})
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, secondAccount); len(row.Observations) != 2 {
+		t.Fatalf("same account started a fresh history row: %+v", row)
 	}
 	closeTestStore(t, s)
 	// History is durable across a restart with the file backend.
@@ -239,19 +207,14 @@ func TestQuotaHistoryAccountIsolationAndRestart(t *testing.T) {
 			t.Error(errClose)
 		}
 	}()
-	bindQuotaFixtures(t, s, auth)
-	restarted := fixtureBinding(s, historyTestProvider, historyTestIndex)
-	if restarted.Account != second.Account {
-		t.Fatalf("restart changed the account: %+v", restarted)
-	}
-	if row := loadQuotaHistoryRow(t, s, restarted.Provider, restarted.Account); len(row.Observations) != 2 {
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, secondAccount); len(row.Observations) != 2 {
 		t.Fatalf("history did not survive a restart: %+v", row)
 	}
-	mergeHistorySnapshot(t, s, restarted, base.Add(4*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 50})
-	if row := loadQuotaHistoryRow(t, s, restarted.Provider, restarted.Account); len(row.Observations) != 3 {
+	mergeHistorySnapshot(t, s, historyTestProvider, secondAccount, base.Add(4*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 50})
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, secondAccount); len(row.Observations) != 3 {
 		t.Fatalf("restart appended into a fresh row: %+v", row)
 	}
-	if row := loadQuotaHistoryRow(t, s, first.Provider, first.Account); len(row.Observations) != 2 {
+	if row := loadQuotaHistoryRow(t, s, historyTestProvider, firstAccount); len(row.Observations) != 2 {
 		t.Fatalf("restart leaked history between accounts: %+v", row)
 	}
 }
@@ -259,13 +222,11 @@ func TestQuotaHistoryAccountIsolationAndRestart(t *testing.T) {
 func TestQuotaHistoryWriteFailureDoesNotFailObservation(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
-	bindQuotaFixtures(t, s, quotaFixtureAuth(historyTestProvider, historyTestIndex, "auth.json", "source-token"))
-	binding := fixtureBinding(s, historyTestProvider, historyTestIndex)
 	backend := &historyFailingStore{store: s.store}
 	s.store = backend
 	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	snapshot := quota.Snapshot{
-		Provider: historyTestProvider, Account: binding.Account, AccountKind: binding.AccountKind,
+		Provider: historyTestProvider, Account: fixtureAccount,
 		Source: quota.SourceHeaders, ObservedAt: at,
 		Windows: []quota.Window{{ID: "five_hour", UsedPercent: floatPtr(42.5), ObservedAt: at, Source: quota.SourceHeaders}},
 	}
@@ -284,14 +245,12 @@ func TestQuotaHistoryWriteFailureDoesNotFailObservation(t *testing.T) {
 func TestQuotaSummaryRangeWindowSelectionAndMissingHistory(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
-	bindQuotaFixtures(t, s, quotaFixtureAuth(historyTestProvider, historyTestIndex, "auth.json", "source-token"))
-	binding := fixtureBinding(s, historyTestProvider, historyTestIndex)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	mergeHistorySnapshot(t, s, binding, base, quota.SourceHeaders, map[string]float64{"five_hour": 10})
-	mergeHistorySnapshot(t, s, binding, base.Add(10*time.Minute), quota.SourceHeaders, map[string]float64{"seven_day": 5})
-	mergeHistorySnapshot(t, s, binding, base.Add(20*time.Minute), quota.SourceFetch, map[string]float64{"five_hour": 30, "seven_day": 6})
-	mergeHistorySnapshot(t, s, binding, base.Add(30*time.Minute), quota.SourceHeaders, map[string]float64{"seven_day": 9})
-	query := quotaSummaryQuery{Provider: historyTestProvider, Account: binding.Account, Window: "five_hour", From: base, To: base.Add(25 * time.Minute)}
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base, quota.SourceHeaders, map[string]float64{"five_hour": 10})
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(10*time.Minute), quota.SourceHeaders, map[string]float64{"seven_day": 5})
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(20*time.Minute), quota.SourceFetch, map[string]float64{"five_hour": 30, "seven_day": 6})
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(30*time.Minute), quota.SourceHeaders, map[string]float64{"seven_day": 9})
+	query := quotaSummaryQuery{Provider: historyTestProvider, Account: fixtureAccount, Window: "five_hour", From: base, To: base.Add(25 * time.Minute)}
 	response, err := s.quotaSummary(ctx, query)
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +265,7 @@ func TestQuotaSummaryRangeWindowSelectionAndMissingHistory(t *testing.T) {
 		t.Fatalf("empty usage must not invent money: %+v %+v", response.Usage, response.Estimate)
 	}
 	// Without an explicit window, the most observed in-range window wins.
-	response, err = s.quotaSummary(ctx, quotaSummaryQuery{Provider: historyTestProvider, Account: binding.Account, From: base, To: base.Add(time.Hour)})
+	response, err = s.quotaSummary(ctx, quotaSummaryQuery{Provider: historyTestProvider, Account: fixtureAccount, From: base, To: base.Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +273,7 @@ func TestQuotaSummaryRangeWindowSelectionAndMissingHistory(t *testing.T) {
 		t.Fatalf("default window selection: %q %+v", response.Window, response.Observations)
 	}
 	// With nothing in range, the newest observed window labels an empty series.
-	response, err = s.quotaSummary(ctx, quotaSummaryQuery{Provider: historyTestProvider, Account: binding.Account, From: base.Add(time.Hour), To: base.Add(2 * time.Hour)})
+	response, err = s.quotaSummary(ctx, quotaSummaryQuery{Provider: historyTestProvider, Account: fixtureAccount, From: base.Add(time.Hour), To: base.Add(2 * time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,18 +363,15 @@ func TestQuotaSummaryHTTPRoute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	s := openTestStore(t)
 	ctx := context.Background()
-	auth := quotaFixtureAuth(historyTestProvider, historyTestIndex, "auth.json", "source-token")
-	bindQuotaFixtures(t, s, auth)
-	binding := fixtureBinding(s, historyTestProvider, historyTestIndex)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	mergeHistorySnapshot(t, s, binding, base.Add(5*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 10})
-	mergeHistorySnapshot(t, s, binding, base.Add(15*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 25})
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(5*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 10})
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(15*time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 25})
 	if _, err := s.SetPrice(ctx, fixturePrice()); err != nil {
 		t.Fatal(err)
 	}
 	record := fixtureRecord("summary-event", base.Add(10*time.Minute))
 	record.Provider = historyTestProvider
-	record.Account, record.AccountKind = binding.Account, binding.AccountKind
+	record.Account, record.AccountKind = fixtureAccount, "email"
 	if err := s.recordFixture(ctx, record); err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +379,7 @@ func TestQuotaSummaryHTTPRoute(t *testing.T) {
 	s.RegisterRoutes(router.Group("/stats"))
 	parameters := url.Values{
 		"provider": {strings.ToUpper(historyTestProvider)},
-		"account":  {binding.Account},
+		"account":  {fixtureAccount},
 		"window":   {"five_hour"},
 		"from":     {base.Format(time.RFC3339Nano)},
 		"to":       {base.Add(time.Hour).Format(time.RFC3339Nano)},
@@ -492,7 +448,7 @@ func TestQuotaSummaryHTTPRoute(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Provider != historyTestProvider || decoded.Account != binding.Account || decoded.Window != "five_hour" {
+	if decoded.Provider != historyTestProvider || decoded.Account != fixtureAccount || decoded.Window != "five_hour" {
 		t.Fatalf("account fields: %+v", decoded)
 	}
 	if !decoded.Range.From.Equal(base) || !decoded.Range.To.Equal(base.Add(time.Hour)) {
@@ -538,7 +494,7 @@ func TestQuotaSummaryHTTPRoute(t *testing.T) {
 			t.Fatalf("observation is missing %q: %s", field, body)
 		}
 	}
-	for _, secret := range []string{"source-token", `"access_token"`, "auth.json", "sk-private-test-key", "private-auth-file", "private-source", "upstream.invalid", binding.Key} {
+	for _, secret := range []string{"sk-private-test-key", "private-auth-file", "private-source", "upstream.invalid"} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("response leaked %q: %s", secret, body)
 		}
@@ -571,18 +527,16 @@ func TestQuotaSummaryHTTPRoute(t *testing.T) {
 func TestQuotaSummaryUnpricedUsageKeepsEstimateNull(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
-	bindQuotaFixtures(t, s, quotaFixtureAuth(historyTestProvider, historyTestIndex, "auth.json", "source-token"))
-	binding := fixtureBinding(s, historyTestProvider, historyTestIndex)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	mergeHistorySnapshot(t, s, binding, base.Add(time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 50})
+	mergeHistorySnapshot(t, s, historyTestProvider, fixtureAccount, base.Add(time.Minute), quota.SourceHeaders, map[string]float64{"five_hour": 50})
 	record := fixtureRecord("unpriced-event", base.Add(2*time.Minute))
 	record.Provider = historyTestProvider
 	record.Model = "unpriced-model"
-	record.Account, record.AccountKind = binding.Account, binding.AccountKind
+	record.Account, record.AccountKind = fixtureAccount, "email"
 	if err := s.recordFixture(ctx, record); err != nil {
 		t.Fatal(err)
 	}
-	response, err := s.quotaSummary(ctx, quotaSummaryQuery{Provider: historyTestProvider, Account: binding.Account, From: base, To: base.Add(time.Hour)})
+	response, err := s.quotaSummary(ctx, quotaSummaryQuery{Provider: historyTestProvider, Account: fixtureAccount, From: base, To: base.Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}

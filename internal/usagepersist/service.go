@@ -31,7 +31,6 @@ type Store struct {
 	droppedEvents        atomic.Int64
 	lastDrop             atomic.Int64
 	pendingEvents        atomic.Int64
-	quotaSource          atomic.Pointer[quotaSourceHolder]
 	quotaHistoryFailures atomic.Int64
 
 	queue         chan queuedUsage
@@ -106,9 +105,6 @@ func (s *Store) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closing = true
-		if source := s.quotaSource.Load(); source != nil {
-			source.stop()
-		}
 		close(s.queue)
 		s.mu.Unlock()
 		go func() {

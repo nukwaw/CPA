@@ -1,89 +1,12 @@
 package quota
 
 import (
-	"encoding/json"
 	"math"
-	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
-
-const maxBodyBytes = 4 << 20
-
-// ParseAPICall recognizes only actual quota endpoints used by the existing
-// management UI and keeper. A generic API-call body is never a quota source.
-// Unknown endpoints, invalid JSON and error bodies do not erase prior quota.
-func ParseAPICall(identity Identity, rawURL string, statusCode int, headers http.Header, body []byte, observedAt time.Time) (Snapshot, bool) {
-	snapshot, valid := newSnapshot(identity, SourceAPICall, observedAt)
-	if !valid {
-		return Snapshot{}, false
-	}
-	endpoint, errURL := url.Parse(rawURL)
-	if errURL != nil || endpoint.Scheme != "https" || endpoint.User != nil || (endpoint.Port() != "" && endpoint.Port() != "443") {
-		return Snapshot{}, false
-	}
-	kind := endpointKind(snapshot.Provider, strings.ToLower(endpoint.Hostname()), endpoint.Path)
-	if kind == "" {
-		return Snapshot{}, false
-	}
-	// Even a quota-endpoint 429 may carry a measured header watermark, but
-	// never interpret its error body as a successful quota refresh.
-	headerSnapshot, hasHeaders := ParseHeaders(identity, headers, observedAt)
-	if statusCode >= 200 && statusCode < 300 && len(body) <= maxBodyBytes {
-		object := decodeObject(body)
-		switch kind {
-		case "codex":
-			parseCodexBody(&snapshot, object)
-		case "claude":
-			parseClaudeBody(&snapshot, object)
-		case "gemini-cli":
-			parseGeminiBody(&snapshot, object)
-		case "antigravity":
-			parseAntigravityBody(&snapshot, object)
-		case "kimi":
-			parseKimiBody(&snapshot, object)
-		case "xai":
-			parseXAIBody(&snapshot, object, endpoint.Query().Get("format") == "credits")
-		}
-	}
-	if hasHeaders {
-		snapshot = Merge(headerSnapshot, snapshot)
-	}
-	return finish(snapshot)
-}
-
-func endpointKind(provider, host, path string) string {
-	switch provider {
-	case "codex":
-		if host == "chatgpt.com" && path == "/backend-api/wham/usage" {
-			return provider
-		}
-	case "claude":
-		if host == "api.anthropic.com" && path == "/api/oauth/usage" {
-			return provider
-		}
-	case "gemini-cli":
-		if host == "cloudcode-pa.googleapis.com" && path == "/v1internal:retrieveUserQuota" {
-			return provider
-		}
-	case "antigravity":
-		if (host == "cloudcode-pa.googleapis.com" || host == "daily-cloudcode-pa.googleapis.com" || host == "daily-cloudcode-pa.sandbox.googleapis.com") && path == "/v1internal:retrieveUserQuotaSummary" {
-			return provider
-		}
-	case "kimi":
-		if host == "api.kimi.com" && path == "/coding/v1/usages" {
-			return provider
-		}
-	case "xai":
-		if host == "cli-chat-proxy.grok.com" && path == "/v1/billing" {
-			return provider
-		}
-	}
-	return ""
-}
 
 func newSnapshot(identity Identity, source string, observedAt time.Time) (Snapshot, bool) {
 	provider, account, accountKind, valid := identityFacts(identity)
@@ -247,76 +170,6 @@ func relativeReset(observed time.Time, seconds *int64) *time.Time {
 		return nil
 	}
 	return &reset
-}
-
-type jsonObject map[string]json.RawMessage
-
-func decodeObject(data []byte) jsonObject {
-	var object jsonObject
-	if errJSON := json.Unmarshal(data, &object); errJSON == nil {
-		return object
-	}
-	// Some management intermediaries JSON-encode the upstream object as text.
-	var text string
-	if errJSON := json.Unmarshal(data, &text); errJSON == nil {
-		if errObject := json.Unmarshal([]byte(text), &object); errObject == nil {
-			return object
-		}
-	}
-	return nil
-}
-
-func field(object jsonObject, names ...string) json.RawMessage {
-	for _, name := range names {
-		if value, exists := object[name]; exists && string(value) != "null" {
-			return value
-		}
-	}
-	return nil
-}
-
-func objectField(object jsonObject, names ...string) jsonObject {
-	return decodeObject(field(object, names...))
-}
-
-func textField(object jsonObject, names ...string) string {
-	data := field(object, names...)
-	var text string
-	if errJSON := json.Unmarshal(data, &text); errJSON == nil {
-		return safeText(text)
-	}
-	var numeric json.Number
-	if errJSON := json.Unmarshal(data, &numeric); errJSON == nil {
-		return safeText(numeric.String())
-	}
-	return ""
-}
-
-func numberField(object jsonObject, names ...string) *float64 {
-	return number(textField(object, names...))
-}
-func intField(object jsonObject, names ...string) *int64 { return integer(textField(object, names...)) }
-
-func boolField(object jsonObject, names ...string) *bool {
-	data := field(object, names...)
-	var value bool
-	if len(data) > 0 {
-		if errJSON := json.Unmarshal(data, &value); errJSON == nil {
-			return &value
-		}
-	}
-	return boolean(textField(object, names...))
-}
-
-func arrayField(object jsonObject, names ...string) []json.RawMessage {
-	var array []json.RawMessage
-	if errJSON := json.Unmarshal(field(object, names...), &array); errJSON != nil {
-		return nil
-	}
-	if len(array) > maxWindows {
-		array = array[:maxWindows]
-	}
-	return array
 }
 
 func sortedKeys[T any](object map[string]T) []string {
