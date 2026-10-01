@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/quota"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 const quotaNamespace = "quota_snapshots"
@@ -68,6 +69,18 @@ func (s *Store) mergeQuota(ctx context.Context, incoming quota.Snapshot) error {
 		s.recordQuotaHistory(ctx, incoming)
 	}
 	return nil
+}
+
+// ObserveQuotaFetch normalizes a successful management quota fetch before
+// nonblocking admission. The caller (the management handler's observer)
+// supplies the account facts of the live credential it already holds, so no
+// credential lookup happens here. Flush provides an explicit
+// persistence-attempt barrier.
+func (s *Store) ObserveQuotaFetch(_ context.Context, provider, account, accountKind string, response pluginapi.QuotaFetchResponse) {
+	snapshot, ok := quota.ParseFetch(quota.Identity{Provider: provider, Account: account, AccountKind: accountKind}, response, time.Now().UTC())
+	if ok {
+		s.enqueueManagement(queuedUsage{Kind: queuedQuotaObservation, Quota: &snapshot})
+	}
 }
 
 func (s *Store) Quotas(ctx context.Context) ([]quota.Snapshot, error) {

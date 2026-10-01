@@ -106,7 +106,7 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 				c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errFetch)})
 				return
 			}
-			c.JSON(http.StatusOK, quotaResp)
+			h.respondCredentialQuota(c, auth, quotaResp)
 			return
 		}
 	}
@@ -121,14 +121,40 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 						c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("quota probe failed: %v", errProbe)})
 						return
 					}
-					c.JSON(http.StatusOK, quotaResp)
+					h.respondCredentialQuota(c, auth, quotaResp)
 					return
 				}
 			}
 		}
 	}
 
+	// Fallback to the provider's own quota endpoint when the proxy has builtin
+	// support for it, fetched through the same probe machinery as api-call.
+	if endpoint, okEndpoint := builtinQuotaEndpointFor(auth); okEndpoint {
+		quotaResp, errBuiltin := h.fetchBuiltinQuota(c, auth, endpoint)
+		if errBuiltin != nil {
+			log.WithError(errBuiltin).Warnf("builtin quota fetch failed for credential %s", auth.Index)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errBuiltin)})
+			return
+		}
+		h.respondCredentialQuota(c, auth, quotaResp)
+		return
+	}
+
 	c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
+}
+
+// respondCredentialQuota writes a successful quota response and notifies the
+// registered observer (the optional usage persistence adapter) with the live
+// credential and the normalized result.
+func (h *Handler) respondCredentialQuota(c *gin.Context, auth *coreauth.Auth, quotaResp pluginapi.QuotaFetchResponse) {
+	h.mu.Lock()
+	observer := h.quotaFetchObserver
+	h.mu.Unlock()
+	if observer != nil {
+		observer(c.Request.Context(), auth, quotaResp)
+	}
+	c.JSON(http.StatusOK, quotaResp)
 }
 
 // ResetCredentialQuota resets quota or usage for a credential.
@@ -374,11 +400,16 @@ func (h *Handler) ResetPluginQuota(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe map[string]any) (pluginapi.QuotaFetchResponse, bool, error) {
+// runQuotaProbeRequest performs the HTTP call of a declarative quota probe
+// through the same credential-aware machinery the management api-call endpoint
+// uses ($TOKEN$ substitution, per-credential proxy and transport). It returns
+// the raw upstream body and the server clock offset; handled is false only
+// when the probe declares no URL.
+func (h *Handler) runQuotaProbeRequest(c *gin.Context, auth *coreauth.Auth, probe map[string]any) (respBytes []byte, serverOffsetMs int64, handled bool, err error) {
 	urlStr, _ := probe["url"].(string)
 	urlStr = strings.TrimSpace(urlStr)
 	if urlStr == "" {
-		return pluginapi.QuotaFetchResponse{}, false, nil
+		return nil, 0, false, nil
 	}
 
 	method, _ := probe["method"].(string)
@@ -408,10 +439,10 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 		var errToken error
 		token, errToken = h.resolveTokenForAuth(c.Request.Context(), auth, "")
 		if errToken != nil {
-			return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("probe authentication failed: %w", errToken)
+			return nil, 0, true, fmt.Errorf("probe authentication failed: %w", errToken)
 		}
 		if token == "" {
-			return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("probe authentication token not found for credential")
+			return nil, 0, true, fmt.Errorf("probe authentication token not found for credential")
 		}
 		urlStr = strings.ReplaceAll(urlStr, "$TOKEN$", token)
 		rawData = strings.ReplaceAll(rawData, "$TOKEN$", token)
@@ -424,7 +455,7 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 
 	req, errReq := http.NewRequestWithContext(c.Request.Context(), method, urlStr, reqBody)
 	if errReq != nil {
-		return pluginapi.QuotaFetchResponse{}, false, fmt.Errorf("build probe request: %w", errReq)
+		return nil, 0, false, fmt.Errorf("build probe request: %w", errReq)
 	}
 
 	for k, v := range headers {
@@ -442,7 +473,7 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("probe request failed: %w", errDo)
+		return nil, 0, true, fmt.Errorf("probe request failed: %w", errDo)
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -452,22 +483,29 @@ func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe m
 
 	respBytes, errRead := io.ReadAll(resp.Body)
 	if errRead != nil {
-		return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("read probe response: %w", errRead)
+		return nil, 0, true, fmt.Errorf("read probe response: %w", errRead)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("probe returned status %d: %s", resp.StatusCode, string(respBytes))
+		return nil, 0, true, fmt.Errorf("probe returned status %d: %s", resp.StatusCode, string(respBytes))
 	}
 
 	if !json.Valid(respBytes) {
-		return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("upstream probe response is not valid JSON")
+		return nil, 0, true, fmt.Errorf("upstream probe response is not valid JSON")
 	}
 
-	var serverOffsetMs int64
 	if dateHeader := resp.Header.Get("Date"); dateHeader != "" {
 		if parsedDate, errDate := http.ParseTime(dateHeader); errDate == nil {
 			serverOffsetMs = parsedDate.Sub(time.Now()).Milliseconds()
 		}
+	}
+	return respBytes, serverOffsetMs, true, nil
+}
+
+func (h *Handler) executeQuotaProbe(c *gin.Context, auth *coreauth.Auth, probe map[string]any) (pluginapi.QuotaFetchResponse, bool, error) {
+	respBytes, serverOffsetMs, handled, errRun := h.runQuotaProbeRequest(c, auth, probe)
+	if !handled || errRun != nil {
+		return pluginapi.QuotaFetchResponse{}, handled, errRun
 	}
 
 	if mappingRaw, okMapping := probe["mapping"].(map[string]any); okMapping {

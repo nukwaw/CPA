@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -61,6 +62,7 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
+	quotaFetchObserver      func(ctx context.Context, auth *coreauth.Auth, resp pluginapi.QuotaFetchResponse)
 }
 
 type configReloadSnapshot struct {
@@ -148,6 +150,20 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 	}
 	h.mu.Lock()
 	h.pluginHost = host
+	h.mu.Unlock()
+}
+
+// SetQuotaFetchObserver registers the callback notified with the live
+// credential and the normalized result of every successful credential quota
+// fetch (plugin, declarative probe, or builtin provider endpoint). The usage
+// persistence adapter uses it to record refreshes it asked this handler to
+// perform; nil clears it.
+func (h *Handler) SetQuotaFetchObserver(observer func(ctx context.Context, auth *coreauth.Auth, resp pluginapi.QuotaFetchResponse)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.quotaFetchObserver = observer
 	h.mu.Unlock()
 }
 

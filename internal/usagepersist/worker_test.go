@@ -147,6 +147,7 @@ func TestQueuedUsageContainsOnlySanitizedSnapshots(t *testing.T) {
 	}{
 		{"Event", reflect.TypeOf(Event{})},
 		{"Quota", reflect.TypeOf((*quota.Snapshot)(nil))},
+		{"Kind", reflect.TypeOf(queuedWorkKind(0))},
 	}
 	if typ.NumField() != len(fields) {
 		t.Fatalf("queue retains fields outside the sanitized work union: %v", typ)

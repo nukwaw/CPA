@@ -68,7 +68,7 @@ type UsageReporter struct {
 	upstreamModel string
 
 	// account and accountKind are the account facts used to group usage by
-	// (provider, account). See usageAccountFacts.
+	// (provider, account). See UsageAccountFacts.
 	account     string
 	accountKind string
 }
@@ -140,19 +140,19 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
 		reporter.accessTokenHash = authAccessTokenSHA256(auth)
-		reporter.account, reporter.accountKind = usageAccountFacts(provider, auth)
+		reporter.account, reporter.accountKind = UsageAccountFacts(provider, auth)
 	}
 	return reporter
 }
 
-// usageAccountFacts returns the account fact used to group usage by
+// UsageAccountFacts returns the account fact used to group usage by
 // (provider, account), together with the credential property it came from.
 // kimi credentials are identified by their device_id metadata property; every
 // other provider by its email metadata property. These facts are account
 // identifiers, never credentials: no token, header or key is read. A missing,
 // nil or empty property yields two empty strings, and no other property is
 // used as a fallback.
-func usageAccountFacts(provider string, auth *cliproxyauth.Auth) (account string, accountKind string) {
+func UsageAccountFacts(provider string, auth *cliproxyauth.Auth) (account string, accountKind string) {
 	if auth == nil {
 		return "", ""
 	}

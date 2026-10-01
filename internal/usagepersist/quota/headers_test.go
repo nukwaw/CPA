@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 var observed = time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
@@ -329,5 +331,58 @@ func assertNumber(t *testing.T, value *float64, want float64) {
 	t.Helper()
 	if value == nil || math.Abs(*value-want) > 0.000001 {
 		t.Fatalf("value=%v, want %v", value, want)
+	}
+}
+
+func TestFetchKnownFields(t *testing.T) {
+	response := pluginapi.QuotaFetchResponse{
+		Subscription: &pluginapi.QuotaSubscription{Plan: "pro", TierName: "Premium", TierID: "p"},
+		Groups: []pluginapi.QuotaGroup{{DisplayName: "Custom", Buckets: []pluginapi.QuotaBucket{
+			{Window: "monthly", RemainingFraction: 0, ResetTime: "2026-10-01T00:00:00Z", Description: "not-retained"},
+			{Window: "invalid", RemainingFraction: math.NaN()},
+			{Window: "overflow", RemainingFraction: 2},
+		}}},
+		Summary: []pluginapi.QuotaMetric{{Key: "balance", Label: "Balance", Value: 0, Unit: "credits", Format: "number"}, {Key: "bad", Value: math.Inf(1)}},
+	}
+	// Declarative plugins name their own provider; any non-empty provider is a
+	// valid account fact.
+	identity := parserIdentity("custom", "a")
+	snapshot, ok := ParseFetch(identity, response, observed)
+	if !ok || len(snapshot.Windows) != 1 || len(snapshot.Summary) != 1 {
+		t.Fatalf("unexpected plugin snapshot: %+v", snapshot)
+	}
+	assertAccountFacts(t, snapshot, identity)
+	window := getWindow(t, snapshot, "fetch:custom:monthly")
+	assertNumber(t, window.RemainingPercent, 0)
+	assertNumber(t, window.UsedPercent, 100)
+	if snapshot.Plan != "pro" || snapshot.TierName != "Premium" || snapshot.TierID != "p" {
+		t.Fatalf("subscription fields lost: %+v", snapshot)
+	}
+	if !snapshot.ObservedAt.Equal(observed) || window.Source != SourceFetch {
+		t.Fatal("normalization changed observation metadata")
+	}
+	encoded, errJSON := json.Marshal(snapshot)
+	if errJSON != nil || strings.Contains(string(encoded), "not-retained") {
+		t.Fatalf("unexpected serialized snapshot: %s, %v", encoded, errJSON)
+	}
+	// kimi credentials publish device_id instead of email.
+	if kimi, ok := ParseFetch(parserIdentity("kimi", "device-1"), response, observed); !ok || kimi.Account != "device-1" || kimi.AccountKind != "device_id" {
+		t.Fatalf("kimi device_id account fact lost: %+v, parsed=%v", kimi, ok)
+	}
+	// The fetch parser validates account facts exactly like the other parsers.
+	for _, identity := range []Identity{parserIdentity("", "a"), parserIdentity("custom", "a\nsecret"), parserIdentity("custom", strings.Repeat("a", maxText+1))} {
+		if _, ok := ParseFetch(identity, response, observed); ok {
+			t.Fatalf("fetch accepted invalid account facts %+v", identity)
+		}
+	}
+	pluginSnapshot, ok := ParseFetch(parserIdentity("custom", ""), response, observed)
+	if !ok || pluginSnapshot.Account != "" {
+		t.Fatalf("account-less plugin credential was hidden: %+v, parsed=%v", pluginSnapshot, ok)
+	}
+	if _, ok := ParseFetch(parserIdentity("custom", "a"), pluginapi.QuotaFetchResponse{}, observed); ok {
+		t.Fatal("empty fetch fabricated quota")
+	}
+	if _, ok := ParseFetch(parserIdentity("custom", "a"), response, time.Time{}); ok {
+		t.Fatal("fetch accepted a missing observation time")
 	}
 }

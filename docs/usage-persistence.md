@@ -216,7 +216,7 @@ All data routes are under `/v0/management/stats` and reuse the existing manageme
 | `GET /quota/summary` | Bounded window history plus attributed request value for one credential |
 | `GET /quota/cache`, `PUT /quota/cache` | Read/upsert sanitized original UI display state with mandatory freshness preconditions |
 
-Live credential files are read from the existing `GET /v0/management/auth-files`; the add-on keeps no credential projection of its own.
+Live credential files are read from the existing `GET /v0/management/auth-files`; the add-on keeps no credential projection of its own. Manual quota refreshes (`POST /v0/management/quota/fetch`) are served by the management quota handler itself — plugin quota providers, credential-level probes, or its builtin provider endpoints — and every successful fetch is reported to the store through the handler's registered observer, which records the normalized result under the credential's account facts (email, or device id for Kimi).
 
 Manual prices require `model` plus finite, nonnegative, non-null `input_per_million`, `output_per_million`, `cache_read_per_million`, and `cache_write_per_million`; explicit zero is allowed. There is no separate read-only statistics role. Filters use `from`/`to` (RFC3339, inclusive/exclusive), `provider`, `account`, `model`, `key_id`, and `status` (`success`/`failed`). Missing dates mean the last 24 hours; analysis buckets are UTC `hour`/`day`, and event pagination uses `limit` (1–500) and `offset`.
 

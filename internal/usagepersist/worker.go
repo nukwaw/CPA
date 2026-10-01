@@ -2,6 +2,7 @@ package usagepersist
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/quota"
@@ -15,11 +16,40 @@ import (
 // This fixed bound is deliberately not another runtime setting.
 const usageQueueCapacity = 256
 
+type queuedWorkKind uint8
+
+const (
+	queuedUsageEvent queuedWorkKind = iota // Keep existing Consume admission unchanged.
+	queuedQuotaObservation
+)
+
 // queuedUsage is the entire queued representation. Do not add raw JSON, headers,
-// credentials, callbacks or request contexts here.
+// credentials, callbacks or request contexts here. Only usage work inserts Event;
+// quota-only observations never produce dummy accounting events.
 type queuedUsage struct {
 	Event Event           `json:"event"`
 	Quota *quota.Snapshot `json:"quota,omitempty"`
+	Kind  queuedWorkKind  `json:"kind,omitempty"`
+}
+
+// enqueueManagement admits a normalized management observation under the same
+// admission/bookkeeping contract as Consume. This lock never covers backend I/O
+// and a full queue never blocks the original management handler's response.
+func (s *Store) enqueueManagement(item queuedUsage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing || s.workerStopped || s.workerCtx.Err() != nil {
+		s.recordDrop(1)
+		return
+	}
+	select {
+	case s.queue <- item:
+		s.accepted++
+		s.pendingEvents.Add(1)
+	default:
+		s.queueOverflows.Add(1)
+		s.recordDrop(1)
+	}
 }
 
 func (s *Store) startWorker(lifecycle context.Context) {
@@ -86,11 +116,18 @@ func (s *Store) runWorker() {
 }
 
 func (s *Store) persistUsage(ctx context.Context, item queuedUsage) error {
-	if _, err := s.store.Insert(ctx, item.Event); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
+	switch item.Kind {
+	case queuedUsageEvent:
+		if _, err := s.store.Insert(ctx, item.Event); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	case queuedQuotaObservation:
+		// Quota-only management observations never enter usage statistics.
+	default:
+		return errors.New("unknown queued observation kind")
 	}
 	if item.Quota != nil {
 		return s.mergeQuota(ctx, *item.Quota)

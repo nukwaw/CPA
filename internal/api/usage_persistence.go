@@ -1,11 +1,16 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist"
 	usageweb "github.com/router-for-me/CLIProxyAPI/v8/internal/usagepersist/web"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // WithServerConfigurator composes an extension hook after standard middleware
@@ -46,6 +51,19 @@ func WithUsagePersistenceProvider(current func() *usagepersist.Store) ServerOpti
 		// The sidebar entry is independent of storage availability: the
 		// dashboard itself reports an unavailable store.
 		server.engine.Use(usagepersist.ManagementNavMiddleware(server.getConfig))
+		// Record every successful credential quota refresh the management quota
+		// handler performs (plugin, probe, or builtin provider endpoint). The
+		// handler supplies the live credential; core's own account facts group
+		// the observation. No route is observed and no credential is projected.
+		server.mgmt.SetQuotaFetchObserver(func(ctx context.Context, auth *coreauth.Auth, resp pluginapi.QuotaFetchResponse) {
+			store := current()
+			if store == nil || auth == nil {
+				return
+			}
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			account, accountKind := helps.UsageAccountFacts(provider, auth)
+			store.ObserveQuotaFetch(ctx, provider, account, accountKind, resp)
+		})
 		usagepersist.RegisterDynamicRoutes(usageManagementGroup(server), current, func() bool {
 			cfg := server.getConfig()
 			return cfg != nil && cfg.UsageStatisticsEnabled
