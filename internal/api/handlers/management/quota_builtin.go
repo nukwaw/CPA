@@ -30,7 +30,16 @@ type builtinQuotaEndpoint struct {
 
 // builtinQuotaEndpoints is a package-level table so tests can point endpoints
 // at fixture servers.
+//
+// Maintenance: each entry records where its request and response shape was
+// confirmed. When a provider changes its endpoint, update the single entry
+// and its test; the normalizers ignore unknown fields and fail loudly on a
+// changed shape, so a stale entry never yields wrong quota. Escape hatches
+// that need no code change: a credential-level quota_probe overrides these
+// entries per credential, and a plugin quota provider takes precedence.
 var builtinQuotaEndpoints = map[string]builtinQuotaEndpoint{
+	// Shape confirmed against the control panel bundle (chatgpt.com
+	// backend-api/wham/usage, codex CLI user agent) and the usage keeper.
 	"codex": {
 		method: http.MethodGet,
 		url:    "https://chatgpt.com/backend-api/wham/usage",
@@ -41,6 +50,8 @@ var builtinQuotaEndpoints = map[string]builtinQuotaEndpoint{
 		},
 		normalize: normalizeCodexUsage,
 	},
+	// Shape confirmed against the control panel bundle and the Claude Code
+	// OAuth usage endpoint (anthropic-beta: oauth-2025-04-20).
 	"claude": {
 		method: http.MethodGet,
 		url:    "https://api.anthropic.com/api/oauth/usage",
@@ -51,6 +62,7 @@ var builtinQuotaEndpoints = map[string]builtinQuotaEndpoint{
 		},
 		normalize: normalizeClaudeUsage,
 	},
+	// Shape confirmed against the usage keeper's retrieveUserQuota call.
 	"gemini-cli": {
 		method: http.MethodPost,
 		url:    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
@@ -60,6 +72,8 @@ var builtinQuotaEndpoints = map[string]builtinQuotaEndpoint{
 		},
 		normalize: normalizeGeminiUsage,
 	},
+	// Shape confirmed against the control panel bundle and the usage keeper's
+	// retrieveUserQuotaSummary call (bucket fractions as 0..1 or "25%").
 	"antigravity": {
 		method: http.MethodPost,
 		url:    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
@@ -71,12 +85,17 @@ var builtinQuotaEndpoints = map[string]builtinQuotaEndpoint{
 		data:      "{}",
 		normalize: normalizeAntigravityUsage,
 	},
+	// Shape confirmed against the control panel bundle
+	// (api.kimi.com / api.kimi.ai /coding/v1/usages, Authorization only).
 	"kimi": {
 		// url is resolved per credential (domain or custom base_url).
 		method:    http.MethodGet,
 		headers:   map[string]string{"Authorization": "Bearer $TOKEN$"},
 		normalize: normalizeKimiUsages,
 	},
+	// Shape confirmed against the control panel bundle (billing?format=credits).
+	// Client version headers follow xaiClientVersionValue in the xAI executor;
+	// bump together when cli-chat-proxy raises its minimum (HTTP 426).
 	"xai": {
 		method: http.MethodGet,
 		url:    "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
